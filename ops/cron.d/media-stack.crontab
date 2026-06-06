@@ -1,0 +1,64 @@
+# Versioned snapshot of the user crontab governing the media stack.
+#
+# CANONICAL INSTALL: `bash ops/install.sh --apply` — it renders the
+# `$HOME/media-stack` placeholder to this operator's MEDIA_STACK_ROOT and
+# is the drift-safe path for any checkout location.
+#
+# Raw `crontab ops/cron.d/media-stack.crontab` ALSO works IF the checkout
+# is at `$HOME/media-stack`: cron runs each command through /bin/sh, which
+# expands `$HOME` at job-run time (unlike systemd units, which do NOT
+# expand it — those must go through the installer).  (`crontab` strips
+# comment lines on load, so this header passes through cleanly.)
+#
+# This file is the source of truth; if you change it, re-install via
+# `ops/install.sh --apply` (or raw `crontab` for a default-path checkout)
+# and run `bash ops/audit.sh` to confirm no drift.
+#
+# Last sync: 2026-05-19 from `crontab -l`.
+
+# m h  dom mon dow   command
+
+# All log redirects now go under var/log/ (DEFERRED #5 var/ runtime
+# refactor).  Sentinels, locks, and state live under var/{state,run,…}.
+
+# qBittorrent stall reaper — every minute, kills torrents with no progress
+# past STALL_THRESHOLD_SEC.
+* * * * * python3 $HOME/media-stack/nuke_stalled.py >> $HOME/media-stack/var/log/stall_killer.log 2>&1
+
+# Weekly Docker / apt / journal prune — Sunday 03:00.
+0 3 * * 0 ( docker image prune -af --filter "until=168h" && sudo aptitude autoclean -y && sudo journalctl --vacuum-time=7d ) >> $HOME/media-stack/var/log/weekly-prune.log 2>&1
+
+# Nightly host upgrade — 04:00 daily in the host timezone.  The host clock
+# is set to America/Los_Angeles (2026-06-05) so this is 4 AM Pacific where
+# the operator is for the summer; balls3 itself sits in Colorado but its
+# clock follows the operator's TZ (and auto-tracks PDT/PST).  All the other
+# media-stack cron hours below are likewise interpreted in this host TZ now.
+# Lives outside the repo (see $HOME/nightly-upgrade.sh) because it also
+# touches non-media-stack host state.
+0 4 * * * $HOME/nightly-upgrade.sh
+
+# Nightly subtitle consolidation sweep — idempotent backstop for the
+# consolidate-watch.service inotify watcher.
+0 5 * * * python3 $HOME/media-stack/consolidate-subs.py --scan $HOME/media-stack/data/media --jobs 2 >> $HOME/media-stack/var/log/consolidate-subs.log 2>&1
+
+# Daily Bazarr profile audit — fixes profileId=None items Radarr/Sonarr add
+# without a default profile attached.
+30 4 * * * $HOME/media-stack/bazarr-profile-audit.py >> $HOME/media-stack/var/log/bazarr-profile-audit.log 2>&1
+
+# Daily movie de-dup — Radarr upgrade-import leaves the replaced (pipeline-
+# renamed) file behind, so a folder ends up with 2 videos and Jellyfin lists
+# both.  Auto-resolves the SAFE case (Radarr already tracks the keeper → move
+# the leftover to the recoverable .dupe-recycle); flags the RISKY case for
+# manual review and Telegrams a summary.  Runs after the profile audit,
+# before the 05:00 consolidation sweep.
+45 4 * * * python3 $HOME/media-stack/movie-dedupe.py --apply --notify >> $HOME/media-stack/var/log/movie-dedupe.log 2>&1
+
+# Audio normalization driver — keeps the EBU R128 sweep alive autonomously.
+# JOBS / STUCK_MIN overridable in .env.
+*/15 * * * * $HOME/media-stack/normalize-driver.sh >> $HOME/media-stack/var/log/normalize-driver.log 2>&1
+
+# Hourly aggregate healthcheck (codex round-7 finding #3 — the script existed
+# but was never auto-scheduled).  Wrapped with healthcheck-alert.sh so a
+# non-zero exit (FAIL=1, WARN=2) fires a Telegram notification with the
+# last 30 lines of the failure context.  Closes AUDIT A9 + codex round-13 #1.
+0 * * * * $HOME/media-stack/ops/healthcheck-alert.sh >> $HOME/media-stack/var/log/healthcheck.log 2>&1

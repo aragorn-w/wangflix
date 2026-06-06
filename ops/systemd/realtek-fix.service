@@ -1,0 +1,23 @@
+# Versioned snapshot of /etc/systemd/system/realtek-fix.service.
+# Host-critical: disables GSO/GRO/TSO/EEE on enp6s0f1 to prevent
+# Realtek 8169 NIC instability under sustained throughput. Without this,
+# the host loses LAN connectivity within hours of heavy Docker traffic.
+# Documented in $HOME/.claude/CLAUDE.md and CLAUDE.md (this repo).
+#
+# The companion script (/usr/local/bin/fix-realtek-nic.sh) lives outside
+# the repo because it's a host-level fix that must work even if the
+# media stack isn't installed.
+#
+# Last sync: 2026-05-19.
+
+[Unit]
+Description=Fix Realtek NIC Offload and EEE Issues
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/fix-realtek-nic.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

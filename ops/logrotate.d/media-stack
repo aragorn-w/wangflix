@@ -1,0 +1,25 @@
+# Logrotate for the media-stack runtime logs under var/log.
+#
+# Installed to /etc/logrotate.d/media-stack by `ops/install.sh`, which
+# renders the `$HOME/media-stack` path placeholder to this host's
+# MEDIA_STACK_ROOT.  Rotation runs from the system `logrotate.timer`.
+#
+# `su root root`: var/log holds a mix of owners — most logs belong to the
+# service user, but the hardened root-run `malware-guard.service` writes
+# `malware-guard.log` as root.  Rotating as root handles both uniformly.
+# (var/log is group-writable, so logrotate requires an explicit `su`.)
+#
+# `copytruncate` is mandatory: several writers hold their log open —
+# `consolidate-watch.service` via systemd `append:`, and the cron jobs via
+# `>>`.  Copy-then-truncate-in-place keeps those file descriptors valid,
+# whereas a rename would leave them writing to the rotated (orphaned) inode.
+$HOME/media-stack/var/log/*.log {
+    weekly
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}

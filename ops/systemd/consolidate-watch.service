@@ -1,0 +1,33 @@
+# Versioned snapshot of /etc/systemd/system/consolidate-watch.service.
+# Inotify-driven trigger for consolidate-subs.py: fires on close_write /
+# moved_to of .mkv/.mp4 and sidecar .srt/.ass/.vtt under the media root.
+#
+# TEMPLATE — DO NOT install raw.  The placeholders below (`$HOME/media-stack`,
+# `User=mediauser`, `Group=mediauser`) must be substituted to the
+# operator's MEDIA_STACK_ROOT + service user/group before install.
+#
+# To install:
+#   bash ops/install.sh --apply   # renders placeholders + installs
+#
+# To audit drift (also renders placeholders before diffing):
+#   bash ops/audit.sh
+#
+# Last sync: 2026-05-19 from `systemctl cat`.
+
+[Unit]
+Description=Consolidate subtitles on new media imports
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=mediauser
+Group=mediauser
+ExecStart=/bin/bash $HOME/media-stack/consolidate-watch.sh
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:$HOME/media-stack/var/log/consolidate-watch.service.log
+StandardError=append:$HOME/media-stack/var/log/consolidate-watch.service.log
+
+[Install]
+WantedBy=multi-user.target

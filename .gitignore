@@ -1,0 +1,63 @@
+# --- Secrets / runtime config ---
+.env
+.env.local
+*.key
+*.pem
+secrets/
+
+# --- Runtime state / live data ---
+# Sonarr/Radarr/qBit/Bazarr/Jellyfin persistent dirs.
+config/
+# mergerfs media library + torrent inflight.
+data/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-journal
+*.lock
+*.pid
+
+# --- Logs & generated output ---
+*.log
+*.out
+*.err
+*.bak
+normalize-driver.done
+movies-loudness.json
+
+# --- var/ runtime tree (logs, locks, sentinels, codex reviews) ---
+# Track the directory shape via .gitkeep, ignore contents.  The var/
+# layout replaces the old root-level *.log + *.done convention.
+var/log/*
+!var/log/.gitkeep
+var/run/*
+!var/run/.gitkeep
+var/state/*
+!var/state/.gitkeep
+var/reviews/*
+!var/reviews/.gitkeep
+
+# --- Stale tmp / pipeline scratch ---
+*.normalize-tmp/
+*.consolidate-tmp/
+.consolidate-subs.state.json
+
+# --- Review-loop transient state ---
+.claude/review-loop.local.md
+.claude/review-loop.lock
+.claude/review-loop-run-codex.sh
+.claude/review-loop-codex-prompt.txt
+.claude/review-loop.log
+# Legacy top-level reviews/ — kept as a compat symlink to var/reviews/
+# because the review-loop plugin hook hardcodes the `reviews/` path.
+# Leading slash anchors the ignore rule to repo root only so it doesn't
+# also ignore var/reviews/.gitkeep (codex round var-refactor #1).
+/reviews/
+
+# --- Editor / OS noise ---
+.DS_Store
+*.swp
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/

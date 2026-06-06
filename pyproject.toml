@@ -1,0 +1,42 @@
+# Tooling config for the media-stack helper package + entry scripts.
+# This project is NOT pip-installed — it runs in place. This file exists
+# only to give ruff / mypy / pytest a shared, conservative baseline so
+# regressions are catchable before runtime. Dev tools: requirements-dev.txt.
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Conservative baseline: pyflakes (F — real bugs: unused/undefined names)
+# plus pycodestyle errors/warnings (E, W). Style-only rules that the
+# existing code intentionally trips are ignored rather than mass-reformatted
+# — the point is a green baseline to ratchet from, not a reformat pass.
+select = ["E", "F", "W"]
+ignore = [
+    "E501",  # line length — long descriptive lines / comments are intentional
+    "E402",  # import not at top — entry scripts set sys.path / load env first
+    "E401",  # multiple imports on one line — a few `import os, sys`
+    "E701",  # multiple statements per line — terse guard clauses
+    "E741",  # ambiguous single-char name — a couple of legacy loop vars
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The legacy monolithic CLI entry scripts carry pre-module-split import
+# cruft (AUDIT A4 territory). The package (media_stack/) is held to the
+# full ruleset; clean these opportunistically when next touched.
+"consolidate-subs.py" = ["F401", "F841"]
+"normalize-audio.py" = ["F401"]
+"loudness-report.py" = ["F401", "F841"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.mypy]
+# Permissive baseline scoped to the package first (codex: "ratchet
+# media_stack/ first"). No disallow_untyped_defs / strict yet.
+python_version = "3.10"
+files = ["media_stack"]
+ignore_missing_imports = true
+warn_unused_ignores = true

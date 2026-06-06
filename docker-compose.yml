@@ -1,0 +1,304 @@
+services:
+  gluetun:
+    image: qmcgaw/gluetun
+    container_name: gluetun
+    labels:
+    - com.centurylinklabs.watchtower.enable=false
+    cap_add:
+    - NET_ADMIN
+    devices:
+    - /dev/net/tun:/dev/net/tun
+    # Ports bind to ALL interfaces (0.0.0.0) so Tailnet clients (which
+    # talk to the host via the tailscale0 interface, IP 100.x.x.x) can
+    # reach the admin UIs alongside the LAN.  A previous attempt to
+    # restrict bind-IP to MEDIA_LAN_IP only broke Tailscale access
+    # entirely (codex round-module-split #2 reopened AUDIT A10).
+    # The "perimeter" relies on:
+    #   (1) UFW off + Tailnet Lock on
+    #   (2) the host having no public-routable interface
+    #   (3) admin UI auth where configured
+    # If you replicate on a host with public interface(s) exposed, edit
+    # this file to add `${MEDIA_LAN_IP}:HOST:CONTAINER` (and a second
+    # binding for your Tailscale IP) before bringing the stack up.
+    ports:
+    - 8090:8090
+    - 54321:54321
+    - 54321:54321/udp
+    - 9696:9696
+    - 8989:8989
+    - 7878:7878
+    - 6767:6767
+    - 8192:8191
+    # Removed 2026-05-19: 8787 was Readarr's default WebUI port; the
+    # Readarr container was disabled 2026-04-28 and never replaced
+    # (codex round-5 finding #5).  5000 was Kavita's port — but Kavita
+    # was never inside Gluetun's namespace, so the mapping pointed at
+    # nothing.  Moved to a direct publish on the kavita service (codex
+    # round-9 finding #1).
+    dns:
+    - 8.8.8.8
+    - 1.1.1.1
+    environment:
+    - VPN_SERVICE_PROVIDER=protonvpn
+    - VPN_TYPE=wireguard
+    - FIREWALL_VPN_INPUT_PORTS=54321
+    - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY:?WIREGUARD_PRIVATE_KEY missing — see .env.example}
+    - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESS:?WIREGUARD_ADDRESS missing — see .env.example}
+    - SERVER_COUNTRIES=${VPN_COUNTRY:-Switzerland}
+    - VPN_PORT_FORWARDING=off
+    - VPN_PORT_FORWARDING_PROVIDER=protonvpn
+    # LAN + Tailnet CGNAT range.  Inbound to published ports already works
+    # via conntrack, but containers in gluetun's namespace that initiate
+    # outbound to Tailnet-only services (e.g. host-side Sonarr/Radarr
+    # webhooks reachable via 100.x) need this allowlist.  100.64.0.0/10
+    # is the CGNAT block Tailscale assigns from (codex round-4 #1).
+    # Replicators on a different LAN can override via .env (codex
+    # round-10 #5 — was hardcoded to a single host's LAN subnet).
+    - FIREWALL_OUTBOUND_SUBNETS=${FIREWALL_OUTBOUND_SUBNETS:-10.0.0.0/24,100.64.0.0/10}
+    restart: unless-stopped
+    networks:
+    - internal-media
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent-dvr
+    network_mode: service:gluetun
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    - WEBUI_PORT=8090
+    volumes:
+    - ./config/qbittorrent:/config
+    - ./data/torrents:/downloads
+    restart: unless-stopped
+    depends_on:
+    - gluetun
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr-dvr
+    network_mode: service:gluetun
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    volumes:
+    - ./config/prowlarr:/config
+    restart: unless-stopped
+    depends_on:
+    - gluetun
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    network_mode: service:gluetun
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    volumes:
+    - ./config/sonarr:/config
+    - ${MEDIA_ROOT:-${MEDIA_STACK_ROOT:-$HOME/media-stack}/data/media}/tv:/tv
+    - ./data/torrents:/downloads
+    restart: unless-stopped
+    depends_on:
+    - gluetun
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    network_mode: service:gluetun
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    volumes:
+    - ./config/radarr:/config
+    - ${MEDIA_ROOT:-${MEDIA_STACK_ROOT:-$HOME/media-stack}/data/media}/movies:/movies
+    - ./data/torrents:/downloads
+    restart: unless-stopped
+    depends_on:
+    - gluetun
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    network_mode: service:gluetun
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    volumes:
+    - ./config/bazarr:/config
+    - ${MEDIA_ROOT:-${MEDIA_STACK_ROOT:-$HOME/media-stack}/data/media}/tv:/tv
+    - ${MEDIA_ROOT:-${MEDIA_STACK_ROOT:-$HOME/media-stack}/data/media}/movies:/movies
+    restart: unless-stopped
+    depends_on:
+    - gluetun
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr-dvr
+    network_mode: service:gluetun
+    environment:
+    - LOG_LEVEL=info
+    - TZ=${TZ:-UTC}
+    restart: unless-stopped
+    depends_on:
+    - gluetun
+  unpackerr:
+    image: golift/unpackerr
+    container_name: unpackerr
+    environment:
+    - UN_SONARR_0_URL=http://localhost:8989
+    - UN_SONARR_0_API_KEY=${SONARR_API_KEY:?SONARR_API_KEY missing — see .env.example}
+    - UN_RADARR_0_URL=http://localhost:7878
+    - UN_RADARR_0_API_KEY=${RADARR_API_KEY:?RADARR_API_KEY missing — see .env.example}
+    volumes:
+    - ./data/torrents:/downloads
+    restart: unless-stopped
+    network_mode: service:gluetun
+    depends_on:
+    - gluetun
+  watchtower:
+    # Forked from containrrr/watchtower 2026-05-23 — upstream is abandoned
+    # and ships an old Docker API client (1.25) below the minimum 1.44
+    # required by Docker daemon 29.x.  nickfedor/watchtower is the
+    # actively-maintained community fork.  Same config interface.
+    image: nickfedor/watchtower:latest
+    container_name: watchtower
+    volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+    - WATCHTOWER_CLEANUP=true
+    - WATCHTOWER_POLL_INTERVAL=86400
+    restart: unless-stopped
+    networks:
+    - internal-media
+  tdarr:
+    container_name: tdarr
+    image: ghcr.io/haveagitgat/tdarr:latest
+    restart: unless-stopped
+    ports:
+    - 8265:8265
+    - 8266:8266
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    - serverIP=0.0.0.0
+    - disableAnalytics=true
+    volumes:
+    - ${MEDIA_STACK_ROOT:-$HOME/media-stack}/config/tdarr:/app/server
+    - ${MEDIA_STACK_ROOT:-$HOME/media-stack}/config/tdarr_configs:/app/configs
+    - ${MEDIA_ROOT:-${MEDIA_STACK_ROOT:-$HOME/media-stack}/data/media}:/media
+    networks:
+    - internal-media
+  tdarr-node:
+    container_name: tdarr-node
+    image: ghcr.io/haveagitgat/tdarr_node:latest
+    restart: unless-stopped
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    - nodeID=Balls3-NVIDIA
+    - serverIP=tdarr
+    - serverPort=8266
+    - disableAnalytics=true
+    volumes:
+    - ${MEDIA_STACK_ROOT:-$HOME/media-stack}/config/tdarr_node:/app/configs
+    - ${MEDIA_ROOT:-${MEDIA_STACK_ROOT:-$HOME/media-stack}/data/media}:/media
+    - /tmp:/temp
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            count: 1
+            capabilities:
+            - gpu
+    depends_on:
+    - tdarr
+    networks:
+    - internal-media
+  jellyfin:
+    container_name: jellyfin
+    image: jellyfin/jellyfin:latest
+    restart: unless-stopped
+    ports:
+    - 8096:8096
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    # Default to the LAN IP so clients at least have a working URL when
+    # the operator hasn't set JELLYFIN_PUBLISHED_URL — falling back to a
+    # placeholder tailnet name would advertise a non-resolvable host.
+    - JELLYFIN_PublishedServerUrl=${JELLYFIN_PUBLISHED_URL:-${MEDIA_LAN_IP:-10.0.0.10}}
+    volumes:
+    - ${MEDIA_STACK_ROOT:-$HOME/media-stack}/config/jellyfin:/config
+    - ${MEDIA_ROOT:-${MEDIA_STACK_ROOT:-$HOME/media-stack}/data/media}:/data
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            count: 1
+            capabilities:
+            - gpu
+    networks:
+    - internal-media
+  jellyseerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    container_name: jellyseerr
+    restart: unless-stopped
+    networks:
+    - internal-media
+    ports:
+    - 5055:5055
+    environment:
+    - LOG_LEVEL=debug
+    - TZ=${TZ:-UTC}
+    volumes:
+    - ${MEDIA_STACK_ROOT:-$HOME/media-stack}/config/jellyseerr:/app/config
+  # readarr: disabled 2026-04-28 — image pulled from registries (LinuxServer
+  # discontinued Readarr after upstream was abandoned). Config still on disk
+  # at ./config/readarr if a replacement is chosen later.
+  # readarr:
+  #   image: lscr.io/linuxserver/readarr:develop
+  #   container_name: readarr
+  #   network_mode: service:gluetun
+  #   environment:
+  #   - PUID=${PUID:-1000}
+  #   - PGID=${PGID:-1000}
+  #   - TZ=${TZ:-UTC}
+  #   volumes:
+  #   - ./config/readarr:/config
+  #   - ${CALIBRE_LIBRARY:-/srv/calibre/library}:/books
+  #   - ./data/torrents:/downloads
+  #   restart: unless-stopped
+  #   depends_on:
+  #   - gluetun
+  kavita:
+    image: lscr.io/linuxserver/kavita:latest
+    container_name: kavita
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    volumes:
+    - ./config/kavita:/config
+    - ${CALIBRE_LIBRARY:-/srv/calibre/library}:/books
+    restart: unless-stopped
+    # Direct host port publish — Kavita reads from /srv/calibre/library
+    # and doesn't fetch external content, so routing through Gluetun's
+    # VPN namespace is unnecessary.  Previously the 5000:5000 mapping
+    # lived on Gluetun (alongside Sonarr/Radarr/Bazarr/qBit), which left
+    # host:5000 pointing at Gluetun's empty namespace — Kavita was
+    # unreachable from the LAN despite the docs saying otherwise (codex
+    # round-9 finding #1).
+    ports:
+    - 5000:5000
+    networks:
+    - internal-media
+networks:
+  internal-media:
+    driver: bridge

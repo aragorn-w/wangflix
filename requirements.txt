@@ -1,0 +1,6 @@
+# Runtime Python deps. Install with: pip install -r requirements.txt
+# (See AGENTS.md for system-package deps: ffmpeg, mkvtoolnix, ffsubsync,
+# subliminal, inotify-tools, docker — those come from apt/pip system-wide.)
+requests>=2.31
+pysubs2>=1.7
+srt>=3.5
