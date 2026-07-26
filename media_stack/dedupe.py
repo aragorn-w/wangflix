@@ -90,3 +90,56 @@ def choose_keeper(videos: list[dict]) -> tuple[dict, list[dict]]:
         reverse=True,
     )
     return ranked[0], ranked[1:]
+
+
+# Sonarr's naming convention embeds "SxxEyy" in every episode filename
+# (e.g. "Rick and Morty - S09E01 - There's Something About Morty
+# WEBDL-1080p.mkv").  tv-dedupe.py uses this to group video files by
+# episode before running choose_keeper() on each group.
+_EPISODE_RE = re.compile(r"[Ss](\d{1,4})[Ee](\d{1,4})")
+
+# Multi-episode releases embed a SECOND episode marker right after the
+# first (e.g. "S01E01E02.mkv", "S01E01-E02.mkv").  Reducing one of those to
+# just its first (season, episode) pair would let it collide with a plain
+# single-episode "S01E01" file and get "deduped" away — silently destroying
+# the only local copy of E02.  There's no safe single (season, episode) key
+# for a multi-episode file, so `episode_key` treats it as unparseable
+# (returns None) rather than misidentifying it as a duplicate of episode 1.
+_MULTI_EP_SUFFIX_RE = re.compile(r"-?[Ee]\d{1,4}")
+
+
+def episode_key(filename: str) -> tuple[int, int] | None:
+    """Parse the ``(season, episode)`` numbers out of a Sonarr-style
+    ``SxxEyy`` filename token, case-insensitively (matching every other
+    regex in this module).  Returns None when no such token is present, OR
+    when a second episode marker immediately follows (a multi-episode
+    release — see ``_MULTI_EP_SUFFIX_RE``) — either way the file can't be
+    safely paired with anything for episode-level dedup, so the caller
+    must not silently drop it from consideration (see ``group_by_episode``)."""
+    m = _EPISODE_RE.search(filename)
+    if not m:
+        return None
+    if _MULTI_EP_SUFFIX_RE.match(filename, m.end()):
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def group_by_episode(videos: list[dict]) -> dict[tuple[int, int], list[dict]]:
+    """Group video dicts (the same ``{"name", "size", "processed"}`` shape
+    ``choose_keeper`` consumes) by their parsed ``(season, episode)`` key.
+
+    Videos whose filename has no parseable ``SxxEyy`` token are EXCLUDED
+    from the returned groups — there's no safe way to pair an unparseable
+    name with anything, so it can never be auto-resolved.  This is a
+    deliberate omission, not a bug: the caller (tv-dedupe.py) is
+    responsible for listing every input's ``episode_key()`` itself and
+    logging any that come back None, so an unparseable duplicate is
+    surfaced for manual review instead of vanishing silently from the
+    audit."""
+    groups: dict[tuple[int, int], list[dict]] = {}
+    for v in videos:
+        key = episode_key(v["name"])
+        if key is None:
+            continue
+        groups.setdefault(key, []).append(v)
+    return groups

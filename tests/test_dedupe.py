@@ -74,3 +74,58 @@ def test_choose_keeper_empty_raises():
     import pytest
     with pytest.raises(ValueError):
         dedupe.choose_keeper([])
+
+
+def test_episode_key_parses_season_episode():
+    name = "Rick and Morty - S09E01 - There's Something About Morty WEBDL-1080p.mkv"
+    assert dedupe.episode_key(name) == (9, 1)
+
+
+def test_episode_key_case_insensitive():
+    assert dedupe.episode_key("Show - s01e02 - Title.mkv") == (1, 2)
+
+
+def test_episode_key_none_when_unparseable():
+    assert dedupe.episode_key("Show - Special Feature.mkv") is None
+
+
+def test_episode_key_none_for_multi_episode_e_form():
+    # codex review #1 — "S01E01E02" must NOT collapse to (1, 1); that would
+    # let it collide with a plain S01E01 file and get deduped away, losing
+    # the only copy of E02.
+    assert dedupe.episode_key("Show - S01E01E02 - Title WEBDL-1080p.mkv") is None
+
+
+def test_episode_key_none_for_multi_episode_hyphen_e_form():
+    assert dedupe.episode_key("Show - S01E01-E02 - Title WEBDL-1080p.mkv") is None
+
+
+def test_episode_key_single_episode_with_hyphenated_quality_still_parses():
+    # A hyphen right after the episode number is common for quality tags
+    # (source-resolution) and must NOT be mistaken for a second episode
+    # marker — only a literal E/e right after (optionally hyphenated)
+    # signals a multi-episode release.
+    assert dedupe.episode_key("Show.S01E01-WEBDL.1080p.mkv") == (1, 1)
+
+
+def test_group_by_episode_groups_matching_keys():
+    vids = [
+        {"name": "Show - S01E01 - A WEBDL-1080p.mkv", "size": 1, "processed": False},
+        {"name": "Show - S01E01 - A WEBRip-1080p.mkv", "size": 1, "processed": False},
+        {"name": "Show - S01E02 - B WEBDL-1080p.mkv", "size": 1, "processed": False},
+    ]
+    groups = dedupe.group_by_episode(vids)
+    assert set(groups.keys()) == {(1, 1), (1, 2)}
+    assert len(groups[(1, 1)]) == 2
+    assert len(groups[(1, 2)]) == 1
+
+
+def test_group_by_episode_excludes_unparseable_names():
+    vids = [
+        {"name": "Show - S01E01 - A WEBDL-1080p.mkv", "size": 1, "processed": False},
+        {"name": "Show - Special Feature.mkv", "size": 1, "processed": False},
+    ]
+    groups = dedupe.group_by_episode(vids)
+    assert list(groups.keys()) == [(1, 1)]
+    all_names = [v["name"] for names in groups.values() for v in names]
+    assert "Show - Special Feature.mkv" not in all_names

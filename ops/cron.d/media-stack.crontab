@@ -53,6 +53,16 @@
 # before the 05:00 consolidation sweep.
 45 4 * * * python3 $HOME/media-stack/movie-dedupe.py --apply --notify >> $HOME/media-stack/var/log/movie-dedupe.log 2>&1
 
+# Daily TV episode de-dup — Sonarr sibling of movie-dedupe.py above,
+# 5 min later so the two never run concurrently.  Same SAFE/RISKY model,
+# PLUS a TV-specific cleanup: Sonarr's own `episodefile` DB table can keep
+# an orphan row pointing at the removed leftover even when the correct
+# file is tracked — tv-dedupe.py deletes that row via the Sonarr API after
+# moving the file, not just the physical duplicate.  Auto-resolves the SAFE
+# case (Sonarr already tracks the keeper); flags the RISKY case for manual
+# review and Telegrams a summary.
+50 4 * * * python3 $HOME/media-stack/tv-dedupe.py --apply --notify >> $HOME/media-stack/var/log/tv-dedupe.log 2>&1
+
 # Audio normalization driver — keeps the EBU R128 sweep alive autonomously.
 # JOBS / STUCK_MIN overridable in .env.
 */15 * * * * $HOME/media-stack/normalize-driver.sh >> $HOME/media-stack/var/log/normalize-driver.log 2>&1

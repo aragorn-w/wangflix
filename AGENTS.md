@@ -116,6 +116,14 @@ Bazarr settings, etc.) stays where it is so the bind-mounts in
     non-keeper) for manual review (`movie-dedupe.py --apply --force`).
     `consolidate-watch` excludes `.dupe-recycle` so recycled files aren't
     re-normalized.
+  - Cron 04:50 — `tv-dedupe.py --apply --notify`, the Sonarr sibling of
+    movie-dedupe.py (runs 5 min later so they never overlap). Same
+    SAFE/RISKY model, one TV-specific addition: Sonarr's `episodefile` DB
+    table can retain an orphan row for the removed leftover even when the
+    correct file is tracked (observed live 2026-07-26, Rick and Morty
+    S09E01), so `tv-dedupe.py` also deletes that row via the Sonarr API
+    after the physical move. Recycles to `.dupe-recycle/tv/`; RISKY cases
+    need manual review (`tv-dedupe.py --apply --force`).
 
 - **Bazarr:** English profile (id=1) attached to everything. Sidecar SRTs ingested by the watcher.
 

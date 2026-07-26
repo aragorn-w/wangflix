@@ -86,6 +86,118 @@ def test_arr_rescan_movie_false_on_failure():
         assert ArrClient("http://radarr:7878", "k").rescan_movie(42) is False
 
 
+def test_arr_series_returns_list():
+    payload = [{"id": 29, "path": "/tv/Rick and Morty", "title": "Rick and Morty"}]
+    with patch("requests.get") as mock_get:
+        resp = MagicMock(status_code=200, json=lambda: payload)
+        resp.raise_for_status = lambda: None
+        mock_get.return_value = resp
+        assert ArrClient("http://sonarr:8989", "k").series() == payload
+
+
+def test_arr_series_none_on_non_list_shape():
+    with patch("requests.get") as mock_get:
+        resp = MagicMock(status_code=200, json=lambda: {"error": "x"})
+        resp.raise_for_status = lambda: None
+        mock_get.return_value = resp
+        assert ArrClient("http://sonarr:8989", "k").series() is None
+
+
+def test_arr_series_none_on_failure():
+    with patch("requests.get", side_effect=Exception("down")):
+        assert ArrClient("http://sonarr:8989", "k").series() is None
+
+
+def test_arr_episodes_returns_list():
+    payload = [{"seasonNumber": 9, "episodeNumber": 1, "hasFile": True, "episodeFileId": 3846}]
+    with patch("requests.get") as mock_get:
+        resp = MagicMock(status_code=200, json=lambda: payload)
+        resp.raise_for_status = lambda: None
+        mock_get.return_value = resp
+        c = ArrClient("http://sonarr:8989", "k")
+        assert c.episodes(29) == payload
+        _, kwargs = mock_get.call_args
+        assert kwargs["params"] == {"seriesId": 29}
+
+
+def test_arr_episodes_none_on_non_list_shape():
+    with patch("requests.get") as mock_get:
+        resp = MagicMock(status_code=200, json=lambda: {"error": "x"})
+        resp.raise_for_status = lambda: None
+        mock_get.return_value = resp
+        assert ArrClient("http://sonarr:8989", "k").episodes(29) is None
+
+
+def test_arr_episodes_none_on_failure():
+    with patch("requests.get", side_effect=Exception("down")):
+        assert ArrClient("http://sonarr:8989", "k").episodes(29) is None
+
+
+def test_arr_episode_files_returns_list():
+    payload = [{"id": 3846, "relativePath": "Season 9/E01 WEBDL-1080p.mkv"}]
+    with patch("requests.get") as mock_get:
+        resp = MagicMock(status_code=200, json=lambda: payload)
+        resp.raise_for_status = lambda: None
+        mock_get.return_value = resp
+        c = ArrClient("http://sonarr:8989", "k")
+        assert c.episode_files(29) == payload
+        _, kwargs = mock_get.call_args
+        assert kwargs["params"] == {"seriesId": 29}
+
+
+def test_arr_episode_files_none_on_non_list_shape():
+    with patch("requests.get") as mock_get:
+        resp = MagicMock(status_code=200, json=lambda: {"error": "x"})
+        resp.raise_for_status = lambda: None
+        mock_get.return_value = resp
+        assert ArrClient("http://sonarr:8989", "k").episode_files(29) is None
+
+
+def test_arr_episode_files_none_on_failure():
+    with patch("requests.get", side_effect=Exception("down")):
+        assert ArrClient("http://sonarr:8989", "k").episode_files(29) is None
+
+
+def test_arr_rescan_series_true_on_2xx():
+    with patch("requests.post") as mock_post:
+        resp = MagicMock(status_code=201)
+        resp.raise_for_status = lambda: None
+        mock_post.return_value = resp
+        assert ArrClient("http://sonarr:8989", "k").rescan_series(29) is True
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"name": "RescanSeries", "seriesId": 29}
+
+
+def test_arr_rescan_series_false_on_failure():
+    with patch("requests.post", side_effect=Exception("boom")):
+        assert ArrClient("http://sonarr:8989", "k").rescan_series(29) is False
+
+
+def test_arr_delete_episode_file_true_on_2xx():
+    with patch("requests.delete") as mock_delete:
+        resp = MagicMock(status_code=200)
+        resp.raise_for_status = lambda: None
+        mock_delete.return_value = resp
+        assert ArrClient("http://sonarr:8989", "k").delete_episode_file(3845) is True
+        args, _ = mock_delete.call_args
+        assert args[0] == "http://sonarr:8989/api/v3/episodefile/3845"
+
+
+def test_arr_delete_episode_file_false_on_non_2xx():
+    import requests
+    with patch("requests.delete") as mock_delete:
+        resp = MagicMock(status_code=404)
+        resp.raise_for_status = MagicMock(
+            side_effect=requests.HTTPError("404 Client Error"))
+        mock_delete.return_value = resp
+        assert ArrClient("http://sonarr:8989", "k").delete_episode_file(3845) is False
+
+
+def test_arr_delete_episode_file_false_on_failure():
+    with patch("requests.delete", side_effect=Exception("boom")):
+        assert ArrClient("http://sonarr:8989", "k").delete_episode_file(3845) is False
+
+
 def test_arr_get_queue_returns_records():
     with patch("requests.get") as mock_get:
         resp = MagicMock(status_code=200,

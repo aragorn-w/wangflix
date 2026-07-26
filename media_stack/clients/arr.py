@@ -337,3 +337,93 @@ class ArrClient:
             return True
         except Exception:
             return False
+
+    def series(self) -> list[dict] | None:
+        """GET /api/v3/series — every Sonarr series (id, path, title, ...).
+        Returns the list, or None on endpoint failure / malformed shape.
+        Used by tv-dedupe.py to map a season folder back to its Sonarr
+        series id."""
+        try:
+            r = requests.get(f"{self.base_url}/api/v3/series",
+                             headers=self.headers, timeout=self.timeout)
+            r.raise_for_status()
+            data = r.json()
+        except Exception:
+            return None
+        if not isinstance(data, list) or not all(isinstance(s, dict) for s in data):
+            return None
+        return data
+
+    def episodes(self, series_id: int) -> list[dict] | None:
+        """GET /api/v3/episode?seriesId=<id> — every episode of one series,
+        each with seasonNumber/episodeNumber/hasFile/episodeFileId.  Returns
+        the list, or None on endpoint failure / malformed shape."""
+        try:
+            r = requests.get(
+                f"{self.base_url}/api/v3/episode",
+                params={"seriesId": series_id},
+                headers=self.headers, timeout=self.timeout,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception:
+            return None
+        if not isinstance(data, list) or not all(isinstance(e, dict) for e in data):
+            return None
+        return data
+
+    def episode_files(self, series_id: int) -> list[dict] | None:
+        """GET /api/v3/episodefile?seriesId=<id> — every tracked episode
+        file record for one series (id, relativePath, ...).  A record here
+        is not necessarily linked to a live episode: Sonarr can leave an
+        orphan row behind after an upgrade-import even when the correct
+        file is tracked elsewhere (tv-dedupe.py's whole reason for calling
+        ``delete_episode_file`` on the extras it finds).  Returns the
+        list, or None on endpoint failure / malformed shape."""
+        try:
+            r = requests.get(
+                f"{self.base_url}/api/v3/episodefile",
+                params={"seriesId": series_id},
+                headers=self.headers, timeout=self.timeout,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception:
+            return None
+        if not isinstance(data, list) or not all(isinstance(f, dict) for f in data):
+            return None
+        return data
+
+    def rescan_series(self, series_id: int) -> bool:
+        """POST /api/v3/command {name: RescanSeries, seriesId}.  Triggers a
+        disk rescan so Sonarr re-imports the keeper after the dedupe tool
+        removes the file it was tracking.  Returns True on 2xx, False on
+        any failure."""
+        try:
+            r = requests.post(
+                f"{self.base_url}/api/v3/command",
+                json={"name": "RescanSeries", "seriesId": series_id},
+                headers=self.headers, timeout=self.timeout,
+            )
+            r.raise_for_status()
+            return True
+        except Exception:
+            return False
+
+    def delete_episode_file(self, episode_file_id: int) -> bool:
+        """DELETE /api/v3/episodefile/<id> — remove a Sonarr episodefile DB
+        record (and its on-disk file, if one is still there).  tv-dedupe.py
+        always calls this AFTER moving the physical file to the recycle
+        dir, so by the time Sonarr looks for it on disk there's nothing to
+        delete there — this call's real job is clearing the orphan DB row.
+        Returns True on 2xx, False on any failure (never raises; the
+        caller treats a failure as non-fatal and logs it)."""
+        try:
+            r = requests.delete(
+                f"{self.base_url}/api/v3/episodefile/{episode_file_id}",
+                headers=self.headers, timeout=self.timeout,
+            )
+            r.raise_for_status()
+            return True
+        except Exception:
+            return False
