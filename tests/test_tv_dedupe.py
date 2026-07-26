@@ -166,6 +166,74 @@ def test_risky_case_resolved_with_force_rescans(tmp_path):
     assert _videos(season_dir) == ["Show - S01E01 - A WEBDL-1080p.mkv"]
 
 
+def test_risky_force_verify_scoped_to_the_resolved_episode_not_whole_season(tmp_path):
+    # codex review #3 — a season folder almost always has OTHER episodes.
+    # The post-rescan verify must count remaining files for the SPECIFIC
+    # (season, episode) group being resolved, not every video in the
+    # season folder, or it spuriously reports an error even when the
+    # rescan succeeded correctly.
+    series = "Show"
+    season_dir = _make_season(tmp_path / "tv", series, "Season 01", {
+        "Show - S01E01 - A WEBDL-1080p.mkv": 200 * 1024 * 1024,
+        "Show - S01E01 - A WEBRip-1080p.mkv": 150 * 1024 * 1024,
+        "Show - S01E02 - B WEBDL-1080p.mkv": 180 * 1024 * 1024,   # unrelated episode
+    })
+    client = MagicMock()
+    client.series.return_value = [{"id": 1, "path": f"/tv/{series}"}]
+    client.episode_files.side_effect = [
+        [{"id": 200, "relativePath": "Season 01/Show - S01E01 - A WEBRip-1080p.mkv"},
+         {"id": 400, "relativePath": "Season 01/Show - S01E02 - B WEBDL-1080p.mkv"}],
+        [{"id": 201, "relativePath": "Season 01/Show - S01E01 - A WEBDL-1080p.mkv"},
+         {"id": 400, "relativePath": "Season 01/Show - S01E02 - B WEBDL-1080p.mkv"}],
+    ]
+    client.episodes.side_effect = [
+        [{"seasonNumber": 1, "episodeNumber": 1, "hasFile": True, "episodeFileId": 200},
+         {"seasonNumber": 1, "episodeNumber": 2, "hasFile": True, "episodeFileId": 400}],
+        [{"seasonNumber": 1, "episodeNumber": 1, "hasFile": True, "episodeFileId": 201},
+         {"seasonNumber": 1, "episodeNumber": 2, "hasFile": True, "episodeFileId": 400}],
+    ]
+    client.rescan_series.return_value = True
+    client.delete_episode_file.return_value = True
+
+    with patch.object(td.time, "sleep"):
+        rc, tv = _run(tmp_path, ["--apply", "--force"], client)
+
+    assert rc == 0   # would have been 1 (spurious error) before the fix
+    assert sorted(_videos(season_dir)) == [
+        "Show - S01E01 - A WEBDL-1080p.mkv",
+        "Show - S01E02 - B WEBDL-1080p.mkv",
+    ]
+
+
+def test_recycle_move_does_not_overwrite_existing_recycled_file(tmp_path):
+    # codex review #2 — a same-named file already sitting in the recycle
+    # dir (e.g. from a previous run) must never be silently overwritten.
+    series = "Show"
+    season_dir = _make_season(tmp_path / "tv", series, "Season 01", {
+        "Show - S01E01 - A WEBDL-1080p.mkv": 200 * 1024 * 1024,
+        "Show - S01E01 - A WEBRip-1080p.mkv": 150 * 1024 * 1024,
+    })
+    recycle_dir = tmp_path / ".dupe-recycle" / "tv" / series / "Season 01"
+    recycle_dir.mkdir(parents=True)
+    preexisting = recycle_dir / "Show - S01E01 - A WEBRip-1080p.mkv"
+    preexisting.touch()
+    os.truncate(preexisting, 999 * 1024 * 1024)   # distinct size from the new move
+
+    client = _sonarr_tracking(series, 1, 1, "Show - S01E01 - A WEBDL-1080p.mkv")
+    rc, tv = _run(tmp_path, ["--apply"], client)
+
+    assert rc == 0
+    assert _videos(season_dir) == ["Show - S01E01 - A WEBDL-1080p.mkv"]
+    # The old recycled file must survive untouched...
+    assert preexisting.exists()
+    assert preexisting.stat().st_size == 999 * 1024 * 1024
+    # ...and the newly-moved duplicate must land under a DIFFERENT name in
+    # the same recycle dir (not silently discarded).
+    recycled_now = sorted(p.name for p in recycle_dir.iterdir())
+    assert len(recycled_now) == 2
+    assert "Show - S01E01 - A WEBRip-1080p.mkv" in recycled_now
+
+
 def test_locked_folder_skipped_not_moved(tmp_path):
     # A pipeline holds a per-file lock -> dedupe must NOT move the file; skip
     # the episode (retried next pass) and exit 0 (transient, not a failure).

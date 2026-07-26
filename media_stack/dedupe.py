@@ -99,13 +99,27 @@ def choose_keeper(videos: list[dict]) -> tuple[dict, list[dict]]:
 _EPISODE_RE = re.compile(r"[Ss](\d{1,4})[Ee](\d{1,4})")
 
 # Multi-episode releases embed a SECOND episode marker right after the
-# first (e.g. "S01E01E02.mkv", "S01E01-E02.mkv").  Reducing one of those to
-# just its first (season, episode) pair would let it collide with a plain
-# single-episode "S01E01" file and get "deduped" away — silently destroying
-# the only local copy of E02.  There's no safe single (season, episode) key
-# for a multi-episode file, so `episode_key` treats it as unparseable
-# (returns None) rather than misidentifying it as a duplicate of episode 1.
-_MULTI_EP_SUFFIX_RE = re.compile(r"-?[Ee]\d{1,4}")
+# first, either with an explicit E ("S01E01E02.mkv", "S01E01-E02.mkv") or
+# as a bare numeric range ("S01E01-02.mkv" — Sonarr's own default
+# multi-episode naming format).  Reducing any of these to just their first
+# (season, episode) pair would let them collide with a plain single-episode
+# "S01E01" file and get "deduped" away — silently destroying the only local
+# copy of E02.  There's no safe single (season, episode) key for a
+# multi-episode file, so `episode_key` treats it as unparseable (returns
+# None) rather than misidentifying it as a duplicate of episode 1 (codex
+# review finding: the original fix only covered the explicit-E forms).
+#
+# The bare-range branch (`-\d{1,2}(?!\d)`) is deliberately narrow: it must
+# NOT fire on a quality tag hyphen-glued directly to the episode number
+# (e.g. a hypothetical "S01E01-1080p") — real Sonarr-rendered filenames
+# always insert a title between the episode token and the quality tag (see
+# every example in this module/AGENTS.md), so a bare "-NN" right after the
+# episode number is only ever a genuine multi-episode range in this
+# library. The `(?!\d)` guard additionally makes sure a resolution number
+# like "1080" (4 digits) can never partially match as "-10": every 1-2
+# digit prefix of a longer digit run is immediately followed by another
+# digit, so the lookahead rejects it at every attempted split.
+_MULTI_EP_SUFFIX_RE = re.compile(r"-?[Ee]\d{1,4}|-\d{1,2}(?!\d)")
 
 
 def episode_key(filename: str) -> tuple[int, int] | None:

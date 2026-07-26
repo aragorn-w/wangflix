@@ -100,12 +100,27 @@ def test_episode_key_none_for_multi_episode_hyphen_e_form():
     assert dedupe.episode_key("Show - S01E01-E02 - Title WEBDL-1080p.mkv") is None
 
 
+def test_episode_key_none_for_multi_episode_bare_range_form():
+    # codex review (round 2) — "S01E01-02" (Sonarr's own default
+    # multi-episode naming format, no second E) was missed by the original
+    # fix, which only caught explicit-E forms.
+    assert dedupe.episode_key("Show - S01E01-02 - Title WEBDL-1080p.mkv") is None
+
+
 def test_episode_key_single_episode_with_hyphenated_quality_still_parses():
     # A hyphen right after the episode number is common for quality tags
     # (source-resolution) and must NOT be mistaken for a second episode
     # marker — only a literal E/e right after (optionally hyphenated)
     # signals a multi-episode release.
     assert dedupe.episode_key("Show.S01E01-WEBDL.1080p.mkv") == (1, 1)
+
+
+def test_episode_key_bare_hyphen_digit_resolution_tag_not_mistaken_for_range():
+    # A hypothetical 3-4 digit resolution number glued directly after the
+    # episode number (e.g. "-1080p") must still parse normally — the
+    # bare-range guard only matches 1-2 digit runs specifically so it can't
+    # partially match a longer digit run like "1080" as "-10".
+    assert dedupe.episode_key("Show.S01E01-1080p.mkv") == (1, 1)
 
 
 def test_group_by_episode_groups_matching_keys():

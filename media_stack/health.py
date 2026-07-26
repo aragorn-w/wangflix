@@ -64,6 +64,7 @@ REPO_ROOT_EXPECTED = {
     "normalize-audio.py", "normalize-driver.sh", "normalize-loop.sh",
     "normalize-status.sh",
     "nuke_stalled.py", "preflight.sh", "pyproject.toml", "requirements-dev.txt",
+    "tv-dedupe.py",
     "config", "data", "lib", "ops", "requirements.txt", "tests", "reviews", "var",
 }
 # Dotfiles/dirs the find loop skips entirely (never flagged).  The tool

@@ -93,6 +93,27 @@ def _sonarr_key() -> str:
     return paths.load_env_file(paths.MEDIA_STACK_ROOT / ".env").get("SONARR_API_KEY", "")
 
 
+def _unique_recycle_target(dest: Path, name: str) -> Path:
+    """Return a collision-free destination path for a recycle move.  A
+    fixed `dest / name` target risks `shutil.move` silently overwriting an
+    already-recycled file of the same name (e.g. the same duplicate
+    re-appearing on a later run before the operator has cleared the
+    recycle bin) — that would destroy the earlier recoverable copy,
+    defeating the whole point of recycling instead of deleting (codex
+    review finding #2)."""
+    target = dest / name
+    if not target.exists():
+        return target
+    stem, suffix = target.stem, target.suffix
+    stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+    candidate = dest / f"{stem}.{stamp}{suffix}"
+    n = 1
+    while candidate.exists():
+        candidate = dest / f"{stem}.{stamp}-{n}{suffix}"
+        n += 1
+    return candidate
+
+
 def _videos_in(folder: Path) -> list[str]:
     return sorted(f.name for f in folder.iterdir()
                   if f.is_file() and is_video(f.name))
@@ -296,7 +317,11 @@ def main(argv: list[str] | None = None) -> int:
                         moved = []
                         moved_relpaths = []
                         for e in extras:
-                            shutil.move(str(season_folder / e["name"]), str(dest / e["name"]))
+                            # Collision-safe target: a fixed name risks
+                            # overwriting an already-recycled file from a
+                            # prior run (codex review finding #2).
+                            target = _unique_recycle_target(dest, e["name"])
+                            shutil.move(str(season_folder / e["name"]), str(target))
                             reclaimed += e["size"]
                             moved.append(e["name"])
                             moved_relpaths.append(f"{season_folder.name}/{e['name']}")
@@ -306,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
                             # already succeeded (codex review finding #3).
                             manifest.append({"label": label, "keeper": keeper_name,
                                              "tracked": tracked, "moved": [e["name"]],
-                                             "safe": safe})
+                                             "recycled_as": target.name, "safe": safe})
 
                         _cleanup_orphan_episodefiles(
                             arr, file_id_by_relpath, episode_by_file_id,
@@ -315,16 +340,27 @@ def main(argv: list[str] | None = None) -> int:
                         if not safe and arr and series_id is not None:
                             # RISKY + --force: Sonarr was tracking a moved file ->
                             # rescan so it re-imports the keeper, then verify.
-                            arr.rescan_series(series_id)
+                            if not arr.rescan_series(series_id):
+                                log(f"  WARNING: {label}: RescanSeries command "
+                                    f"submission failed — verifying anyway")
                             time.sleep(4)
-                            remaining = _videos_in(season_folder)
+                            # Re-group just THIS episode's remaining files, not
+                            # the whole season folder — a season folder almost
+                            # always has other unrelated episodes, so counting
+                            # every video in it would spuriously fail verify
+                            # even on a correct rescan (codex review finding #3).
+                            remaining_metas = [_video_meta(season_folder, v)
+                                              for v in _videos_in(season_folder)]
+                            remaining_group = group_by_episode(remaining_metas).get(
+                                (season_num, ep_num), [])
+                            remaining_names = [v["name"] for v in remaining_group]
                             new_tracked_by_ep, _, _ = _tracked_by_episode(arr, series_id)
                             cur_tracked = new_tracked_by_ep.get((season_num, ep_num))
-                            if len(remaining) == 1 and cur_tracked == remaining[0]:
+                            if len(remaining_names) == 1 and cur_tracked == remaining_names[0]:
                                 forced.append(label)
                             else:
                                 errors.append(f"{label} (rescan left tracks={cur_tracked!r} "
-                                              f"remaining={len(remaining)})")
+                                              f"remaining={len(remaining_names)})")
                         else:
                             resolved.append(label)
                     # Locks released.  The moved extras no longer exist at their
