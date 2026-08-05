@@ -1,7 +1,13 @@
 # AGENTS.md — Media Stack (DVR)
 
 Canonical agent guidance for this directory. `CLAUDE.md` is a symlink to this file.
-Top-level home-server policy lives at `$HOME/CLAUDE.md` (do not edit from here).
+Top-level home-server policy lives at `$HOME/.claude/CLAUDE.md`, not in this repo.
+The rest of this paragraph is maintainer-host only; replicators can ignore it.
+That file is generated, and hand-edits to it are reverted within 30 minutes, so
+change it with `chezmoi edit --apply $HOME/.claude/CLAUDE.md`, or
+non-interactively by editing `$(chezmoi source-path $HOME/.claude/CLAUDE.md)` and
+then running `chezmoi apply $HOME/.claude/CLAUDE.md`. `$HOME/CLAUDE.md` there is
+retired and intentionally left empty; do not delete it.
 
 ---
 
@@ -157,7 +163,7 @@ Bazarr settings, etc.) stays where it is so the bind-mounts in
 
 ## Maintenance
 
-- **Updates:** Host via `aptitude` (nightly 04:00 via `nightly-upgrade.sh`). Containers via Watchtower (24h cycle). See `$HOME/CLAUDE.md` for the home-server policy.
+- **Updates:** Host via `aptitude` (nightly 04:00 via `nightly-upgrade.sh`). Containers via Watchtower (24h cycle). See `$HOME/.claude/CLAUDE.md` for the home-server policy.
 - **Power:** `restart: unless-stopped` on all containers.
 - **Backups:** none configured for media (intentional — re-fetchable). Service config under `config/` should be snapshotted before destructive changes.
 
