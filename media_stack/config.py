@@ -128,3 +128,14 @@ STILL_IMAGE_VIDEO_CODECS: set[str] = {
 TMP_MKV_RE       = re.compile(r"\.consol\.(\d+)\.tmp\.mkv$")
 CONSOLSUB_DIR_RE = re.compile(r"^consolsub_(?:(\d+)_)?[A-Za-z0-9]+$")
 SWEEP_MIN_AGE_S: int = 30 * 60  # PID-less consolsub_* dirs must be at least this old to be swept
+
+# normalize-audio.py's `.normalize-tmp` workdir (normalize-audio.py:253-254).
+# The DIRECTORY name carries no PID -- concurrent workers share one per media
+# folder via mkdir(exist_ok=True) -- so liveness is decided per FILE, from the
+# PID in `.<stem>.<pid>.pass2.mkv` / `.<stem>.<pid>.remux.mkv`.
+NORMALIZE_TMP_DIR = ".normalize-tmp"
+NORMALIZE_TMP_RE  = re.compile(r"\.(\d+)\.(?:pass2|remux)\.mkv$")
+# The PID belongs to a normalize-audio.py worker, never to the sweep's caller.
+NORMALIZE_SCRIPT  = "normalize-audio.py"
+# Own floor, no less conservative than normalize-driver.sh's `find -mmin -60`.
+NORMALIZE_TMP_MIN_AGE_S: int = 60 * 60

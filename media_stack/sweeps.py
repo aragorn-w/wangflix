@@ -4,6 +4,10 @@ A `.tmp.mkv` is orphan iff its encoded PID is no longer a live
 consolidate-subs.py process.
 A `consolsub_*` workdir is orphan iff its encoded PID is dead, OR (when
 no PID is encoded) its mtime is older than `SWEEP_MIN_AGE_S`.
+A `.normalize-tmp` intermediate is orphan iff the PID encoded in its name
+is no longer a live normalize-audio.py process AND the file is older than
+`NORMALIZE_TMP_MIN_AGE_S`.  The workdir itself is left in place (see the
+rule body for why removing a shared workdir is unsafe).
 
 Caller passes the per-script identity (basename to grep in /proc) so
 this module isn't tied to a specific script name.
@@ -17,7 +21,8 @@ import time
 from pathlib import Path
 
 from media_stack.config import (
-    CONSOLSUB_DIR_RE, SWEEP_MIN_AGE_S, TMP_MKV_RE,
+    CONSOLSUB_DIR_RE, NORMALIZE_SCRIPT, NORMALIZE_TMP_DIR,
+    NORMALIZE_TMP_MIN_AGE_S, NORMALIZE_TMP_RE, SWEEP_MIN_AGE_S, TMP_MKV_RE,
 )
 
 
@@ -46,6 +51,7 @@ def sweep_orphans(
     deleted_dirs: list[str] = []
     skipped: list[tuple[str, str, str]] = []
     age_cutoff = time.time() - SWEEP_MIN_AGE_S
+    norm_cutoff = time.time() - NORMALIZE_TMP_MIN_AGE_S
 
     for r, dirs, files in os.walk(root):
         for f in files:
@@ -65,6 +71,46 @@ def sweep_orphans(
                 deleted_files.append((str(p), pid))
             except OSError as e:
                 skipped.append(("file-error", str(p), str(e)))
+
+        # normalize-audio.py's `.normalize-tmp` intermediates.  The PID here
+        # belongs to a normalize-audio.py worker, NOT to this sweep's caller:
+        # passing `script_basename` (always "consolidate-subs.py") would test a
+        # normalize PID against the wrong name and read every live encode as
+        # dead, deleting a running 4K render.
+        if Path(r).name == NORMALIZE_TMP_DIR:
+            for f in files:
+                m = NORMALIZE_TMP_RE.search(f)
+                if not m:
+                    continue
+                p = Path(r) / f
+                pid = int(m.group(1))
+                if pid_is_running_script(pid, NORMALIZE_SCRIPT):
+                    skipped.append(("normtmp-active", str(p), f"pid={pid}"))
+                    continue
+                try:
+                    if p.stat().st_mtime > norm_cutoff:
+                        skipped.append(("normtmp-too-young", str(p), f"pid={pid}"))
+                        continue
+                except OSError:
+                    continue
+                if dry_run:
+                    deleted_files.append((str(p), pid))
+                    continue
+                try:
+                    p.unlink()
+                    deleted_files.append((str(p), pid))
+                except OSError as e:
+                    skipped.append(("file-error", str(p), str(e)))
+            # NOTE: the workdir itself is deliberately NOT removed here.
+            # `.normalize-tmp` is shared by every worker in a media folder via
+            # mkdir(exist_ok=True), which does NOT restamp an already-existing
+            # directory.  So an old workdir a live worker has just entered is
+            # indistinguishable, by age or by emptiness, from an abandoned one,
+            # and removing it would delete the output directory out from under
+            # a running render.  There is no cheap coordination available, and
+            # the payload here is the multi-GB intermediates, not a 4 KB dir.
+            # normalize-audio.py:311 already rmdir()s its own workdir on the
+            # way out, which covers the successful case.
 
         # Walk a copy so we can mutate `dirs` to prevent descent into deleted ones
         for d in list(dirs):

@@ -59,6 +59,7 @@ while IFS='|' read -r path event; do
     case "$path" in
         *.consol.*.tmp.mkv|*.tmp.mkv|*.partial|*.consolidate-subs.state.*) continue ;;
         */.dupe-recycle/*) continue ;;
+        */.normalize-tmp/*) continue ;;
     esac
     case "${path,,}" in
         *.mkv|*.mp4)

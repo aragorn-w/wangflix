@@ -32,7 +32,7 @@ from media_stack.config import (  # noqa: E402
     DUAL_AUDIO_KEYWORDS, ENG_LANGS, ENG_SIDECAR_SUFFIXES,
     HTML_FONT_RE, HTML_OTHER_RE, IMAGE_CODECS, JAPANESE_KEYWORDS,
     KOREAN_KEYWORDS, LITERAL_NH_RE, MULTI_BLANK_RE, PIPELINE_VERSION,
-    SIDECAR_EXTS, STILL_IMAGE_VIDEO_CODECS, SWEEP_MIN_AGE_S,
+    NORMALIZE_TMP_DIR, SIDECAR_EXTS, STILL_IMAGE_VIDEO_CODECS, SWEEP_MIN_AGE_S,
     TEXT_CODECS, TMP_MKV_RE, TRAIL_WS_RE,
 )
 from media_stack.lang import (  # noqa: E402
@@ -113,6 +113,24 @@ def _process_file_inner(path_str: str, dry_run: bool = False) -> dict:
     if TMP_MKV_RE.search(path.name):
         return {"path": path_str, "status": "SKIP",
                 "detail": "tmp file (orphan candidate; run --sweep-only to clean)"}
+    # Single-file entry points (the watcher, a manual run) never pass through
+    # walk(), so the prune above cannot cover them.  This must stay BEFORE
+    # acquire_file_lock: locking.py opens the lock file before attempting the
+    # flock, so merely reaching that call deposits a .lock beside the scratch
+    # file even when the lock is never held.
+    # Resolve first: `path.parts` sees only the spelling handed to us, so a
+    # relative invocation from inside the workdir would slip past the check.
+    # On resolution failure we REFUSE rather than fall back to the unresolved
+    # spelling: a guard that falls back to the input it could not verify fails
+    # open, which is precisely the bypass this exists to close.
+    try:
+        _resolved = path.resolve()
+    except OSError as e:
+        return {"path": path_str, "status": "FAIL",
+                "detail": f"cannot resolve path: {e}"}
+    if NORMALIZE_TMP_DIR in _resolved.parts:
+        return {"path": path_str, "status": "SKIP",
+                "detail": "normalize-audio workdir intermediate"}
 
     # Per-file exclusive lock — shared with normalize-audio.py via the
     # centralized `media_stack.locking.acquire_file_lock` helper so the
@@ -493,7 +511,12 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
 
 
 def walk(root: Path):
-    for r, _, files in os.walk(root):
+    # Bind the dirnames slot (was `_`) so we can prune.  normalize-audio.py's
+    # `.normalize-tmp` holds this pipeline's own 4K intermediates; descending
+    # into it made us treat scratch renders as library media and deposit a
+    # flock file beside each one.  Mirrors normalize-audio.py:326.
+    for r, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d != NORMALIZE_TMP_DIR]
         for f in files:
             fl = f.lower()
             if not fl.endswith((".mkv", ".mp4")):

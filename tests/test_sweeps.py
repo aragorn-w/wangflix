@@ -109,3 +109,150 @@ def test_sweep_pidless_workdir_old_enough_deleted(tmp_path):
     res = sweep_orphans(tmp_path, script_basename="anything", dry_run=False)
     assert len(res["deleted_dirs"]) == 1
     assert not wd.exists()
+
+
+# --- .normalize-tmp workdir rule (normalize-audio.py intermediates) ---------
+
+def _normtmp(tmp_path, name, age_s=0):
+    """Make .normalize-tmp/<name>, backdating the file and the dir."""
+    d = tmp_path / ".normalize-tmp"
+    d.mkdir(exist_ok=True)
+    f = d / name
+    f.write_bytes(b"X")
+    if age_s:
+        old = time.time() - age_s
+        os.utime(f, (old, old))
+        os.utime(d, (old, old))
+    return d, f
+
+
+def test_normtmp_dead_pid_old_file_reaped(tmp_path):
+    d, f = _normtmp(tmp_path, ".Movie.99999999.pass2.mkv", age_s=7200)
+    res = sweep_orphans(tmp_path, script_basename="consolidate-subs.py")
+    assert not f.exists()
+    assert str(f) in [p for p, _ in res["deleted_files"]]
+    assert d.exists(), "workdir is shared; it is deliberately left in place"
+
+
+def test_normtmp_live_normalize_pid_preserved(tmp_path):
+    """The PID belongs to a normalize-audio.py worker, not to the caller.
+
+    The mock is identity-aware on purpose: a blanket return_value=True would
+    also accept "consolidate-subs.py", so reverting the rule to the caller's
+    script_basename would still pass and the regression would ship.
+    """
+    seen = []
+
+    def only_normalize(pid, script_basename):
+        seen.append((pid, script_basename))
+        return script_basename == "normalize-audio.py"
+
+    d, f = _normtmp(tmp_path, ".Movie.4242.remux.mkv", age_s=7200)
+    with patch("media_stack.sweeps.pid_is_running_script", side_effect=only_normalize):
+        sweep_orphans(tmp_path, script_basename="consolidate-subs.py")
+    assert f.exists(), "live normalize-audio.py worker's file must survive"
+    assert (4242, "normalize-audio.py") in seen, \
+        "rule must check the PID against normalize-audio.py, not the caller"
+
+
+def test_normtmp_young_file_preserved(tmp_path):
+    d, f = _normtmp(tmp_path, ".Movie.99999999.pass2.mkv", age_s=0)
+    sweep_orphans(tmp_path, script_basename="consolidate-subs.py")
+    assert f.exists(), "an intermediate inside the 60min floor must survive"
+
+
+def test_normtmp_fresh_empty_dir_not_removed(tmp_path):
+    """THE RACE: normalize-audio.py:254 mkdirs the workdir, :261 writes the
+    first file. In that window the dir is empty and a live worker owns it."""
+    d = tmp_path / ".normalize-tmp"
+    d.mkdir()
+    sweep_orphans(tmp_path, script_basename="consolidate-subs.py")
+    assert d.exists(), "a just-created empty workdir must NOT be swept"
+
+
+def test_normtmp_workdir_never_removed(tmp_path):
+    """A shared workdir must never be removed, at any age.
+
+    mkdir(exist_ok=True) does NOT restamp an existing directory, so an old
+    workdir a live worker has just entered looks identical to an abandoned
+    one. Removing it would delete the output dir under a running render.
+    """
+    for age in (0, 7200):
+        d = tmp_path / f"m{age}" / ".normalize-tmp"
+        d.mkdir(parents=True)
+        if age:
+            os.utime(d, (time.time() - age, time.time() - age))
+    res = sweep_orphans(tmp_path, script_basename="consolidate-subs.py")
+    assert res["deleted_dirs"] == []
+    assert (tmp_path / "m0" / ".normalize-tmp").exists()
+    assert (tmp_path / "m7200" / ".normalize-tmp").exists()
+
+
+def test_normtmp_dry_run_deletes_nothing(tmp_path):
+    d, f = _normtmp(tmp_path, ".Movie.99999999.pass2.mkv", age_s=7200)
+    res = sweep_orphans(tmp_path, script_basename="x", dry_run=True)
+    assert f.exists() and d.exists()
+    assert str(f) in [p for p, _ in res["deleted_files"]]
+
+
+def test_normtmp_rule_scoped_to_that_dirname(tmp_path):
+    """Same filename shape outside .normalize-tmp is not this rule's business."""
+    other = tmp_path / "Season 1"
+    other.mkdir()
+    f = other / ".Movie.99999999.pass2.mkv"
+    f.write_bytes(b"X")
+    old = time.time() - 7200
+    os.utime(f, (old, old))
+    sweep_orphans(tmp_path, script_basename="consolidate-subs.py")
+    assert f.exists()
+
+
+def test_normtmp_relative_path_guard(tmp_path, monkeypatch):
+    """A relative single-file invocation from inside the workdir must still
+    be refused. `path.parts` sees only the spelling handed in, so the guard
+    resolves first; without that, this path reaches lock acquisition and
+    deposits a .lock beside a scratch intermediate."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "cs", Path(__file__).resolve().parent.parent / "consolidate-subs.py")
+    m = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(m)
+    except SystemExit:
+        pass
+    d = tmp_path / ".normalize-tmp"
+    d.mkdir()
+    f = d / ".Movie.4242.pass2.mkv"
+    f.write_bytes(b"X")
+    monkeypatch.chdir(d)
+    res = m._process_file_inner(".Movie.4242.pass2.mkv")
+    assert res["status"] == "SKIP"
+    assert "workdir" in res["detail"]
+    assert not list(d.glob(".consolidate-*.lock")), "no lock may be deposited"
+
+
+def test_normtmp_guard_fails_closed_on_resolve_error(tmp_path, monkeypatch):
+    """If the path cannot be resolved the guard must REFUSE, not fall back.
+
+    Falling back to the unresolved spelling reopens the relative-path bypass:
+    a bare filename inside .normalize-tmp has no workdir component in .parts,
+    so it would reach acquire_file_lock and deposit a .lock on scratch.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "cs2", Path(__file__).resolve().parent.parent / "consolidate-subs.py")
+    m = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(m)
+    except SystemExit:
+        pass
+    d = tmp_path / ".normalize-tmp"
+    d.mkdir()
+    f = d / ".Movie.4242.pass2.mkv"
+    f.write_bytes(b"X")
+    monkeypatch.chdir(d)
+    with patch.object(Path, "resolve", side_effect=OSError("ELOOP")):
+        res = m._process_file_inner(".Movie.4242.pass2.mkv")
+    assert res["status"] == "FAIL"
+    assert "resolve" in res["detail"]
+    assert not list(d.glob(".consolidate-*.lock")), "no lock may be deposited"
