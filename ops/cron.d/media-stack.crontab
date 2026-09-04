@@ -29,13 +29,21 @@
 0 3 * * 0 ( docker image prune -af --filter "until=168h" && sudo aptitude autoclean -y && sudo journalctl --vacuum-time=7d ) >> $HOME/media-stack/var/log/weekly-prune.log 2>&1
 
 # Nightly host upgrade — 04:00 daily in the host timezone.  The host clock
-# is set to America/Los_Angeles (2026-06-05) so this is 4 AM Pacific where
-# the operator is for the summer; balls3 itself sits in Colorado but its
-# clock follows the operator's TZ (and auto-tracks PDT/PST).  All the other
-# media-stack cron hours below are likewise interpreted in this host TZ now.
+# is set to America/Denver (2026-09-04, was America/Los_Angeles since
+# 2026-06-05) so this is 4 AM Mountain; balls3 itself sits in Colorado, and the
+# clock now matches the box's own physical location rather than following the
+# operator's TZ. All the other media-stack cron hours below are likewise
+# interpreted in this host TZ now.
 # Lives outside the repo (see $HOME/nightly-upgrade.sh) because it also
 # touches non-media-stack host state.
 0 4 * * * $HOME/nightly-upgrade.sh
+
+# Watchdog for the job above (2026-09-04): nightly-upgrade.sh went
+# silent-unless-failed the same day, so this is what actually proves the 04:00
+# job ran at all, and what catches nightly-upgrade.sh's own Telegram push
+# failing. 90+ minutes of margin past that job's typical <5min runtime. Also
+# lives outside the repo, same reasoning as the line above.
+30 5 * * * $HOME/scripts/nightly-watchdog.sh >> $HOME/media-stack/var/log/nightly-watchdog.log 2>&1
 
 # Nightly subtitle consolidation sweep — idempotent backstop for the
 # consolidate-watch.service inotify watcher.
