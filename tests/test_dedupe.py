@@ -144,3 +144,50 @@ def test_group_by_episode_excludes_unparseable_names():
     assert list(groups.keys()) == [(1, 1)]
     all_names = [v["name"] for names in groups.values() for v in names]
     assert "Show - Special Feature.mkv" not in all_names
+
+
+# --- multi-episode parsing regressions --------------------------------------
+# A combined file reduced to a single (season, episode) key can be "deduped"
+# against a standalone file for that episode, recycling the only copy of the
+# other episode(s).  These cover the two forms the original guard missed.
+
+def test_episode_key_none_for_three_digit_bare_range():
+    """S01E100-101: the primary parser takes 1-4 episode digits, so the bare
+    range guard has to as well.  It previously read this as plain E100."""
+    assert dedupe.episode_key("Show - S01E100-101 - Title WEBRip-720p.mkv") is None
+
+
+def test_episode_key_none_for_range_crossing_two_to_three_digits():
+    assert dedupe.episode_key("Show - S01E99-100 - Title WEBDL-1080p.mkv") is None
+
+
+def test_episode_key_none_for_four_digit_range():
+    assert dedupe.episode_key("Show - S01E1000-1001 - Title.mkv") is None
+
+
+def test_episode_key_none_for_sonarr_duplicate_naming_style():
+    """Sonarr's "Duplicate" multi-episode style repeats the whole token
+    instead of appending a suffix, so the suffix check alone never saw it."""
+    assert dedupe.episode_key("Show - S01E01 - S01E02 - Title WEBRip-1080p.mkv") is None
+
+
+def test_episode_key_none_for_duplicate_style_across_seasons():
+    assert dedupe.episode_key("Show - S01E01 - S02E01 - Title.mkv") is None
+
+
+def test_episode_key_repeated_identical_token_still_parses():
+    """One episode named after itself is not a multi-episode file."""
+    assert dedupe.episode_key("Show - S01E01 - The S01E01 Story.mkv") == (1, 1)
+
+
+def test_episode_key_720p_suffix_not_mistaken_for_range():
+    """Widening the range guard must not swallow resolution tags."""
+    assert dedupe.episode_key("Show.S01E01-720p.mkv") == (1, 1)
+
+
+def test_episode_key_480i_suffix_not_mistaken_for_range():
+    assert dedupe.episode_key("Show.S01E01-480i.mkv") == (1, 1)
+
+
+def test_episode_key_high_episode_number_still_parses():
+    assert dedupe.episode_key("Show - S01E100 - Title WEBDL-1080p.mkv") == (1, 100)

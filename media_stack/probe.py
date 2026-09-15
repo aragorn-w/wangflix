@@ -17,7 +17,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from media_stack.config import PIPELINE_VERSION
+from media_stack.config import PIPELINE_VERSION, STILL_IMAGE_VIDEO_CODECS
 
 
 CONSOLIDATED_TAG = "CONSOLIDATED_SUBS"
@@ -98,3 +98,25 @@ def primary_audio_stream(info: dict) -> dict | None:
         if (s.get("disposition") or {}).get("default"):
             return s
     return audio[0]
+
+
+def real_video_streams(streams: list[dict]) -> list[dict]:
+    """The video streams that carry actual motion picture content.
+
+    Drops two kinds of cover art:
+      - streams flagged with the `attached_pic` disposition (the legitimate,
+        well-formed case), and
+      - still-image codecs (mjpeg/png/...) muxed as bare video streams
+        *without* that flag, which is the malformed case.
+
+    The second kind is why this is shared rather than inlined: players bind to
+    the 640x360 thumbnail instead of the feature and stall at 0s, so every
+    muxing step in the pipeline has to drop them or one step silently undoes
+    another.  Pass the full stream list; non-video streams are ignored.
+    """
+    return [
+        s for s in streams
+        if s.get("codec_type") == "video"
+        and not (s.get("disposition") or {}).get("attached_pic")
+        and s.get("codec_name") not in STILL_IMAGE_VIDEO_CODECS
+    ]

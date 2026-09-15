@@ -122,3 +122,68 @@ def test_replace_and_tag_raises_on_collision_under_lock_mp4(tmp_path):
             na._replace_and_tag(src, remux_out, final_path, backup_path)
     assert src.read_bytes() == b"ORIGINAL"          # untouched
     assert final_path.read_bytes() == b"SIBLING"    # sibling not overwritten
+
+
+# --- _check_stream_regression ----------------------------------------------
+# Regression guard for the interaction between pass 2's cover-art strip and
+# this post-render validation.  Counting *all* video streams here rejected the
+# corrected output ("video count regressed: 2->1") and left the malformed file
+# in place, silently defeating the strip.
+
+def _vid(codec, attached_pic=False):
+    return {"codec_type": "video", "codec_name": codec,
+            "disposition": {"attached_pic": 1} if attached_pic else {}}
+
+
+def _aud():
+    return {"codec_type": "audio", "codec_name": "aac", "disposition": {}}
+
+
+def _sub():
+    return {"codec_type": "subtitle", "codec_name": "subrip", "disposition": {}}
+
+
+def test_guard_allows_intended_cover_art_removal():
+    """hevc + malformed mjpeg in, hevc out — the whole point of the fix."""
+    info = {"streams": [_vid("hevc"), _vid("mjpeg"), _aud()]}
+    new_info = {"streams": [_vid("hevc"), _aud()]}
+    na._check_stream_regression(info, new_info)   # must not raise
+
+
+def test_guard_allows_attached_pic_removal():
+    info = {"streams": [_vid("hevc"), _vid("mjpeg", attached_pic=True), _aud()]}
+    new_info = {"streams": [_vid("hevc"), _aud()]}
+    na._check_stream_regression(info, new_info)
+
+
+def test_guard_allows_multiple_cover_art_removal():
+    info = {"streams": [_vid("hevc"), _vid("mjpeg"), _vid("png"), _aud()]}
+    new_info = {"streams": [_vid("hevc"), _aud()]}
+    na._check_stream_regression(info, new_info)
+
+
+def test_guard_still_rejects_real_video_loss():
+    """Losing genuine motion video remains a hard failure."""
+    info = {"streams": [_vid("hevc"), _vid("h264"), _aud()]}
+    new_info = {"streams": [_vid("hevc"), _aud()]}
+    with pytest.raises(RuntimeError, match="real video count regressed"):
+        na._check_stream_regression(info, new_info)
+
+
+def test_guard_rejects_total_video_loss():
+    info = {"streams": [_vid("hevc"), _aud()]}
+    new_info = {"streams": [_aud()]}
+    with pytest.raises(RuntimeError, match="real video count regressed"):
+        na._check_stream_regression(info, new_info)
+
+
+def test_guard_still_rejects_subtitle_loss():
+    info = {"streams": [_vid("hevc"), _aud(), _sub(), _sub()]}
+    new_info = {"streams": [_vid("hevc"), _aud(), _sub()]}
+    with pytest.raises(RuntimeError, match="sub count regressed"):
+        na._check_stream_regression(info, new_info)
+
+
+def test_guard_passes_unchanged_file():
+    info = {"streams": [_vid("hevc"), _aud(), _sub()]}
+    na._check_stream_regression(info, {"streams": [_vid("hevc"), _aud(), _sub()]})

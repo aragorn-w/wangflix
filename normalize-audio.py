@@ -35,6 +35,7 @@ from media_stack.paths import VAR_LOG, ensure_var_dirs  # noqa: E402
 ensure_var_dirs()  # we're a writer (log file); guarantee dirs exist
 from media_stack.probe import (  # noqa: E402
     ffprobe_strict as ffprobe, already_normalized, primary_audio_stream,
+    real_video_streams,
 )
 from media_stack.loudness import (  # noqa: E402
     AAC_BITRATE, DEFAULT_AAC_BITRATE, TARGET_I, TARGET_LRA, TARGET_TP,
@@ -199,6 +200,27 @@ def _replace_and_tag(src: Path, remux_out: Path, final_path: Path,
         return True
 
 
+def _check_stream_regression(info: dict, new_info: dict) -> None:
+    """Raise if pass 2 silently dropped a subtitle or real-video track.
+
+    Video is compared over `real_video_streams()`, not every video stream.
+    render_normalized deliberately drops still-image cover art muxed as a bare
+    video track, so a malformed input legitimately renders to a lower *total*
+    video count.  Counting raw video streams here would classify that intended
+    strip as a regression, discard the corrected output, and leave the
+    malformed file in place — which is exactly the file the strip exists to
+    repair.  Losing genuine motion video is still a hard failure.
+    """
+    old_subs = sum(1 for s in info["streams"] if s.get("codec_type") == "subtitle")
+    new_subs = sum(1 for s in new_info["streams"] if s.get("codec_type") == "subtitle")
+    if new_subs < old_subs:
+        raise RuntimeError(f"sub count regressed: {old_subs}->{new_subs}")
+    old_video = len(real_video_streams(info["streams"]))
+    new_video = len(real_video_streams(new_info["streams"]))
+    if new_video < old_video:
+        raise RuntimeError(f"real video count regressed: {old_video}->{new_video}")
+
+
 def _process_file_inner_locked(src: Path, path_str: str, dry_run: bool) -> dict:
 
     info = ffprobe(src)
@@ -282,16 +304,9 @@ def _process_file_inner_locked(src: Path, path_str: str, dry_run: bool) -> dict:
                 f"collision: sibling .mkv exists for {src.name}; refusing to overwrite"
             )
 
-        # Verify the renderer didn't somehow drop a sub track silently.
+        # Verify the renderer didn't somehow drop a track silently.
         new_info = ffprobe(remux_out)
-        old_subs = sum(1 for s in info["streams"] if s.get("codec_type") == "subtitle")
-        new_subs = sum(1 for s in new_info["streams"] if s.get("codec_type") == "subtitle")
-        if new_subs < old_subs:
-            raise RuntimeError(f"sub count regressed: {old_subs}->{new_subs}")
-        old_video = sum(1 for s in info["streams"] if s.get("codec_type") == "video")
-        new_video = sum(1 for s in new_info["streams"] if s.get("codec_type") == "video")
-        if new_video < old_video:
-            raise RuntimeError(f"video count regressed: {old_video}->{new_video}")
+        _check_stream_regression(info, new_info)
 
         # Atomic swap + idempotency tag, with rollback if tagging fails
         # (see _replace_and_tag).  A failed tag must NOT report FIXED — the

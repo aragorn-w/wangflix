@@ -32,14 +32,14 @@ from media_stack.config import (  # noqa: E402
     DUAL_AUDIO_KEYWORDS, ENG_LANGS, ENG_SIDECAR_SUFFIXES,
     HTML_FONT_RE, HTML_OTHER_RE, IMAGE_CODECS, JAPANESE_KEYWORDS,
     KOREAN_KEYWORDS, LITERAL_NH_RE, MULTI_BLANK_RE, PIPELINE_VERSION,
-    NORMALIZE_TMP_DIR, SIDECAR_EXTS, STILL_IMAGE_VIDEO_CODECS, SWEEP_MIN_AGE_S,
+    NORMALIZE_TMP_DIR, SIDECAR_EXTS, SWEEP_MIN_AGE_S,
     TEXT_CODECS, TMP_MKV_RE, TRAIL_WS_RE,
 )
 from media_stack.lang import (  # noqa: E402
     ENG_AUDIO_LANGS, JPN_AUDIO_LANGS, KOR_AUDIO_LANGS, canonical_lang,
 )
 from media_stack.probe import (  # noqa: E402
-    already_processed, file_key, probe,
+    already_processed, file_key, probe, real_video_streams,
 )
 from media_stack.state import (  # noqa: E402
     load_state, save_state, update_state_entry,
@@ -415,17 +415,11 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
         # Korean cinema, otherwise eng).
         audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
 
-        # Real motion video streams. Filters out:
-        #  - attached_pic-disposition cover art (legitimate flag),
-        #  - and still-image codecs (mjpeg/png/etc.) embedded as video streams
-        #    without the disposition flag — these cause black-screen-no-audio
-        #    until the player is forced to re-pick on seek.
+        # Real motion video streams — see probe.real_video_streams, which is
+        # shared with normalize-audio's pass 2 so the two muxing steps cannot
+        # disagree about what counts as cover art.
         video_streams_all = [s for s in streams if s.get("codec_type") == "video"]
-        video_streams = [
-            s for s in video_streams_all
-            if not (s.get("disposition") or {}).get("attached_pic")
-            and s.get("codec_name") not in STILL_IMAGE_VIDEO_CODECS
-        ]
+        video_streams = real_video_streams(streams)
         # Belt-and-braces: if multiple real video tracks still remain (rare —
         # e.g. director's-cut alt angle), keep only the default-disposition one,
         # falling back to the first.

@@ -23,6 +23,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from media_stack.probe import ffprobe_strict, real_video_streams
+
 
 # EBU R128 broadcast targets.  Don't change without re-tagging every
 # already-normalized file in the library (current count: 214 movies +
@@ -103,9 +105,24 @@ def render_normalized(
         f":offset={measured['target_offset']}"
         ":linear=true:print_format=summary"
     )
+    # Map real motion video only.  A bare `-map 0:v` also carries over any
+    # still-image cover art muxed as a video stream (mjpeg/png with no
+    # attached_pic flag) that is present in THIS input.  It cannot re-add a track
+    # consolidate-subs already removed - consolidation replaces the file before
+    # calling us - but a file normalized without that strip (a standalone pass, or
+    # one whose consolidation was skipped) kept the malformed track, and players
+    # then bound to the thumbnail and stalled at 0s.  Absolute stream indexes keep
+    # the mapping unambiguous.
+    keep_video = real_video_streams(ffprobe_strict(src).get("streams", []))
+    if not keep_video:
+        raise RuntimeError("loudnorm pass2: no real video stream to map")
+    video_maps: list[str] = []
+    for _vs in keep_video:
+        video_maps += ["-map", f"0:{_vs['index']}"]
+
     cmd = [
         "ffmpeg", "-hide_banner", "-nostats", "-nostdin", "-y", "-i", str(src),
-        "-map", "0:v",
+        *video_maps,
         "-map", f"0:a:{audio_index}",
         "-map", "0:s?",
         "-map", "0:t?",                     # attachments (fonts, etc.)

@@ -45,6 +45,31 @@ services:
     - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY:?WIREGUARD_PRIVATE_KEY missing — see .env.example}
     - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESS:?WIREGUARD_ADDRESS missing — see .env.example}
     - SERVER_COUNTRIES=${VPN_COUNTRY:-Switzerland}
+    # Health checks target IPs, not hostnames.  MITIGATION, not the root fix.
+    # gluetun's default targets (cloudflare.com:443, github.com:443) are resolved by the
+    # health server through gluetun's OWN DNS at 127.0.0.1:53, so a resolver hiccup fails
+    # the liveness check even when the tunnel is perfectly healthy (observed: ICMP 0% loss,
+    # HTTPS egress working and nslookup succeeding inside the container, while the check
+    # failed on "lookup github.com on 127.0.0.1:53: i/o timeout").  Dialling raw IPs removes
+    # resolution from the startup and full periodic checks.  It is not a total DNS removal:
+    # if ICMP becomes unavailable the small check can still fall back to a DNS lookup.  Port 443 still does a full TLS handshake, and both
+    # certificates cover their IP, so this remains a real end-to-end check rather than a
+    # bare socket test.  Verified NOT to weaken tunnel enforcement: both IPs route via tun0
+    # (table 51820), OUTPUT defaults to DROP, neither IP falls inside
+    # FIREWALL_OUTBOUND_SUBNETS, and connections bound to the container's eth0 time out.
+    #
+    # The ROOT cause of the permanently-unhealthy state is believed to be a bug in the pinned
+    # image rather than DNS: the health checker passes results over an unbuffered channel and
+    # can deadlock against its own stop routine, after which recovery never runs again.  The
+    # symptoms here are CONSISTENT WITH that upstream deadlock but were not proven against it
+    # (no goroutine dump was captured).  Evidence on
+    # this host: 5,883 "restarting VPN because it failed to pass the healthcheck" entries
+    # that stopped dead on 2026-09-09, while the failing streak kept climbing to 93,585 six
+    # days later.  HEALTH_RESTART_VPN does fire - it fired thousands of times - and then
+    # stopped for good.  Fixed upstream in v3.41.1 (PR #3123), which is why this service is
+    # no longer pinned to the 2026-01-24 build.  Watchtower is still disabled for gluetun
+    # (label above) because restarting it drops the netns for seven containers.
+    - HEALTH_TARGET_ADDRESSES=1.1.1.1:443,8.8.8.8:443
     - VPN_PORT_FORWARDING=off
     - VPN_PORT_FORWARDING_PROVIDER=protonvpn
     # LAN + Tailnet CGNAT range.  Inbound to published ports already works

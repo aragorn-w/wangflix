@@ -119,7 +119,7 @@ _EPISODE_RE = re.compile(r"[Ss](\d{1,4})[Ee](\d{1,4})")
 # like "1080" (4 digits) can never partially match as "-10": every 1-2
 # digit prefix of a longer digit run is immediately followed by another
 # digit, so the lookahead rejects it at every attempted split.
-_MULTI_EP_SUFFIX_RE = re.compile(r"-?[Ee]\d{1,4}|-\d{1,2}(?!\d)")
+_MULTI_EP_SUFFIX_RE = re.compile(r"-?[Ee]\d{1,4}|-\d{1,4}(?!\d)(?![PpIi])")
 
 
 def episode_key(filename: str) -> tuple[int, int] | None:
@@ -130,12 +130,20 @@ def episode_key(filename: str) -> tuple[int, int] | None:
     release — see ``_MULTI_EP_SUFFIX_RE``) — either way the file can't be
     safely paired with anything for episode-level dedup, so the caller
     must not silently drop it from consideration (see ``group_by_episode``)."""
-    m = _EPISODE_RE.search(filename)
-    if not m:
+    matches = list(_EPISODE_RE.finditer(filename))
+    if not matches:
         return None
-    if _MULTI_EP_SUFFIX_RE.match(filename, m.end()):
+    # Sonarr's "Duplicate" multi-episode naming style repeats the whole token
+    # rather than appending a suffix ("S01E01 - S01E02"), so a second COMPLETE
+    # token is just as much a multi-episode marker as a trailing "-02".  Two
+    # distinct pairs => no safe single key, same as the suffix forms below.
+    keys = {(int(m.group(1)), int(m.group(2))) for m in matches}
+    if len(keys) > 1:
         return None
-    return int(m.group(1)), int(m.group(2))
+    first = matches[0]
+    if _MULTI_EP_SUFFIX_RE.match(filename, first.end()):
+        return None
+    return int(first.group(1)), int(first.group(2))
 
 
 def group_by_episode(videos: list[dict]) -> dict[tuple[int, int], list[dict]]:

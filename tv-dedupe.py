@@ -74,7 +74,7 @@ from media_stack import paths
 from media_stack.clients.arr import ArrClient
 from media_stack.clients.telegram import send as telegram_send
 from media_stack.dedupe import choose_keeper, episode_key, group_by_episode, is_video
-from media_stack.locking import acquire_file_lock, lock_path_for
+from media_stack.locking import acquire_file_lock
 from media_stack.probe import already_processed, probe
 
 
@@ -125,8 +125,14 @@ def _video_meta(folder: Path, name: str) -> dict:
         size = p.stat().st_size
     except OSError:
         size = 0
-    processed = already_processed(probe(p) or {})
-    return {"name": name, "size": size, "processed": processed}
+    info = probe(p)
+    # `probed` is tracked separately from `processed`: probe() is lenient and
+    # returns None for an unreadable file, which collapsed into the same
+    # processed=False as a perfectly readable file carrying no pipeline tag.
+    # Keeper selection could then rank a corrupt file over a healthy one.
+    return {"name": name, "size": size,
+            "processed": already_processed(info or {}),
+            "probed": info is not None}
 
 
 def _notify(summary: str) -> None:
@@ -147,7 +153,43 @@ def _notify(summary: str) -> None:
         log(f"notify error (non-fatal): {type(e).__name__}")
 
 
-def _tracked_by_episode(arr: ArrClient, series_id: int) -> tuple[dict, dict, dict]:
+# Sonarr's container-side root for the default library.  docker-compose mounts
+# host $MEDIA_ROOT/tv at /tv inside the sonarr container, so this is the only
+# root whose records correspond to the default --tv-dir.
+DEFAULT_SONARR_TV_ROOT = os.environ.get("SONARR_TV_ROOT", "/tv")
+
+
+def _accepted_sonarr_root(series_list: list[dict], override: str | None,
+                          is_default_library: bool = True) -> str | None:
+    """The single Sonarr root folder that corresponds to the scanned TV dir.
+
+    Sonarr reports CONTAINER paths ("/tv/Show", rootFolderPath "/tv") while we
+    scan host paths, so a basename match alone proves nothing: an unregistered
+    local "tv/Show" would happily bind to Sonarr's unrelated
+    "/other-library/Show" and we would then DELETE that series' episodefile
+    record (Sonarr deletes the backing file with it).  Requiring one known root
+    makes the mapping explicit.  Returns None when it cannot be established,
+    which the caller treats as "no Sonarr data" (=> RISKY => flagged).
+    """
+    if override:
+        return override.rstrip("/") or "/"
+    if not is_default_library:
+        # An alternate --tv-dir has no known correspondence to any Sonarr root.
+        # Auto-detecting "the only root Sonarr returned" would happily bind an
+        # unrelated library, so demand the mapping be stated explicitly.
+        return None
+    root = DEFAULT_SONARR_TV_ROOT.rstrip("/") or "/"
+    roots = {
+        (s.get("rootFolderPath") or os.path.dirname(s.get("path") or "")).rstrip("/")
+        for s in series_list if s.get("path")
+    }
+    if root not in roots:
+        # Sonarr is not serving the library we are scanning.
+        return None
+    return root
+
+
+def _tracked_by_episode(arr: ArrClient, series_id: int) -> tuple[dict, dict, dict, bool]:
     """Join episodes(series_id) with episode_files(series_id) into:
       - tracked_by_ep: {(season, episode): basename of the file the live
         episode currently tracks}
@@ -159,17 +201,27 @@ def _tracked_by_episode(arr: ArrClient, series_id: int) -> tuple[dict, dict, dic
         folders, and a basename-only index could resolve a duplicate in
         one season to a same-named file's id in a completely different
         season (codex review finding #2) — deleting the wrong record.
-      - episode_by_file_id: {episodefile id: (season, episode)} for every
-        id currently linked to a live episode.  A second, independent
+      - episode_by_file_id: {episodefile id: {(season, episode), ...}} for
+        every id currently linked to a live episode.  A SET because one
+        multi-episode file is owned by every episode it covers.  A second, independent
         safety net on top of the relpath keying: cleanup refuses to
         delete an id that's tracked by an episode OTHER than the one it's
         currently resolving — but still allows deleting an episode's own
         now-stale tracked record (the RISKY+force case: the file just
         moved away WAS this episode's tracked file a moment ago).
-    All three are empty (not None) on endpoint failure so callers don't
-    need a separate None-check; classification just degrades to RISKY
-    and orphan-row cleanup is skipped for this series on this pass."""
-    efiles = arr.episode_files(series_id) or []
+      - tracking_ok: False if EITHER endpoint failed.  The three maps above
+        are still empty-not-None so callers need no None-checks, but an
+        empty map from a failed request is NOT evidence that a file has no
+        owner — callers must refuse to mutate the series when this is
+        False, or the ownership guard silently passes on missing data."""
+    raw_efiles = arr.episode_files(series_id)
+    raw_episodes = arr.episodes(series_id)
+    # A failed request and an empty series both used to collapse to [].  That is
+    # unsafe for the ownership guard: "no owners" then looks identical to "we
+    # could not ask", and a transient endpoint failure would let --force move a
+    # file another episode still owns.  Report usability explicitly.
+    tracking_ok = raw_efiles is not None and raw_episodes is not None
+    efiles = raw_efiles or []
     ep_files_by_id = {f["id"]: f for f in efiles
                       if isinstance(f.get("id"), int) and f.get("relativePath")}
     file_id_by_relpath = {
@@ -177,8 +229,8 @@ def _tracked_by_episode(arr: ArrClient, series_id: int) -> tuple[dict, dict, dic
         for fid, f in ep_files_by_id.items()
     }
     tracked_by_ep: dict[tuple[int, int], str] = {}
-    episode_by_file_id: dict[int, tuple[int, int]] = {}
-    for e in arr.episodes(series_id) or []:
+    episode_by_file_id: dict[int, set[tuple[int, int]]] = {}
+    for e in raw_episodes or []:
         if not e.get("hasFile"):
             continue
         fid = e.get("episodeFileId")
@@ -187,14 +239,41 @@ def _tracked_by_episode(arr: ArrClient, series_id: int) -> tuple[dict, dict, dic
             continue
         key = (e.get("seasonNumber"), e.get("episodeNumber"))
         tracked_by_ep[key] = os.path.basename(f["relativePath"])
-        episode_by_file_id[fid] = key
-    return tracked_by_ep, file_id_by_relpath, episode_by_file_id
+        # A multi-episode file is linked by EVERY episode it covers, so this
+        # must accumulate; assigning would keep only the last owner and let
+        # the guards below think the file is unowned by the others.
+        episode_by_file_id.setdefault(fid, set()).add(key)
+    return tracked_by_ep, file_id_by_relpath, episode_by_file_id, tracking_ok
+
+
+def _extras_owned_by_other_episode(
+    file_id_by_relpath: dict, episode_by_file_id: dict,
+    current_episode: tuple[int, int], season_folder_name: str,
+    extras: list[dict],
+) -> list[str]:
+    """Episodes OTHER than `current_episode` that still own one of `extras`.
+
+    Must run BEFORE any physical move.  A multi-episode file is Sonarr's
+    tracked file for every episode it covers, so an "extra" for E01 can be
+    E02's only library file.  `_cleanup_orphan_episodefiles` also checks
+    ownership, but it runs after the move and can only refuse the DB delete —
+    it cannot put the file back, leaving the other episode with a tracked row
+    pointing at a vacated path.  Returning a non-empty list means: do not
+    touch this group, hand it to a human.
+    """
+    blockers: set[tuple[int, int]] = set()
+    for e in extras:
+        efid = file_id_by_relpath.get(f"{season_folder_name}/{e['name']}")
+        if efid is None:
+            continue
+        blockers |= (episode_by_file_id.get(efid) or set()) - {current_episode}
+    return [f"S{s:02d}E{ep:02d}" for s, ep in sorted(blockers)]
 
 
 def _cleanup_orphan_episodefiles(
     arr: ArrClient | None, file_id_by_relpath: dict, episode_by_file_id: dict,
     current_episode: tuple[int, int], moved_relpaths: list[str],
-) -> None:
+) -> list[str]:
     """After extras have been physically moved to recycle, delete any
     Sonarr episodefile DB row still pointing at their (now-vacated) path.
     Looked up by FULL relativePath (season-folder-relative), never bare
@@ -205,27 +284,37 @@ def _cleanup_orphan_episodefiles(
     force case, where the just-moved file WAS this episode's tracked file).
     Best-effort: a missing record or a failed DELETE is logged, never
     raised — this cleanup is a nice-to-have on top of the physical move,
-    not a precondition for it."""
+    not a precondition for it.  Returns the relpaths whose DELETE failed so
+    the caller can surface them; silently reporting the group as fully
+    resolved hid Sonarr rows still pointing at vacated paths."""
+    failures: list[str] = []
     if arr is None:
-        return
+        return failures
     for relpath in moved_relpaths:
         efid = file_id_by_relpath.get(relpath)
         if efid is None:
             continue
-        owner = episode_by_file_id.get(efid)
-        if owner is not None and owner != current_episode:
+        others = (episode_by_file_id.get(efid) or set()) - {current_episode}
+        if others:
+            who = ", ".join(f"S{s:02d}E{e:02d}" for s, e in sorted(others))
             log(f"  WARNING: skipped Sonarr episodefile id={efid} for {relpath!r} — "
-                f"still tracked by S{owner[0]:02d}E{owner[1]:02d}, refusing to delete")
+                f"still tracked by {who}, refusing to delete")
             continue
         if arr.delete_episode_file(efid):
             log(f"  cleaned orphan Sonarr episodefile id={efid} for {relpath!r}")
         else:
             log(f"  WARNING: failed to clean Sonarr episodefile id={efid} for {relpath!r}")
+            failures.append(relpath)
+    return failures
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Resolve duplicate TV episode files (recoverable).")
     ap.add_argument("--apply", action="store_true", help="perform moves (default: dry run)")
+    ap.add_argument("--sonarr-root", default=None,
+                    help="Sonarr's root folder path for this library as Sonarr "
+                         "reports it (container path, e.g. /tv). Auto-detected "
+                         "when every series shares one root.")
     ap.add_argument("--force", action="store_true",
                     help="also resolve RISKY cases (re-point Sonarr via rescan)")
     ap.add_argument("--notify", action="store_true", help="send a Telegram summary")
@@ -233,6 +322,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     tv_dir = Path(args.tv_dir)
+    default_tv_dir = paths.MEDIA_ROOT / "tv"
     # Recycle sits beside the tv dir under its own "tv" namespace (so it's
     # on the same mergerfs pool -> instant rename, and doesn't collide with
     # movie-dedupe.py's recycled folders) and OUTSIDE the tv library
@@ -248,7 +338,38 @@ def main(argv: list[str] | None = None) -> int:
         if series_list is None:
             log("WARNING: could not list Sonarr series — classification degraded to RISKY")
         else:
-            series_by_folder = {os.path.basename(s.get("path", "")): s for s in series_list}
+            # Index by folder basename, but a basename is NOT unique: Sonarr
+            # can hold /tv/Show and /other/Show.  Silently keeping the last one
+            # would point this scan at a DIFFERENT series' episodefile ids and
+            # let --apply DELETE a foreign record.  Ambiguous basenames are
+            # dropped entirely, so the local folder resolves to no series and
+            # degrades to RISKY (flagged) instead of mutating the wrong show.
+            root = _accepted_sonarr_root(
+                series_list, args.sonarr_root,
+                is_default_library=(tv_dir.resolve() == default_tv_dir.resolve()))
+            if root is None:
+                log("WARNING: could not determine a single Sonarr root folder "
+                    "(pass --sonarr-root) — classification degraded to RISKY")
+                series_list = []
+            ambiguous: set[str] = set()
+            for s in series_list:
+                path = (s.get("path") or "").rstrip("/")
+                base = os.path.basename(path)
+                if not base:
+                    continue
+                # Full-path check, not just the basename: the record must live
+                # directly under the root that maps to the dir we are scanning.
+                if path != f"{root.rstrip('/')}/{base}":
+                    log(f"  ignoring Sonarr series {path!r} — outside accepted "
+                        f"root {root!r}")
+                    continue
+                if base in series_by_folder:
+                    ambiguous.add(base)
+                series_by_folder[base] = s
+            for base in sorted(ambiguous):
+                series_by_folder.pop(base, None)
+                log(f"WARNING: series folder {base!r} matches multiple Sonarr "
+                    f"paths — treating as unknown (manual review)")
 
     if not tv_dir.is_dir():
         log(f"tv dir not found: {tv_dir}")
@@ -258,6 +379,7 @@ def main(argv: list[str] | None = None) -> int:
     forced: list[str] = []          # RISKY resolved under --force
     flagged: list[str] = []         # RISKY left for manual review
     skipped_locked: list[str] = []  # a pipeline holds a lock — retried next pass
+    stale: list[str] = []           # moved, but a Sonarr row could not be cleaned
     errors: list[str] = []
     reclaimed = 0
     manifest: list[dict] = []
@@ -266,10 +388,12 @@ def main(argv: list[str] | None = None) -> int:
         series_rec = series_by_folder.get(series_folder.name)
         tracked_by_ep: dict[tuple[int, int], str] = {}
         file_id_by_relpath: dict[str, int] = {}
-        episode_by_file_id: dict[int, tuple[int, int]] = {}
+        episode_by_file_id: dict[int, set[tuple[int, int]]] = {}
+        tracking_ok = False
         series_id = series_rec.get("id") if series_rec else None
         if arr and series_id is not None:
-            tracked_by_ep, file_id_by_relpath, episode_by_file_id = _tracked_by_episode(arr, series_id)
+            (tracked_by_ep, file_id_by_relpath, episode_by_file_id,
+             tracking_ok) = _tracked_by_episode(arr, series_id)
         else:
             log(f"WARNING: could not resolve Sonarr series for {series_folder.name!r} — "
                 f"classification degraded to RISKY")
@@ -300,6 +424,40 @@ def main(argv: list[str] | None = None) -> int:
                 if not safe and not args.force:
                     flagged.append(label)
                     continue
+
+                # An extra that another episode still tracks is a
+                # multi-episode file; moving it strips that episode of its
+                # only copy.  Checked BEFORE the move, for every extra.
+                blockers = _extras_owned_by_other_episode(
+                    file_id_by_relpath, episode_by_file_id,
+                    (season_num, ep_num), season_folder.name, extras)
+                if blockers:
+                    log(f"  {label}: REFUSING — an extra is also Sonarr's tracked "
+                        f"file for {', '.join(blockers)} (multi-episode file); "
+                        f"needs manual review")
+                    flagged.append(f"{label} (extra owned by {', '.join(blockers)})")
+                    continue
+
+                # RISKY groups are only resolvable via a Sonarr rescan.  Without
+                # a usable client + resolved series there is nothing to reconcile
+                # with, and moving anyway would report success while leaving
+                # Sonarr pointed at a file that is no longer there.
+                # Untrusted tracking data => the ownership guard above is
+                # blind, so no move (SAFE or forced) may proceed for this
+                # series.  SAFE already cannot trigger without a tracked name,
+                # but --force would otherwise sail straight past the guard.
+                if arr is not None and series_id is not None and not tracking_ok:
+                    log(f"  {label}: REFUSING — Sonarr tracking lookup failed for "
+                        f"this series, ownership cannot be verified")
+                    errors.append(f"{label} (Sonarr tracking lookup failed)")
+                    continue
+
+                if not safe and (arr is None or series_id is None):
+                    log(f"  {label}: REFUSING — RISKY but no usable Sonarr client/"
+                        f"series, cannot reconcile after the move")
+                    errors.append(f"{label} (RISKY, Sonarr reconciliation unavailable)")
+                    continue
+
                 if not args.apply:
                     (resolved if safe else forced).append(label)
                     continue
@@ -307,14 +465,75 @@ def main(argv: list[str] | None = None) -> int:
                 # --- perform the move(s) under the per-file media locks ---
                 try:
                     with ExitStack() as locks:
-                        if not all(locks.enter_context(acquire_file_lock(season_folder / e["name"]))
-                                   for e in extras):
+                        # Lock the KEEPER too: its continued existence is what
+                        # makes recycling the extras safe, and locking only the
+                        # extras left it free to vanish mid-run (which recycled
+                        # the last remaining copy of the episode).  Sorted for a
+                        # consistent acquisition order between concurrent runs.
+                        lock_targets = sorted(
+                            [season_folder / keeper_name]
+                            + [season_folder / e["name"] for e in extras])
+                        if not all(locks.enter_context(acquire_file_lock(t))
+                                   for t in lock_targets):
                             log(f"  {label}: a pipeline holds a lock — skipping this pass")
                             skipped_locked.append(label)
                             continue
+                        # Re-validate under the locks: the scan snapshot is old
+                        # by now, and Sonarr imports do not take these locks.
+                        if not (season_folder / keeper_name).is_file():
+                            log(f"  {label}: keeper vanished since the scan — "
+                                f"refusing to recycle the remaining copies")
+                            errors.append(f"{label} (keeper disappeared mid-run)")
+                            continue
+                        # Existing is not the same as usable.  An unprobeable
+                        # keeper may be truncated or corrupt, and recycling the
+                        # readable alternative would leave the episode holding
+                        # only a broken file.
+                        if probe(season_folder / keeper_name) is None:
+                            log(f"  {label}: keeper {keeper_name!r} cannot be probed — "
+                                f"refusing to recycle the readable alternatives")
+                            errors.append(f"{label} (keeper unprobeable)")
+                            continue
+                        gone = [e["name"] for e in extras
+                                if not (season_folder / e["name"]).is_file()]
+                        if gone:
+                            log(f"  {label}: extras vanished since the scan ({gone}) — "
+                                f"skipping, will re-evaluate next pass")
+                            skipped_locked.append(label)
+                            continue
+                        # The tracking snapshot predates the season probe, and
+                        # Sonarr imports do not take these locks.  Re-read it
+                        # under the locks so SAFE, the ownership guard and the
+                        # DELETE targets all reflect current state.
+                        use_ids, use_owners = file_id_by_relpath, episode_by_file_id
+                        if arr is not None and series_id is not None:
+                            (fresh_tracked, fresh_ids, fresh_owners,
+                             fresh_ok) = _tracked_by_episode(arr, series_id)
+                            if not fresh_ok:
+                                log(f"  {label}: Sonarr tracking re-read failed — "
+                                    f"skipping this pass")
+                                errors.append(f"{label} (tracking re-read failed)")
+                                continue
+                            if fresh_tracked.get((season_num, ep_num)) != tracked:
+                                log(f"  {label}: Sonarr tracking changed during the "
+                                    f"scan ({tracked!r} -> "
+                                    f"{fresh_tracked.get((season_num, ep_num))!r}) — "
+                                    f"re-evaluating next pass")
+                                skipped_locked.append(label)
+                                continue
+                            fresh_blockers = _extras_owned_by_other_episode(
+                                fresh_ids, fresh_owners, (season_num, ep_num),
+                                season_folder.name, extras)
+                            if fresh_blockers:
+                                log(f"  {label}: REFUSING — extra became owned by "
+                                    f"{', '.join(fresh_blockers)} during the scan")
+                                flagged.append(f"{label} (extra owned by "
+                                               f"{', '.join(fresh_blockers)})")
+                                continue
+                            use_ids, use_owners = fresh_ids, fresh_owners
+
                         dest = recycle_root / series_folder.name / season_folder.name
                         dest.mkdir(parents=True, exist_ok=True)
-                        moved = []
                         moved_relpaths = []
                         for e in extras:
                             # Collision-safe target: a fixed name risks
@@ -323,7 +542,6 @@ def main(argv: list[str] | None = None) -> int:
                             target = _unique_recycle_target(dest, e["name"])
                             shutil.move(str(season_folder / e["name"]), str(target))
                             reclaimed += e["size"]
-                            moved.append(e["name"])
                             moved_relpaths.append(f"{season_folder.name}/{e['name']}")
                             # Record each move as it happens (not after the
                             # whole batch) so a LATER extra's move failing
@@ -333,11 +551,16 @@ def main(argv: list[str] | None = None) -> int:
                                              "tracked": tracked, "moved": [e["name"]],
                                              "recycled_as": target.name, "safe": safe})
 
-                        _cleanup_orphan_episodefiles(
-                            arr, file_id_by_relpath, episode_by_file_id,
+                        cleanup_failures = _cleanup_orphan_episodefiles(
+                            arr, use_ids, use_owners,
                             (season_num, ep_num), moved_relpaths)
+                        if cleanup_failures:
+                            # One entry per ROW, not per group: the summary
+                            # labels this a row count, and a single group can
+                            # leave several rows behind.
+                            stale.extend(f"{label}: {r}" for r in cleanup_failures)
 
-                        if not safe and arr and series_id is not None:
+                        if not safe:
                             # RISKY + --force: Sonarr was tracking a moved file ->
                             # rescan so it re-imports the keeper, then verify.
                             if not arr.rescan_series(series_id):
@@ -354,7 +577,7 @@ def main(argv: list[str] | None = None) -> int:
                             remaining_group = group_by_episode(remaining_metas).get(
                                 (season_num, ep_num), [])
                             remaining_names = [v["name"] for v in remaining_group]
-                            new_tracked_by_ep, _, _ = _tracked_by_episode(arr, series_id)
+                            new_tracked_by_ep, _, _, _ = _tracked_by_episode(arr, series_id)
                             cur_tracked = new_tracked_by_ep.get((season_num, ep_num))
                             if len(remaining_names) == 1 and cur_tracked == remaining_names[0]:
                                 forced.append(label)
@@ -363,15 +586,14 @@ def main(argv: list[str] | None = None) -> int:
                                               f"remaining={len(remaining_names)})")
                         else:
                             resolved.append(label)
-                    # Locks released.  The moved extras no longer exist at their
-                    # old paths, so their per-file lock files are dead — drop
-                    # them (same "never unlink" rule as movie-dedupe.py guards
-                    # against a fresh file reappearing at the path).
-                    for name in moved:
-                        try:
-                            os.unlink(lock_path_for(season_folder / name))
-                        except OSError:
-                            pass
+                    # Locks released.  The per-file lock files are deliberately
+                    # LEFT IN PLACE.  Unlinking a released lock breaks the shared
+                    # helper's persistent-lock invariant: a replacement import can
+                    # recreate the media path and another worker can hold that
+                    # lock inode, and removing the pathname then lets a third
+                    # worker create and lock a DIFFERENT inode for the same path —
+                    # two writers, same media.  An empty stale lock file is
+                    # harmless; a missing one is not.
                 except Exception as e:
                     errors.append(f"{label}: {type(e).__name__}: {e}")
 
@@ -387,27 +609,36 @@ def main(argv: list[str] | None = None) -> int:
     gb = reclaimed / (1024 ** 3)
     summary = (f"tv-dedupe {mode}: resolved={len(resolved)} "
                f"flagged(manual)={len(flagged)} forced={len(forced)} "
-               f"locked-skipped={len(skipped_locked)} errors={len(errors)} "
-               f"reclaimed={gb:.1f}GB")
+               f"locked-skipped={len(skipped_locked)} stale-rows={len(stale)} "
+               f"errors={len(errors)} reclaimed={gb:.1f}GB")
     log(summary)
     if flagged:
         log("manual review (Sonarr tracks a non-keeper; re-run with --force "
             f"after checking): {flagged}")
+    if stale:
+        # Deliberately NOT "re-run to retry": cleanup only runs for groups that
+        # still have duplicates, and the extras have already moved, so the next
+        # pass sees a singleton and skips it.  These rows need a human.
+        log("moved, but these Sonarr rows could not be deleted and will NOT be "
+            f"retried automatically — clear them in Sonarr: {stale}")
     if errors:
         log(f"errors: {errors}")
 
-    if args.notify and (resolved or forced or flagged or errors):
+    if args.notify and (resolved or forced or flagged or errors or stale):
         body = summary
         if flagged:
             body += "\n\nmanual review needed: " + ", ".join(flagged)
+        if stale:
+            body += "\n\nstale Sonarr rows: " + ", ".join(stale)
         if errors:
             body += "\n\nerrors: " + "; ".join(errors)
         _notify(body)
 
-    # Non-zero when something needs a human: flagged RISKY episodes or hard
-    # errors (failed move / failed post-rescan verify).  locked-skipped is
-    # transient (retried next pass), so it does NOT fail the run.
-    return 1 if flagged or errors else 0
+    # Non-zero when something needs a human: flagged RISKY episodes, hard
+    # errors (failed move / failed post-rescan verify), or stale Sonarr rows
+    # (which no later run will retry — see above).  locked-skipped IS retried
+    # next pass, so it alone does NOT fail the run.
+    return 1 if flagged or errors or stale else 0
 
 
 if __name__ == "__main__":

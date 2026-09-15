@@ -105,7 +105,7 @@ Bazarr settings, etc.) stays where it is so the bind-mounts in
   - **Cover art:** drops still-image "video" tracks (mjpeg/png/jpeg) lacking `attached_pic` disposition — these caused black-screen-no-audio bugs.
   - **Idempotency:** state file at `var/state/consolidate-subs.state.json` + mkv global tag `CONSOLIDATED_SUBS=v2`. Bump `PIPELINE_VERSION` to trigger re-flow.
 
-- **Audio loudness (EBU R128 -23 LUFS):** `normalize-audio.py`. Two-pass `loudnorm`; tags `NORMALIZED_AUDIO=v1` in MKV format_tags. Atmos 7.1.2 inputs (FL+FR+FC+LFE+SL+SR+TFL+TFR) get downmixed to 5.1 before AAC encode (native ffmpeg AAC can't take non-standard 8ch).
+- **Audio loudness (EBU R128 -23 LUFS):** `normalize-audio.py`. Two-pass `loudnorm`; tags `NORMALIZED_AUDIO=v1` in MKV format_tags. Pass 2 maps real motion video only, via the shared `probe.real_video_streams` classifier — a bare `-map 0:v` carried over any still-image cover-art track still present in its input, so a file normalized without having been through consolidate-subs' strip kept the malformed mjpeg/png track and stalled Jellyfin Android TV at 0ms. (Normalization cannot re-add a track consolidation already removed; consolidation replaces the file before calling it.) Atmos 7.1.2 inputs (FL+FR+FC+LFE+SL+SR+TFL+TFR) get downmixed to 5.1 before AAC encode (native ffmpeg AAC can't take non-standard 8ch).
 
 - **Driver:** `normalize-driver.sh` runs every 15 min via cron. Idempotent — checks coverage; relaunches sweep with `setsid` at `JOBS=5` if dead and <100%; touches `normalize-driver.done` + Telegram-notifies when complete. JOBS history: 8/6/4 all ≥50% pass2-timeout fail rate; 3 = 0% but slow (~2/hr); 5 = ~18% fail at ~3/hr (winner). Overridable via `JOBS=N` in `.env`.
 
