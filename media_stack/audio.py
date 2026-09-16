@@ -63,10 +63,11 @@ def get_audio_lang_pref(
     wanted).
 
     Decision order (first match wins):
-    1. /anime/ path or `JAPANESE_KEYWORDS` in filename → eng+jpn allowed,
+    1. `DUAL_AUDIO_KEYWORDS` in the path → eng+jpn allowed, jpn primary,
+       multi_keep=True.  Checked FIRST so an explicit per-title opt-in beats
+       the broad anime default below; a title may legitimately be in both sets.
+    2. /anime/ path or `JAPANESE_KEYWORDS` in the path → eng+jpn allowed,
        jpn primary, multi_keep=False (anime preference: prune dubs).
-    2. `DUAL_AUDIO_KEYWORDS` in filename → eng+jpn allowed, jpn primary,
-       multi_keep=True.
     3. `KOREAN_KEYWORDS` → eng+kor allowed, kor primary, multi_keep=False.
     4. Probed audio has both eng + jpn AND a jpn stream carries
        default-OR-original disposition → eng+jpn, jpn primary,
@@ -75,14 +76,24 @@ def get_audio_lang_pref(
     5. Same for eng + kor.
     6. Fallback: eng primary, English-only allowed list, multi_keep=False.
 
+    Rules 1-3 are case-insensitive SUBSTRING matches against the whole
+    lowercased path, not just the basename, so a keyword in a parent
+    directory (series folder, collection folder, library root) matches too.
+
     `audios` is optional for backward compatibility.  Omit it to apply
-    only the filename rules (rules 1-3, 6).
+    only the path rules (rules 1-3, 6).
     """
     pl = str(filepath).lower()
-    if "/anime/" in pl or any(kw in pl for kw in JAPANESE_KEYWORDS):
-        return ENG_AUDIO_LANGS | JPN_AUDIO_LANGS, "jpn", False
+    # DUAL_AUDIO_KEYWORDS is checked FIRST: it is an explicit per-title opt-in to keeping
+    # both tracks, and it must beat the broad anime default below, which prunes dubs.  A
+    # title can legitimately be in both sets - "May I Ask for One Final Thing" is an anime
+    # (so it matches JAPANESE_KEYWORDS by name) that the operator wants dual-audio.  With
+    # the old ordering the anime rule won and silently discarded the English dub on import,
+    # so grabbing a dual-audio release could never produce a dual-audio library file.
     if any(kw in pl for kw in DUAL_AUDIO_KEYWORDS):
         return ENG_AUDIO_LANGS | JPN_AUDIO_LANGS, "jpn", True
+    if "/anime/" in pl or any(kw in pl for kw in JAPANESE_KEYWORDS):
+        return ENG_AUDIO_LANGS | JPN_AUDIO_LANGS, "jpn", False
     if any(kw in pl for kw in KOREAN_KEYWORDS):
         return ENG_AUDIO_LANGS | KOR_AUDIO_LANGS, "kor", False
 

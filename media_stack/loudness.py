@@ -78,9 +78,13 @@ def render_normalized(
     measured: dict,
     channel_layout: str = "",
 ) -> None:
-    """Pass 2: write dst with primary audio re-encoded via loudnorm
-    using the pass-1 measured values, all video + sub + attachment
-    streams copied, single matroska output.
+    """Pass 2: write dst with the primary audio track re-encoded via
+    loudnorm using the pass-1 measured values.  Copied through: the video
+    streams `real_video_streams()` accepts, EVERY other audio track,
+    subtitles, attachments, chapters and metadata.  Not carried over:
+    video that classifier rejects (still-image cover art, deliberately)
+    and data streams, which are never mapped.  Single matroska output.
+    `audio_index` is audio-relative (0 = first audio stream).
 
     For Atmos / non-standard >6ch layouts (e.g. `FL+FR+FC+LFE+SL+SR+TFL+TFR`
     on Mandalorian S3 Bluray), native AAC's encoder rejects the layout.
@@ -113,17 +117,48 @@ def render_normalized(
     # one whose consolidation was skipped) kept the malformed track, and players
     # then bound to the thumbnail and stalled at 0s.  Absolute stream indexes keep
     # the mapping unambiguous.
-    keep_video = real_video_streams(ffprobe_strict(src).get("streams", []))
+    probe_streams = ffprobe_strict(src).get("streams", [])
+    keep_video = real_video_streams(probe_streams)
     if not keep_video:
         raise RuntimeError("loudnorm pass2: no real video stream to map")
     video_maps: list[str] = []
     for _vs in keep_video:
         video_maps += ["-map", f"0:{_vs['index']}"]
 
+    # Map EVERY audio stream, re-encoding only the primary.  Track *selection* is
+    # consolidate-subs' job, and it hands us the file it just built: for a
+    # dual-audio title that file deliberately holds both the original-language
+    # track and the English dub.  Mapping only `0:a:<primary>` here silently threw
+    # the dub away again moments after consolidation kept it, and
+    # _check_stream_regression never caught it because it used to count subtitles
+    # and video but not audio (it counts audio now).  Secondary tracks are
+    # stream-copied, so preserving them costs no quality and no encode time.
+    audio_streams = [s for s in probe_streams if s.get("codec_type") == "audio"]
+    if not 0 <= audio_index < len(audio_streams):
+        raise RuntimeError(
+            f"loudnorm pass2: audio_index {audio_index} out of range "
+            f"({len(audio_streams)} audio stream(s))"
+        )
+    audio_maps: list[str] = []
+    audio_args: list[str] = []
+    for pos in range(len(audio_streams)):
+        # Output audio stream `pos` == input audio stream `pos`, because the maps
+        # below are emitted in input order.  The per-stream specifiers matter: a
+        # bare `-c:a`/`-af`/`-ac` would also hit the copied tracks and either
+        # re-encode or corrupt them.
+        audio_maps += ["-map", f"0:a:{pos}"]
+        if pos == audio_index:
+            audio_args += [f"-c:a:{pos}", "aac", f"-b:a:{pos}", bitrate,
+                           f"-filter:a:{pos}", af]
+            if needs_downmix:
+                audio_args += [f"-ac:a:{pos}", str(channels_out)]
+        else:
+            audio_args += [f"-c:a:{pos}", "copy"]
+
     cmd = [
         "ffmpeg", "-hide_banner", "-nostats", "-nostdin", "-y", "-i", str(src),
         *video_maps,
-        "-map", f"0:a:{audio_index}",
+        *audio_maps,
         "-map", "0:s?",
         "-map", "0:t?",                     # attachments (fonts, etc.)
         "-map_chapters", "0",
@@ -131,12 +166,9 @@ def render_normalized(
         "-c:v", "copy",
         "-c:s", "copy",
         "-c:t", "copy",
-        "-c:a", "aac", "-b:a", bitrate,
-        "-af", af,
+        *audio_args,
+        "-f", "matroska", str(dst),
     ]
-    if needs_downmix:
-        cmd += ["-ac", str(channels_out)]
-    cmd += ["-f", "matroska", str(dst)]
     # Pass2 re-encodes audio + stream-copies the rest.  3600s floor gives
     # 1080p re-encodes a 60-min budget; size term scales up for UHDs.
     size_mb = src.stat().st_size / 1e6

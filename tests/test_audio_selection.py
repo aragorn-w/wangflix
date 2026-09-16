@@ -218,3 +218,45 @@ def test_select_single_mode_returns_only_best():
     allowed = cs.ENG_AUDIO_LANGS | cs.JPN_AUDIO_LANGS
     kept = cs.select_keep_audio(audios, allowed, "jpn", multi_keep=False)
     assert kept == [1]
+
+
+# --- dual-audio opt-in vs the anime default --------------------------------------
+# A title can match BOTH JAPANESE_KEYWORDS (it is an anime) and DUAL_AUDIO_KEYWORDS
+# (the operator wants both tracks).  The explicit opt-in must win, otherwise the anime
+# rule prunes the English dub on import and a dual-audio release can never yield a
+# dual-audio library file.
+
+def _dual_audio_streams():
+    return [{"codec_type": "audio", "tags": {"language": "jpn"}, "disposition": {"default": 1}},
+            {"codec_type": "audio", "tags": {"language": "eng"}, "disposition": {"default": 0}}]
+
+
+def test_dual_audio_optin_beats_anime_rule():
+    from media_stack.audio import get_audio_lang_pref
+    p = Path("/m/tv/May I Ask for One Final Thing!/Season 1/ep.mkv")
+    _allowed, primary, multi = get_audio_lang_pref(p, _dual_audio_streams())
+    assert primary == "jpn"
+    assert multi is True, "opted-in title must keep both audio tracks"
+
+
+def test_plain_anime_still_prunes_the_dub():
+    """Regression: reordering the checks must not change ordinary anime handling."""
+    from media_stack.audio import get_audio_lang_pref
+    p = Path("/m/tv/Aggretsuko/Season 1/ep.mkv")
+    _allowed, primary, multi = get_audio_lang_pref(p, _dual_audio_streams())
+    assert primary == "jpn"
+    assert multi is False
+
+
+def test_anime_path_still_prunes_the_dub():
+    from media_stack.audio import get_audio_lang_pref
+    p = Path("/m/anime/Some Show/Season 1/ep.mkv")
+    _allowed, primary, multi = get_audio_lang_pref(p, _dual_audio_streams())
+    assert primary == "jpn" and multi is False
+
+
+def test_existing_dual_audio_titles_unaffected():
+    from media_stack.audio import get_audio_lang_pref
+    p = Path("/m/movies/Godzilla Minus One (2023)/f.mkv")
+    _allowed, primary, multi = get_audio_lang_pref(p, _dual_audio_streams())
+    assert primary == "jpn" and multi is True

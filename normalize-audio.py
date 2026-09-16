@@ -201,7 +201,7 @@ def _replace_and_tag(src: Path, remux_out: Path, final_path: Path,
 
 
 def _check_stream_regression(info: dict, new_info: dict) -> None:
-    """Raise if pass 2 silently dropped a subtitle or real-video track.
+    """Raise if pass 2 silently dropped a subtitle, audio or real-video track.
 
     Video is compared over `real_video_streams()`, not every video stream.
     render_normalized deliberately drops still-image cover art muxed as a bare
@@ -210,11 +210,22 @@ def _check_stream_regression(info: dict, new_info: dict) -> None:
     strip as a regression, discard the corrected output, and leave the
     malformed file in place — which is exactly the file the strip exists to
     repair.  Losing genuine motion video is still a hard failure.
+
+    Audio is counted too.  It was not, originally, because pass 2 only ever
+    mapped the primary track, so every multi-audio file "regressed" by design.
+    That made this guard blind to the real defect: consolidate-subs keeps both
+    tracks of a dual-audio title and then calls straight into normalization,
+    which dropped the second one again with nothing to catch it.  Pass 2 now
+    preserves all audio, so any audio loss here is a genuine fault.
     """
     old_subs = sum(1 for s in info["streams"] if s.get("codec_type") == "subtitle")
     new_subs = sum(1 for s in new_info["streams"] if s.get("codec_type") == "subtitle")
     if new_subs < old_subs:
         raise RuntimeError(f"sub count regressed: {old_subs}->{new_subs}")
+    old_audio = sum(1 for s in info["streams"] if s.get("codec_type") == "audio")
+    new_audio = sum(1 for s in new_info["streams"] if s.get("codec_type") == "audio")
+    if new_audio < old_audio:
+        raise RuntimeError(f"audio count regressed: {old_audio}->{new_audio}")
     old_video = len(real_video_streams(info["streams"]))
     new_video = len(real_video_streams(new_info["streams"]))
     if new_video < old_video:

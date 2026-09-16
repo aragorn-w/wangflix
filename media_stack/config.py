@@ -54,11 +54,13 @@ TRAIL_WS_RE     = re.compile(r"[ \t]+$", re.MULTILINE)
 MULTI_BLANK_RE  = re.compile(r"\n{3,}")
 
 
-# Audio language pref by filename keyword.
+# Audio language pref by keyword, matched as a substring of the lowercased
+# FULL PATH (not just the basename).
 # Titles where the user prefers a SINGLE Japanese primary audio track and
-# pruning of English dubs (anime purist preference).  Keep separate from
-# DUAL_AUDIO_KEYWORDS, which is live-action foreign-original films where
-# BOTH the original-language and English-dub tracks are wanted.
+# pruning of English dubs (anime purist preference).  This is the DEFAULT for
+# anime, not an absolute rule: a title listed here as well as in
+# DUAL_AUDIO_KEYWORDS keeps both tracks, because get_audio_lang_pref checks
+# that set first.  Membership here only prunes dubs for titles NOT opted in.
 JAPANESE_KEYWORDS: set[str] = {
     "aggretsuko", "one piece", "naruto", "dragon ball", "attack on titan",
     "demon slayer", "jujutsu kaisen", "my hero academia", "fullmetal",
@@ -75,13 +77,18 @@ JAPANESE_KEYWORDS: set[str] = {
     "pop team epic", "may i ask for one final thing",
 }
 
-# Live-action foreign-original films where the user wants BOTH the
-# foreign original-language track AND the English-dub kept (so they can
-# pick at playback time, e.g. Godzilla Minus One).  Distinct from
-# JAPANESE_KEYWORDS above which is anime — there, English dubs are
-# pruned by preference.
+# Titles where the user wants BOTH the foreign original-language track AND
+# the English dub kept, so they can pick at playback time.  Mostly live-action
+# foreign-original films (Godzilla Minus One), but NOT restricted to them:
+# this is the explicit per-title opt-in that OVERRIDES the anime default in
+# JAPANESE_KEYWORDS, and a title may deliberately appear in both sets.
+# get_audio_lang_pref checks this set first for exactly that reason.
 DUAL_AUDIO_KEYWORDS: set[str] = {
     "godzilla minus one", "shin godzilla",
+    # Anime the operator wants BOTH the Japanese original and the English dub for.
+    # Checked before JAPANESE_KEYWORDS in get_audio_lang_pref, so being in both sets is
+    # fine and means "keep both" rather than the anime default of "prune the dub".
+    "may i ask for one final thing",
 }
 
 KOREAN_KEYWORDS: set[str] = {

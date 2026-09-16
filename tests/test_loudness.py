@@ -28,7 +28,7 @@ def _streams(*specs):
             for i, t, c, ap in specs]
 
 
-def _run_pass2(tmp_path, streams):
+def _run_pass2(tmp_path, streams, audio_index=0, channels=6, layout="5.1"):
     """Invoke render_normalized with ffprobe + ffmpeg mocked; return argv."""
     src = tmp_path / "in.mkv"
     src.write_bytes(b"X" * 200_000)
@@ -43,7 +43,7 @@ def _run_pass2(tmp_path, streams):
     with patch("media_stack.loudness.ffprobe_strict",
                return_value={"streams": streams}), \
          patch("media_stack.loudness.subprocess.run", side_effect=fake_run):
-        render_normalized(src, dst, 0, "aac", 6, MEASURED, "5.1")
+        render_normalized(src, dst, audio_index, "aac", channels, MEASURED, layout)
     return captured["cmd"]
 
 
@@ -123,3 +123,92 @@ def test_pass2_raises_when_no_real_video(tmp_path):
             (0, "video", "mjpeg", False),
             (1, "audio", "aac", False),
         ))
+
+
+# --- audio-track preservation ------------------------------------------------
+# Pass 2 used to map only `0:a:<primary>`.  consolidate-subs decides which audio
+# tracks a library file keeps (a dual-audio title keeps the original AND the
+# English dub) and then calls straight into normalization, so that single map
+# silently destroyed the dub moments after consolidation had kept it.
+
+def _audio_maps(cmd):
+    return [cmd[i + 1] for i, a in enumerate(cmd)
+            if a == "-map" and cmd[i + 1].startswith("0:a:")]
+
+
+def _arg_after(cmd, flag):
+    return cmd[cmd.index(flag) + 1]
+
+
+def _dual_audio_streams():
+    return _streams(
+        (0, "video", "hevc", False),
+        (1, "audio", "aac", False),      # primary (original language)
+        (2, "audio", "ac3", False),      # English dub
+    )
+
+
+def test_pass2_keeps_every_audio_track(tmp_path):
+    cmd = _run_pass2(tmp_path, _dual_audio_streams())
+    assert _audio_maps(cmd) == ["0:a:0", "0:a:1"]
+
+
+def test_pass2_reencodes_primary_and_copies_the_rest(tmp_path):
+    cmd = _run_pass2(tmp_path, _dual_audio_streams())
+    assert _arg_after(cmd, "-c:a:0") == "aac"
+    assert _arg_after(cmd, "-c:a:1") == "copy"
+    assert "-filter:a:0" in cmd, "loudnorm must be applied to the primary"
+    assert "-filter:a:1" not in cmd, "loudnorm must not touch a copied track"
+
+
+def test_pass2_uses_no_global_audio_flags(tmp_path):
+    """A bare -c:a / -af / -ac / -b:a also hits the stream-copied tracks,
+    which would re-encode or mangle them."""
+    cmd = _run_pass2(tmp_path, _dual_audio_streams())
+    for bad in ("-c:a", "-af", "-ac", "-b:a"):
+        assert bad not in cmd, f"{bad} applies to every audio stream"
+
+
+def test_pass2_honours_which_track_is_primary(tmp_path):
+    """audio_index selects which mapped track gets loudnorm, not which is kept."""
+    cmd = _run_pass2(tmp_path, _dual_audio_streams(), audio_index=1)
+    assert _audio_maps(cmd) == ["0:a:0", "0:a:1"]
+    assert _arg_after(cmd, "-c:a:0") == "copy"
+    assert _arg_after(cmd, "-c:a:1") == "aac"
+    assert "-filter:a:1" in cmd
+    assert "-filter:a:0" not in cmd
+
+
+def test_pass2_single_audio_file_still_reencodes(tmp_path):
+    cmd = _run_pass2(tmp_path, _streams(
+        (0, "video", "hevc", False),
+        (1, "audio", "aac", False),
+    ))
+    assert _audio_maps(cmd) == ["0:a:0"]
+    assert _arg_after(cmd, "-c:a:0") == "aac"
+
+
+def test_pass2_downmix_targets_only_the_primary(tmp_path):
+    """Atmos downmix is per-stream; applied globally it would mangle the
+    stream-copied secondary track."""
+    cmd = _run_pass2(tmp_path, _streams(
+        (0, "video", "hevc", False),
+        (1, "audio", "truehd", False),
+        (2, "audio", "ac3", False),
+    ), channels=8, layout="FL+FR+FC+LFE+SL+SR+TFL+TFR")
+    assert _arg_after(cmd, "-ac:a:0") == "6"
+    assert "-ac" not in cmd
+    assert "-ac:a:1" not in cmd
+
+
+def test_pass2_raises_when_audio_index_out_of_range(tmp_path):
+    with pytest.raises(RuntimeError, match="audio_index"):
+        _run_pass2(tmp_path, _streams(
+            (0, "video", "hevc", False),
+            (1, "audio", "aac", False),
+        ), audio_index=3)
+
+
+def test_pass2_raises_when_there_is_no_audio(tmp_path):
+    with pytest.raises(RuntimeError, match="audio_index"):
+        _run_pass2(tmp_path, _streams((0, "video", "hevc", False)))

@@ -187,3 +187,18 @@ def test_guard_still_rejects_subtitle_loss():
 def test_guard_passes_unchanged_file():
     info = {"streams": [_vid("hevc"), _aud(), _sub()]}
     na._check_stream_regression(info, {"streams": [_vid("hevc"), _aud(), _sub()]})
+
+
+def test_guard_rejects_audio_loss():
+    """The dual-audio defect: pass 2 dropping the English dub must fail loudly
+    rather than being accepted as a valid replacement."""
+    info = {"streams": [_vid("hevc"), _aud(), _aud()]}
+    new_info = {"streams": [_vid("hevc"), _aud()]}
+    with pytest.raises(RuntimeError, match="audio count regressed"):
+        na._check_stream_regression(info, new_info)
+
+
+def test_guard_allows_unchanged_dual_audio():
+    info = {"streams": [_vid("hevc"), _aud(), _aud(), _sub()]}
+    na._check_stream_regression(
+        info, {"streams": [_vid("hevc"), _aud(), _aud(), _sub()]})
