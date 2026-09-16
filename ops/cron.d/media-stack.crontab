@@ -80,3 +80,11 @@
 # non-zero exit (FAIL=1, WARN=2) fires a Telegram notification with the
 # last 30 lines of the failure context.  Closes AUDIT A9 + codex round-13 #1.
 0 * * * * $HOME/media-stack/ops/healthcheck-alert.sh >> $HOME/media-stack/var/log/healthcheck.log 2>&1
+# ProtonVPN's forwarded port is dynamic and changes on reconnect, and
+# qBittorrent has no way to learn that.  Reconcile the two on a timer rather
+# than via gluetun's one-shot up-command hook, which fires before qBittorrent
+# is necessarily up, is not retried on failure, and does nothing when
+# qBittorrent restarts by itself and reverts to its stored port.  Idempotent:
+# a no-op when they already agree.
+*/5 * * * * python3 $HOME/media-stack/sync-forwarded-port.py >> $HOME/media-stack/var/log/sync-forwarded-port.log 2>&1
+

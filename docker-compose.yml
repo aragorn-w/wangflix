@@ -22,8 +22,11 @@ services:
     # binding for your Tailscale IP) before bringing the stack up.
     ports:
     - 8090:8090
-    - 54321:54321
-    - 54321:54321/udp
+    # 54321/tcp+udp removed 2026-09-16.  They published a STATIC port that
+    # ProtonVPN never forwarded, so nothing on the internet could reach it; the
+    # mapping only documented an inbound path that did not exist.  Inbound peer
+    # traffic now arrives on the port Proton actually allocates, which gluetun
+    # opens in its own firewall automatically and which is not a host publish.
     - 9696:9696
     - 8989:8989
     - 7878:7878
@@ -41,7 +44,6 @@ services:
     environment:
     - VPN_SERVICE_PROVIDER=protonvpn
     - VPN_TYPE=wireguard
-    - FIREWALL_VPN_INPUT_PORTS=54321
     - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY:?WIREGUARD_PRIVATE_KEY missing — see .env.example}
     - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESS:?WIREGUARD_ADDRESS missing — see .env.example}
     - SERVER_COUNTRIES=${VPN_COUNTRY:-Switzerland}
@@ -70,8 +72,39 @@ services:
     # no longer pinned to the 2026-01-24 build.  Watchtower is still disabled for gluetun
     # (label above) because restarting it drops the netns for seven containers.
     - HEALTH_TARGET_ADDRESSES=1.1.1.1:443,8.8.8.8:443
-    - VPN_PORT_FORWARDING=off
-    - VPN_PORT_FORWARDING_PROVIDER=protonvpn
+    # ProtonVPN port forwarding.  Without this qBittorrent is outbound-only: it
+    # can dial peers but no peer can ever dial it, which hurts sparse swarms.
+    #
+    # PORT_FORWARD_ONLY is REQUIRED, not optional.  Proton only forwards on its
+    # P2P servers, and SERVER_COUNTRIES alone does not prefer them, so without
+    # this gluetun can connect to a perfectly healthy server that will never
+    # grant a port and forwarding silently does nothing.
+    #
+    # A NAT-PMP-ENABLED WIREGUARD KEY IS ALSO REQUIRED.  Proton hands the port
+    # out over NAT-PMP (udp/5351) and the key must be generated with that
+    # enabled in Proton's dashboard.  As of 2026-09-16 this host's key was NOT,
+    # so allocation fails with "connection refused" on 5351 and no port is
+    # granted.  gluetun does not retry a failed initial allocation, so after
+    # swapping in a NAT-PMP key you must RECREATE gluetun, not just wait.  Checked against
+    # gluetun's own embedded server list: Switzerland has 18 port_forward-capable
+    # entries out of 28, so this filter still leaves real choice rather than
+    # pinning the tunnel to one host.
+    #
+    # The allocated port is DYNAMIC (Proton: "the port number usually changes
+    # when you reconnect"), so there is deliberately no static port anywhere in
+    # this file.  sync-forwarded-port.py reconciles qBittorrent's listen port on
+    # a timer; see ops/cron.d/media-stack.crontab.  gluetun opens the allocated
+    # port in its own firewall, which is why FIREWALL_VPN_INPUT_PORTS is gone.
+    #
+    # VPN_PORT_FORWARDING_PROVIDER was dropped as redundant: it defaults to
+    # VPN_SERVICE_PROVIDER, already protonvpn above.
+    - VPN_PORT_FORWARDING=on
+    - PORT_FORWARD_ONLY=on
+    # gluetun defaults the control server to :::8000, which IS reachable from
+    # the host on the container IP (verified: GET /v1/portforward answered 200
+    # from outside the namespace).  The auth file grants that route with
+    # auth = "none", so pin the listener to loopback to make that safe.
+    - HTTP_CONTROL_SERVER_ADDRESS=127.0.0.1:8000
     # LAN + Tailnet CGNAT range.  Inbound to published ports already works
     # via conntrack, but containers in gluetun's namespace that initiate
     # outbound to Tailnet-only services (e.g. host-side Sonarr/Radarr
@@ -80,6 +113,12 @@ services:
     # Replicators on a different LAN can override via .env (codex
     # round-10 #5 — was hardcoded to a single host's LAN subnet).
     - FIREWALL_OUTBOUND_SUBNETS=${FIREWALL_OUTBOUND_SUBNETS:-10.0.0.0/24,100.64.0.0/10}
+    # Every control-server route is private by default in this gluetun version.
+    # config.toml grants exactly one read-only route (GET /v1/portforward) so
+    # sync-forwarded-port.py can poll the allocation; nothing else is granted.
+    # /gluetun/auth/config.toml is the default path, so no env var is needed.
+    volumes:
+    - ./ops/gluetun/auth-config.toml:/gluetun/auth/config.toml:ro
     restart: unless-stopped
     networks:
     - internal-media

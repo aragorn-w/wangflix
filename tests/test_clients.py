@@ -1020,3 +1020,41 @@ def test_jellyfin_create_key_non2xx_raises():
 def test_jellyfin_create_key_204_ok():
     with patch("urllib.request.urlopen", return_value=_jf_resp(204, b"")):
         assert JellyfinClient("http://jf:8096").create_key("k", "name") is None
+
+
+# --- QBitClient preferences (forwarded-port reconciler) -----------------------
+# setPreferences takes the settings as a JSON string in a `json=` form field.
+# A plain form body is accepted with HTTP 200 and then IGNORED, so the encoding
+# is load-bearing and sync-forwarded-port.py re-reads to confirm the write.
+
+def test_qbit_preferences_returns_parsed_settings():
+    c = QBitClient("http://qbit:8090", "", "")
+    with patch.object(c.session, "get") as g:
+        g.return_value = MagicMock(status_code=200,
+                                   json=lambda: {"listen_port": 51413})
+        g.return_value.raise_for_status = lambda: None
+        assert c.preferences()["listen_port"] == 51413
+        assert g.call_args[0][0].endswith("/api/v2/app/preferences")
+
+
+def test_qbit_set_preferences_sends_json_encoded_form_field():
+    c = QBitClient("http://qbit:8090", "", "")
+    with patch.object(c.session, "post") as pst:
+        pst.return_value = MagicMock(status_code=200)
+        pst.return_value.raise_for_status = lambda: None
+        c.set_preferences({"listen_port": 12345})
+        assert pst.call_args[0][0].endswith("/api/v2/app/setPreferences")
+        body = pst.call_args.kwargs["data"]
+        assert set(body) == {"json"}, "settings must go in a single json field"
+        assert json.loads(body["json"]) == {"listen_port": 12345}
+
+
+def test_qbit_set_preferences_raises_on_http_error():
+    c = QBitClient("http://qbit:8090", "", "")
+    with patch.object(c.session, "post") as pst:
+        pst.return_value = MagicMock(status_code=403)
+        def boom():
+            raise RuntimeError("403")
+        pst.return_value.raise_for_status = boom
+        with pytest.raises(RuntimeError):
+            c.set_preferences({"listen_port": 1})

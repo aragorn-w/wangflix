@@ -55,8 +55,7 @@ port) or is internal-only.
 
 | Port | Protocol | Purpose |
 | :--- | :--- | :--- |
-| `54321/tcp` | torrent peer-listen | qBittorrent incoming connections via Gluetun's WireGuard-mapped port-forward.  Published to the LAN so qBit can accept incoming peer connections through the VPN. |
-| `54321/udp` | torrent peer-listen | Same purpose, UDP variant (uTP / µTP fallback). |
+| _(none)_ | torrent peer-listen | **No host publish, by design.** ProtonVPN allocates a DYNAMIC forwarded port; gluetun opens it inside its own firewall, so inbound peer traffic never traverses a host port mapping. The static `54321/tcp+udp` publishes that used to sit here were removed 2026-09-16: Proton was never forwarding anything to them, so they documented an inbound path that did not exist. |
 
 **Ports NOT exposed to the LAN** (gluetun namespace, no host port published):
 `unpackerr`, `watchtower`, `tdarr-node`.
@@ -122,6 +121,31 @@ Bazarr settings, etc.) stays where it is so the bind-mounts in
     non-keeper) for manual review (`movie-dedupe.py --apply --force`).
     `consolidate-watch` excludes `.dupe-recycle` so recycled files aren't
     re-normalized.
+  - Cron `*/5` — `sync-forwarded-port.py` keeps qBittorrent's listen port equal
+    to the port ProtonVPN currently forwards.  `VPN_PORT_FORWARDING=on` plus
+    `PORT_FORWARD_ONLY=on`: Proton only forwards on its P2P servers and country
+    selection alone does not prefer them, so without the filter gluetun **can**
+    land on a healthy server that will never grant a port.  The allocation is
+    dynamic, so no static port is configured for it: gluetun opens the allocated
+    port in its own firewall, and the reconciler polls `GET /v1/portforward` on
+    gluetun's control server via `docker exec`.  (qBittorrent's stored
+    `listen_port` is still whatever it was last set to — currently 54321 — until
+    the first successful allocation replaces it.)  Control-server routes are all
+    private by default in this version; `ops/gluetun/auth-config.toml` grants
+    that ONE read-only route, and `HTTP_CONTROL_SERVER_ADDRESS=127.0.0.1:8000`
+    pins the listener to loopback because gluetun otherwise binds `:::8000`,
+    which is reachable from the host on the container IP.
+  - **PREREQUISITE, currently unmet:** Proton hands out the port over NAT-PMP,
+    and the WireGuard key must have been generated with NAT-PMP enabled in
+    Proton's dashboard.  This host's key was not, so gluetun logs
+    `... 10.2.0.1:5351: recvfrom: connection refused ... make sure ... your
+    Wireguard key is set to work with PMP` and `GET /v1/portforward` returns
+    `{"port":0,"ports":[]}`.  Everything else is wired and idle.  This is NOT
+    self-healing: gluetun does not retry a failed initial allocation, so after
+    putting a NAT-PMP-enabled key in `WIREGUARD_PRIVATE_KEY` you must recreate
+    gluetun (and its seven netns dependents) before the reconciler has anything
+    to do.  The failure is otherwise harmless: verified gluetun stays `healthy`
+    with `RestartCount 0` and does not retry-loop.
   - Cron 04:50 — `tv-dedupe.py --apply --notify`, the Sonarr sibling of
     movie-dedupe.py (runs 5 min later so they never overlap). Same
     SAFE/RISKY model, one TV-specific addition: Sonarr's `episodefile` DB

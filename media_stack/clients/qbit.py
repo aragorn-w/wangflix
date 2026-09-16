@@ -13,6 +13,8 @@ Auth model:
 
 from __future__ import annotations
 
+import json
+
 import requests
 
 
@@ -96,6 +98,25 @@ class QBitClient:
         r = self.session.post(
             f"{self.base_url}/api/v2/torrents/delete",
             data={"hashes": torrent_hash, "deleteFiles": delete_files},
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+
+    def preferences(self) -> dict:
+        """GET /api/v2/app/preferences.  Returns the parsed settings dict."""
+        r = self.session.get(f"{self.base_url}/api/v2/app/preferences",
+                             timeout=self.timeout)
+        r.raise_for_status()
+        return r.json()
+
+    def set_preferences(self, values: dict) -> None:
+        """POST /api/v2/app/setPreferences with a JSON-encoded `json=` form
+        field.  That encoding is what the API expects; a plain form body is
+        silently ignored, so callers must verify the change took effect
+        rather than trusting the 200.  Raises on HTTP failure."""
+        r = self.session.post(
+            f"{self.base_url}/api/v2/app/setPreferences",
+            data={"json": json.dumps(values)},
             timeout=self.timeout,
         )
         r.raise_for_status()

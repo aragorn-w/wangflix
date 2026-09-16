@@ -1,0 +1,28 @@
+# gluetun control-server authorisation.
+#
+# Since the version this stack runs, EVERY control-server route is private by
+# default and 401s unless a role grants it.  This file grants exactly one:
+# reading the currently forwarded port, which sync-forwarded-port.py polls to
+# keep qBittorrent's listen port in step with ProtonVPN's dynamic allocation.
+#
+# auth = "none" is deliberate and is scoped to this ONE read-only route.  The
+# route returns an integer port number and nothing else, so a credential that
+# would itself have to live in .env and be rotated buys nothing.
+#
+# This is only true because the control server is pinned to loopback.  gluetun
+# defaults to listening on :::8000, which a review proved is reachable from the
+# HOST on the container IP (GET /v1/portforward returned 200 from outside the
+# namespace).  docker-compose.yml therefore sets
+# HTTP_CONTROL_SERVER_ADDRESS=127.0.0.1:8000.  Do not remove that line while this
+# role is auth = "none".
+#
+# What this does NOT do is grant anything else.  Routes that can act on the
+# tunnel (PUT /v1/vpn/status and friends) are not listed, so they stay denied.
+# That matters because flaresolverr shares this namespace and executes untrusted
+# web content; if it were ever compromised, the blast radius of this file is
+# "can read the forwarded port number".  Do not widen it casually, and never add
+# a role with auth = "none" for a mutating route.
+[[roles]]
+name = "portforward-reader"
+routes = ["GET /v1/portforward"]
+auth = "none"
