@@ -36,7 +36,7 @@ import sys
 import time
 from pathlib import Path
 
-from media_stack import paths, vpn_country
+from media_stack import paths, state, vpn_country
 from media_stack.clients.arr import ArrClient
 from media_stack.clients.bazarr import BazarrClient, apikey_from_container
 from media_stack.clients.qbit import QBitClient
@@ -319,6 +319,247 @@ class HealthCheck:
                       "movies are monitored=False AND hasFile=False — they're invisible to "
                       "search; bulk re-monitor via PUT /movie/editor or audit each")
 
+    # ---------- pipeline OUTCOME probes ----------
+    # Everything above this point checks that something is RUNNING.  These check
+    # that it is WORKING, which is a different question and the one that kept
+    # going unanswered: 15 Sonarr queue items sat in "qBittorrent is reporting
+    # missing files" for weeks, silently convincing Sonarr those episodes were
+    # already downloading so it never searched for them again.  Nothing was down.
+    #
+    # Detection only.  These never delete or blocklist: a dropped USB mount makes
+    # every download look like it lost its files at once (see
+    # feedback_usb_disk_dropout_mountpoint_guard), and auto-cleanup would turn a
+    # recoverable cable fault into mass data loss.
+    OUTCOME_STATE = "health-outcomes.json"
+    STUCK_AFTER_S = 6 * 3600
+    NO_PORT_AFTER_S = 30 * 60
+
+    def _age_conditions(self, prefix: str, active: set[str]) -> tuple[dict[str, float], bool]:
+        """Ages of the currently-bad conditions, and whether ageing is trustworthy.
+
+        Returns ({key: seconds persisted}, persisted).  Every stored key under
+        `prefix` that is NOT in `active` is dropped, so a condition that clears
+        and later returns starts a fresh clock instead of inheriting its old
+        timestamp and FAILing instantly.  Reconciling only the keys the caller
+        happens to be looking at is not enough: an item can vanish from the
+        snapshot entirely and come back later.
+
+        The whole read-modify-write runs under one flock via state.mutate_state,
+        because loading outside the lock lets two overlapping runs (cron and a
+        manual check) each write a stale snapshot and resurrect the other's
+        deletions.
+
+        persisted=False means the store could not be read or written, so the
+        caller must NOT present an age as meaningful: an unwritable insert would
+        report age 0 forever and never escalate, and an unwritable delete would
+        let a fresh recurrence inherit an old timestamp and FAIL immediately.
+        """
+        now = time.time()
+        ages: dict[str, float] = {}
+
+        def _mutate(st: dict) -> dict:
+            for stale in [k for k in st if k.startswith(prefix) and k not in active]:
+                st.pop(stale, None)
+            for k in active:
+                rec = st.get(k)
+                first = rec.get("first_seen") if isinstance(rec, dict) else None
+                if isinstance(first, (int, float)) and not isinstance(first, bool):
+                    ages[k] = max(0.0, now - float(first))
+                else:
+                    st[k] = {"first_seen": now}
+                    ages[k] = 0.0
+            return st
+
+        try:
+            state.mutate_state(paths.VAR_STATE / self.OUTCOME_STATE, _mutate)
+        except Exception:
+            return ({k: 0.0 for k in active}, False)
+        return (ages, True)
+
+    def probe_arr_stuck_queue(self, name: str, url: str, key_var: str) -> None:
+        key = self.env.get(key_var, "")
+        if not key:
+            return
+        try:
+            records = ArrClient(url, key).get_queue()
+        except Exception:
+            self.warn(f"outcome:{name} queue", "couldn't read /queue — Arr unreachable?")
+            return
+        bad = [r for r in records
+               if r.get("errorMessage")
+               or str(r.get("trackedDownloadStatus", "")).lower() in ("warning", "error")]
+        prefix = f"{name}:queue:"
+        active = {f"{prefix}{r.get('downloadId') or r.get('id')}" for r in bad}
+        ages, persisted = self._age_conditions(prefix, active)
+        oldest = max(ages.values(), default=0.0)
+        if not bad:
+            if persisted:
+                self.ok(f"outcome:{name} queue clean ({len(records)} item(s), none erroring)")
+            else:
+                # The clear did not stick, so an old timestamp survives and the
+                # next recurrence would FAIL instantly on stale history.
+                self.warn(f"outcome:{name} queue clean ({len(records)} item(s))",
+                          "could not reset outcome history — ageing is unreliable "
+                          "until var/state is writable")
+        elif not persisted:
+            self.warn(f"outcome:{name} queue erroring={len(bad)}",
+                      "cannot age this: the outcome state file is unreadable/unwritable")
+        elif oldest >= self.STUCK_AFTER_S:
+            self.fail(f"outcome:{name} queue stuck={len(bad)}",
+                      f"oldest has been erroring {oldest / 3600:.1f}h — a persistently failing "
+                      f"queue item can stop Arr grabbing a replacement for that episode; "
+                      f"inspect /queue and clear the dead ones")
+        else:
+            self.warn(f"outcome:{name} queue erroring={len(bad)}",
+                      f"oldest {oldest / 60:.0f}m — transient if it clears on its own")
+
+    def probe_qbit_missing_files(self, qbit_url: str) -> None:
+        client = QBitClient(qbit_url, self.env.get("QBIT_USER", ""),
+                            self.env.get("QBIT_PASS", ""))
+        if not client.login():
+            return  # probe_qbit already reports auth failures
+        try:
+            torrents = client.torrents_info()
+        except Exception:
+            self.warn("outcome:qbit torrents", "couldn't read /torrents/info")
+            return
+        bad = [t for t in torrents
+               if str(t.get("state", "")).lower() in ("missingfiles", "error")]
+        active = {f"qbit:{t.get('hash')}" for t in bad}
+        ages, persisted = self._age_conditions("qbit:", active)
+        oldest = max(ages.values(), default=0.0)
+        if not bad:
+            if persisted:
+                self.ok(f"outcome:qbit no missing-file torrents ({len(torrents)} total)")
+            else:
+                self.warn("outcome:qbit no missing-file torrents",
+                          "could not reset outcome history — ageing is unreliable "
+                          "until var/state is writable")
+        elif not persisted:
+            self.warn(f"outcome:qbit missing-files={len(bad)}",
+                      "cannot age this: the outcome state file is unreadable/unwritable")
+        elif oldest >= self.STUCK_AFTER_S:
+            self.fail(f"outcome:qbit missing-files={len(bad)}",
+                      f"oldest {oldest / 3600:.1f}h — if MANY appeared at once suspect a dropped "
+                      f"mount (check findmnt) before deleting anything")
+        else:
+            self.warn(f"outcome:qbit missing-files={len(bad)}", f"oldest {oldest / 60:.0f}m")
+
+    def probe_forwarded_port(self, qbit_url: str) -> None:
+        """ProtonVPN's forwarded port vs qBittorrent's listen port.
+
+        Observation only; sync-forwarded-port.py owns the repair.  Worth probing
+        because both halves fail silently: gluetun does not retry an allocation
+        that failed at startup, and qBittorrent has no idea the port changed.
+        """
+        rc, out, _err = _run(["docker", "exec", "gluetun", "wget", "-qO-", "--timeout=10",
+                              "http://127.0.0.1:8000/v1/portforward"], timeout=60)
+        if rc != 0:
+            self.warn("outcome:port-forward", "couldn't query gluetun's control server")
+            return
+        try:
+            port = int(json.loads(out).get("port") or 0)
+        except Exception:
+            self.warn("outcome:port-forward", f"unparseable response: {out.strip()[:60]}")
+            return
+
+        if port <= 0:
+            # Only "none" is active, so this also clears any stale mismatch
+            # timer; otherwise a new-but-mismatching allocation would inherit it
+            # and FAIL instantly instead of getting the reconciler's grace period.
+            ages, persisted = self._age_conditions("portforward:", {"portforward:none"})
+            age = ages.get("portforward:none", 0.0)
+            if not persisted:
+                self.warn("outcome:port-forward none", "no allocation (cannot age it)")
+            elif age >= self.NO_PORT_AFTER_S:
+                self.fail("outcome:port-forward none",
+                          f"no allocation for {age / 60:.0f}m — gluetun does NOT retry a failed "
+                          f"initial allocation, so recreate it; check the WireGuard key has "
+                          f"NAT-PMP enabled")
+            else:
+                self.warn("outcome:port-forward none", f"no allocation yet ({age / 60:.0f}m)")
+            return
+
+        # Clear the no-allocation timer the moment a positive allocation is seen,
+        # BEFORE touching qBittorrent.  Bailing out below on a qBittorrent
+        # failure used to leave it running, so the next genuine outage inherited
+        # an old timestamp and FAILed immediately.
+        _ages, cleared = self._age_conditions("portforward:none", set())
+        if not cleared:
+            self.warn("outcome:port-forward", "could not reset the no-allocation timer")
+
+        client = QBitClient(qbit_url, self.env.get("QBIT_USER", ""),
+                            self.env.get("QBIT_PASS", ""))
+        if not client.login():
+            return
+        try:
+            listen = int(client.preferences().get("listen_port", 0))
+        except Exception:
+            self.warn("outcome:port-forward", "couldn't read qBittorrent's listen_port")
+            return
+
+        if listen == port:
+            _a, ok_clear = self._age_conditions("portforward:", set())
+            if ok_clear:
+                self.ok(f"outcome:port-forward {port} == qBittorrent listen_port")
+            else:
+                self.warn(f"outcome:port-forward {port} == listen_port",
+                          "could not reset outcome history")
+            return
+        ages, persisted = self._age_conditions("portforward:", {"portforward:mismatch"})
+        age = ages.get("portforward:mismatch", 0.0)
+        if not persisted:
+            self.warn(f"outcome:port-forward mismatch {port} != {listen}", "cannot age it")
+        elif age >= self.NO_PORT_AFTER_S:
+            self.fail(f"outcome:port-forward mismatch {port} != {listen}",
+                      f"persisted {age / 60:.0f}m — the */5 reconciler should have fixed this; "
+                      f"check var/log/sync-forwarded-port.log")
+        else:
+            self.warn(f"outcome:port-forward mismatch {port} != {listen}",
+                      "reconciler runs every 5 min; transient right after a reconnect")
+
+    def probe_unsynced_subs(self) -> None:
+        """Files the pipeline finished but could not synchronise.
+
+        consolidate-subs falls back to the UNSYNCED subtitle when ffsubsync
+        fails, then records the file as `fixed` anyway with synced=False.  That
+        is a real degraded outcome the operator never saw.
+
+        Two things this deliberately does NOT claim.  It does not count records
+        whose path no longer exists, because a deleted file is not a current
+        problem.  And it never reports "all synced": most records carry no
+        `synced` field at all (skip-tag entries, and the skip branch replaces an
+        entry after a fingerprint change, dropping the old result), so absence
+        of evidence is reported as unknown rather than success.
+        """
+        raw = state.load_state(paths.VAR_STATE / "consolidate-subs.state.json")
+        if not isinstance(raw, dict) or not raw:
+            self.warn("outcome:subs", "consolidate state missing, empty or malformed")
+            return
+        current = historical = unknown = synced = 0
+        for path_str, v in raw.items():
+            if not isinstance(v, dict):
+                continue
+            flag = v.get("synced")
+            if flag is False:
+                if Path(path_str).exists():
+                    current += 1
+                else:
+                    historical += 1
+            elif flag is True:
+                synced += 1
+            else:
+                unknown += 1
+        if current:
+            self.warn(f"outcome:subs unsynced={current}",
+                      f"ffsubsync failed and the UNSYNCED subtitle was embedded anyway; these "
+                      f"are the files most likely to be visibly out of sync "
+                      f"({synced} synced, {unknown} no recorded result, "
+                      f"{historical} failed-sync records whose file is gone)")
+        else:
+            self.ok(f"outcome:subs no failed syncs among files still present "
+                    f"({synced} synced, {unknown} no recorded result, {historical} historical)")
+
     # ---------- Bazarr API reachability ----------
     def probe_bazarr_api(self, bazarr_url: str) -> None:
         try:
@@ -565,8 +806,13 @@ class HealthCheck:
         self.probe_arr_format_scores("sonarr", paths.SONARR_URL, "SONARR_API_KEY")
         self.probe_arr_format_scores("radarr", paths.RADARR_URL, "RADARR_API_KEY")
         self.probe_arr_silent_gap("radarr", paths.RADARR_URL, "RADARR_API_KEY")
+        self.probe_arr_stuck_queue("sonarr", paths.SONARR_URL, "SONARR_API_KEY")
+        self.probe_arr_stuck_queue("radarr", paths.RADARR_URL, "RADARR_API_KEY")
         self.probe_bazarr_api(paths.BAZARR_URL)
         self.probe_qbit(paths.QBIT_URL)
+        self.probe_qbit_missing_files(paths.QBIT_URL)
+        self.probe_forwarded_port(paths.QBIT_URL)
+        self.probe_unsynced_subs()
         self.probe_bazarr_profiles(paths.BAZARR_URL)
         self.probe_ufw()
         self.probe_perimeter()

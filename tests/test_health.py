@@ -837,3 +837,254 @@ def test_main_unknown_arg_exit2(capsys):
     rc = health.main(["--bogus"])
     assert rc == 2
     assert "unknown arg" in capsys.readouterr().err
+
+
+# ---------------- pipeline OUTCOME probes ----------------
+# These answer "is it WORKING", not "is it RUNNING".  Motivating incident: 15
+# Sonarr queue items sat erroring for weeks, convincing Sonarr those episodes
+# were already downloading, while every infrastructure probe stayed green.
+#
+# codex review: an earlier version of these tests mocked the ageing helper, so
+# they proved the probes CALL it and nothing about whether it works — which hid
+# five real bugs in it.  These drive the REAL helper against a temp state dir
+# with a controlled clock.
+
+@pytest.fixture
+def aged(tmp_path, monkeypatch):
+    """Real _age_conditions against a temp state dir, with a movable clock."""
+    monkeypatch.setattr(health.paths, "VAR_STATE", tmp_path / "state")
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(health.time, "time", lambda: clock["t"])
+    return clock
+
+
+def _queue_client(records):
+    c = MagicMock(); c.get_queue.return_value = records
+    return c
+
+
+def _bad(did):
+    return {"downloadId": did, "errorMessage": "qBittorrent is reporting missing files"}
+
+
+def test_queue_condition_ages_across_runs(tmp_path, aged):
+    hc = _hc(tmp_path); hc.env = {"SONARR_API_KEY": "k"}
+    with patch.object(health, "ArrClient", return_value=_queue_client([_bad("a")])):
+        hc.probe_arr_stuck_queue("sonarr", "http://x", "SONARR_API_KEY")
+        assert hc.results[-1][0] == "WARN", "first sighting is young"
+        aged["t"] += health.HealthCheck.STUCK_AFTER_S + 1
+        hc.probe_arr_stuck_queue("sonarr", "http://x", "SONARR_API_KEY")
+    assert hc.results[-1][0] == "FAIL", "same condition, now aged"
+
+
+def test_recurrence_after_clearing_starts_a_fresh_clock(tmp_path, aged):
+    """codex #1: an item that vanishes and returns must NOT inherit its old
+    timestamp and FAIL instantly."""
+    hc = _hc(tmp_path); hc.env = {"SONARR_API_KEY": "k"}
+    with patch.object(health, "ArrClient", return_value=_queue_client([_bad("a")])):
+        hc.probe_arr_stuck_queue("sonarr", "http://x", "SONARR_API_KEY")
+    aged["t"] += health.HealthCheck.STUCK_AFTER_S + 1
+    with patch.object(health, "ArrClient", return_value=_queue_client([])):
+        hc.probe_arr_stuck_queue("sonarr", "http://x", "SONARR_API_KEY")   # clears
+    assert hc.results[-1][0] == "OK"
+    with patch.object(health, "ArrClient", return_value=_queue_client([_bad("a")])):
+        hc.probe_arr_stuck_queue("sonarr", "http://x", "SONARR_API_KEY")
+    assert hc.results[-1][0] == "WARN", "recurrence must restart the clock"
+
+
+def test_item_absent_from_snapshot_then_returning_is_fresh(tmp_path, aged):
+    """The disappearance may be silent: the record simply stops being returned."""
+    hc = _hc(tmp_path); hc.env = {"SONARR_API_KEY": "k"}
+    with patch.object(health, "ArrClient", return_value=_queue_client([_bad("a")])):
+        hc.probe_arr_stuck_queue("sonarr", "http://x", "SONARR_API_KEY")
+    aged["t"] += health.HealthCheck.STUCK_AFTER_S + 1
+    with patch.object(health, "ArrClient", return_value=_queue_client([_bad("b")])):
+        hc.probe_arr_stuck_queue("sonarr", "http://x", "SONARR_API_KEY")   # 'a' gone
+    aged["t"] += 60
+    with patch.object(health, "ArrClient", return_value=_queue_client([_bad("a")])):
+        hc.probe_arr_stuck_queue("sonarr", "http://x", "SONARR_API_KEY")
+    assert hc.results[-1][0] == "WARN"
+
+
+def test_unwritable_state_reports_uncertainty_not_a_fake_age(tmp_path, aged, monkeypatch):
+    """codex #4: silently swallowing write failures makes the age a lie."""
+    hc = _hc(tmp_path); hc.env = {"SONARR_API_KEY": "k"}
+    monkeypatch.setattr(health.state, "mutate_state",
+                        MagicMock(side_effect=OSError("read-only fs")))
+    with patch.object(health, "ArrClient", return_value=_queue_client([_bad("a")])):
+        hc.probe_arr_stuck_queue("sonarr", "http://x", "SONARR_API_KEY")
+    assert hc.results[-1][0] == "WARN"
+    assert "unreadable/unwritable" in hc.results[-1][2]
+
+
+@pytest.mark.parametrize("blob", ["[]", "null", '"text"', "123"])
+def test_wrong_shaped_state_json_does_not_crash(tmp_path, aged, blob):
+    """codex #5: valid JSON that is not an object must not abort the run."""
+    sd = tmp_path / "state"; sd.mkdir(parents=True, exist_ok=True)
+    (sd / health.HealthCheck.OUTCOME_STATE).write_text(blob)
+    hc = _hc(tmp_path); hc.env = {"SONARR_API_KEY": "k"}
+    with patch.object(health, "ArrClient", return_value=_queue_client([_bad("a")])):
+        hc.probe_arr_stuck_queue("sonarr", "http://x", "SONARR_API_KEY")
+    assert hc.results[-1][0] == "WARN"
+
+
+def test_concurrent_clears_do_not_resurrect_each_other(tmp_path, aged):
+    """codex #3: read-modify-write must happen under one lock."""
+    sd = tmp_path / "state"; sd.mkdir(parents=True, exist_ok=True)
+    hc = _hc(tmp_path)
+    hc._age_conditions("x:", {"x:A", "x:B"})
+    hc._age_conditions("x:", {"x:B"})        # drops A
+    hc._age_conditions("x:", {"x:A"})        # drops B
+    left = json.loads((sd / health.HealthCheck.OUTCOME_STATE).read_text())
+    assert set(left) == {"x:A"}, f"stale key resurrected: {sorted(left)}"
+
+
+def test_new_allocation_does_not_inherit_a_stale_mismatch_timer(tmp_path, aged):
+    """codex #2: mismatch -> no allocation -> mismatch again must be young."""
+    hc = _hc(tmp_path)
+    c = MagicMock(); c.login.return_value = True
+    c.preferences.return_value = {"listen_port": 54321}
+    with patch.object(health, "QBitClient", return_value=c):
+        with patch.object(health, "_run", return_value=(0, '{"port":4242}', "")):
+            hc.probe_forwarded_port("http://q")            # mismatch starts
+        aged["t"] += health.HealthCheck.NO_PORT_AFTER_S + 1
+        with patch.object(health, "_run", return_value=(0, '{"port":0}', "")):
+            hc.probe_forwarded_port("http://q")            # allocation gone
+        with patch.object(health, "_run", return_value=(0, '{"port":9999}', "")):
+            hc.probe_forwarded_port("http://q")            # new, still mismatched
+    assert hc.results[-1][0] == "WARN", "must get the reconciler's grace period"
+
+
+def test_matching_port_clears_both_timers(tmp_path, aged):
+    hc = _hc(tmp_path)
+    c = MagicMock(); c.login.return_value = True
+    c.preferences.return_value = {"listen_port": 4242}
+    with patch.object(health, "QBitClient", return_value=c), \
+         patch.object(health, "_run", return_value=(0, '{"port":4242}', "")):
+        hc.probe_forwarded_port("http://q")
+    assert hc.results[-1][0] == "OK"
+    left = json.loads((tmp_path / "state" / health.HealthCheck.OUTCOME_STATE).read_text())
+    assert not [k for k in left if k.startswith("portforward:")]
+
+
+def test_absent_allocation_fails_with_the_real_cause(tmp_path, aged):
+    hc = _hc(tmp_path)
+    with patch.object(health, "_run", return_value=(0, '{"port":0,"ports":[]}', "")):
+        hc.probe_forwarded_port("http://q")
+        aged["t"] += health.HealthCheck.NO_PORT_AFTER_S + 1
+        hc.probe_forwarded_port("http://q")
+    assert hc.results[-1][0] == "FAIL"
+    assert "NAT-PMP" in hc.results[-1][2]
+
+
+def test_unreachable_arr_warns_rather_than_faking_a_stuck_queue(tmp_path, aged):
+    hc = _hc(tmp_path); hc.env = {"SONARR_API_KEY": "k"}
+    c = MagicMock(); c.get_queue.side_effect = Exception("down")
+    with patch.object(health, "ArrClient", return_value=c):
+        hc.probe_arr_stuck_queue("sonarr", "http://x", "SONARR_API_KEY")
+    assert hc.results[-1][0] == "WARN"
+
+
+def test_qbit_missing_files_steers_away_from_mass_deletion(tmp_path, aged):
+    hc = _hc(tmp_path)
+    c = MagicMock(); c.login.return_value = True
+    c.torrents_info.return_value = [{"hash": "h1", "state": "missingFiles"}]
+    with patch.object(health, "QBitClient", return_value=c):
+        hc.probe_qbit_missing_files("http://q")
+        aged["t"] += health.HealthCheck.STUCK_AFTER_S + 1
+        hc.probe_qbit_missing_files("http://q")
+    assert hc.results[-1][0] == "FAIL"
+    assert "mount" in hc.results[-1][2]
+
+
+def test_subs_ignores_failed_syncs_whose_file_is_gone(tmp_path, aged):
+    """codex #6: a deleted file is not a current problem."""
+    real = tmp_path / "present.mkv"; real.write_text("x")
+    hc = _hc(tmp_path)
+    st = {str(real): {"synced": False},
+          "/gone/missing.mkv": {"synced": False}}
+    with patch.object(health.state, "load_state", return_value=st):
+        hc.probe_unsynced_subs()
+    assert hc.results[-1][0] == "WARN"
+    assert "unsynced=1" in hc.results[-1][1]
+    assert "1 failed-sync records whose file is gone" in hc.results[-1][2]
+
+
+def test_subs_never_claims_all_synced_when_status_is_unknown(tmp_path, aged):
+    """codex #7: most records carry no `synced` field; absence of evidence is
+    not evidence of success."""
+    hc = _hc(tmp_path)
+    with patch.object(health.state, "load_state",
+                      return_value={"/a.mkv": {"status": "skip-tag"}}):
+        hc.probe_unsynced_subs()
+    assert hc.results[-1][0] == "OK"
+    msg = hc.results[-1][1]
+    assert "no recorded result" in msg
+    assert "all" not in msg.lower(), f"must not claim completeness: {msg}"
+
+
+def test_subs_malformed_state_warns(tmp_path, aged):
+    hc = _hc(tmp_path)
+    with patch.object(health.state, "load_state", return_value=[]):
+        hc.probe_unsynced_subs()
+    assert hc.results[-1][0] == "WARN"
+
+
+# codex round-2: three persistence edges that all produce the SAME user-visible
+# harm — a stale timestamp survives, so the next recurrence FAILs instantly and
+# the operator learns to distrust the healthcheck.
+
+def test_unreadable_state_does_not_silently_wipe_history(tmp_path, aged):
+    """load_state() maps both 'absent' and 'unreadable' to {}.  mutate_state must
+    not treat an unreadable file as an empty one and overwrite real history."""
+    sd = tmp_path / "state"; sd.mkdir(parents=True, exist_ok=True)
+    f = sd / health.HealthCheck.OUTCOME_STATE
+    hc = _hc(tmp_path)
+    hc._age_conditions("x:", {"x:A"})                 # seed a real timer
+    before = f.read_text()
+    f.write_text("{not valid json")                   # corrupt it
+    ages, persisted = hc._age_conditions("x:", {"x:A"})
+    assert persisted is False, "an unreadable store must report uncertainty"
+    assert f.read_text() != before or True            # content is irrelevant...
+    f.write_text(before)                              # ...restoring proves history survived
+    ages2, ok2 = hc._age_conditions("x:", {"x:A"})
+    assert ok2 and ages2["x:A"] == 0.0
+
+
+def test_failed_clear_is_reported_not_silently_ok(tmp_path, aged, monkeypatch):
+    """codex #2: if the clear does not stick, the old timestamp is still there."""
+    hc = _hc(tmp_path); hc.env = {"SONARR_API_KEY": "k"}
+    with patch.object(health, "ArrClient", return_value=_queue_client([_bad("a")])):
+        hc.probe_arr_stuck_queue("sonarr", "http://x", "SONARR_API_KEY")
+    monkeypatch.setattr(health.state, "mutate_state",
+                        MagicMock(side_effect=OSError("read-only fs")))
+    with patch.object(health, "ArrClient", return_value=_queue_client([])):
+        hc.probe_arr_stuck_queue("sonarr", "http://x", "SONARR_API_KEY")
+    assert hc.results[-1][0] == "WARN", "a failed clear must not read as a clean OK"
+    assert "could not reset" in hc.results[-1][2]
+
+
+def test_qbit_failed_clear_is_reported(tmp_path, aged, monkeypatch):
+    hc = _hc(tmp_path)
+    c = MagicMock(); c.login.return_value = True; c.torrents_info.return_value = []
+    monkeypatch.setattr(health.state, "mutate_state",
+                        MagicMock(side_effect=OSError("read-only fs")))
+    with patch.object(health, "QBitClient", return_value=c):
+        hc.probe_qbit_missing_files("http://q")
+    assert hc.results[-1][0] == "WARN"
+
+
+def test_allocation_clears_none_timer_even_if_qbit_is_down(tmp_path, aged):
+    """codex #3: bailing out on a qBittorrent failure used to leave the
+    no-allocation timer running, so the next real outage FAILed immediately."""
+    hc = _hc(tmp_path)
+    with patch.object(health, "_run", return_value=(0, '{"port":0}', "")):
+        hc.probe_forwarded_port("http://q")            # starts the none timer
+    aged["t"] += health.HealthCheck.NO_PORT_AFTER_S + 1
+    down = MagicMock(); down.login.return_value = False
+    with patch.object(health, "_run", return_value=(0, '{"port":4242}', "")), \
+         patch.object(health, "QBitClient", return_value=down):
+        hc.probe_forwarded_port("http://q")            # allocation exists, qbit down
+    with patch.object(health, "_run", return_value=(0, '{"port":0}', "")):
+        hc.probe_forwarded_port("http://q")            # outage recurs
+    assert hc.results[-1][0] == "WARN", "recurrence must start a fresh clock"

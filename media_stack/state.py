@@ -73,3 +73,39 @@ def _atomic_write(state_file: Path, state: dict) -> None:
     tmp = state_file.parent / f".{state_file.name}.{os.getpid()}.tmp"
     tmp.write_text(json.dumps(state))
     tmp.replace(state_file)
+
+
+def mutate_state(state_file: Path, fn) -> dict:
+    """Locked read-modify-write of the whole snapshot.
+
+    `fn` receives the loaded dict and returns the dict to persist.  Unlike
+    `load_state()` + `save_state()`, the read happens INSIDE the lock, so two
+    overlapping callers cannot each load the same snapshot and have the second
+    write resurrect a key the first deleted.  `save_state` alone cannot give
+    that guarantee, because by the time it takes the lock the caller's snapshot
+    is already stale.
+
+    A non-dict on disk (valid JSON that is a list, string or null) is passed to
+    `fn` as an empty dict rather than blowing up the caller.
+    """
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_file.parent / f"{state_file.name}.lock"
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        # Deliberately NOT load_state(): it maps both "file absent" and "file
+        # unreadable" to {}, so a read failure would look like an empty store and
+        # this function would happily overwrite the real history with it.  A
+        # missing file is genuinely empty; an unreadable one must raise so the
+        # caller can say it does not know rather than invent a fresh timestamp.
+        cur: dict = {}
+        if state_file.exists():
+            try:
+                raw = json.loads(state_file.read_text())
+            except Exception as exc:
+                raise OSError(f"state file unreadable: {state_file}: {exc}") from exc
+            # Valid JSON of the wrong shape (list/null/string) is a reset, not a
+            # read failure: there is no history in it to protect.
+            cur = raw if isinstance(raw, dict) else {}
+        new = fn(cur)
+        _atomic_write(state_file, new)
+        return new
