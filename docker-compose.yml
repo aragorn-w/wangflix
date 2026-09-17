@@ -81,11 +81,13 @@ services:
     # grant a port and forwarding silently does nothing.
     #
     # A NAT-PMP-ENABLED WIREGUARD KEY IS ALSO REQUIRED.  Proton hands the port
-    # out over NAT-PMP (udp/5351) and the key must be generated with that
-    # enabled in Proton's dashboard.  As of 2026-09-16 this host's key was NOT,
-    # so allocation fails with "connection refused" on 5351 and no port is
-    # granted.  gluetun does not retry a failed initial allocation, so after
-    # swapping in a NAT-PMP key you must RECREATE gluetun, not just wait.  Checked against
+    # out over NAT-PMP (udp/5351), so the key must be generated with NAT-PMP
+    # enabled AND Moderate NAT off (Proton: the two are mutually exclusive) on a
+    # Standard rather than Secure Core server (no Proton server is both Secure
+    # Core and port-forward capable).  The key in use was regenerated that way
+    # on 2026-09-16 MDT; the previous one failed with "connection refused" on 5351.
+    # If it is ever replaced again, RECREATE gluetun rather than waiting: it
+    # does not retry an allocation that already failed.  Checked against
     # gluetun's own embedded server list: Switzerland has 18 port_forward-capable
     # entries out of 28, so this filter still leaves real choice rather than
     # pinning the tunnel to one host.
