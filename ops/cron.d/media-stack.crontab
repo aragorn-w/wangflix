@@ -88,3 +88,17 @@
 # a no-op when they already agree.
 */5 * * * * python3 $HOME/media-stack/sync-forwarded-port.py >> $HOME/media-stack/var/log/sync-forwarded-port.log 2>&1
 
+# Malware is distributed as fake releases for UNAIRED episodes, because no
+# legitimate release exists to compete with them.  Grabbed three times for
+# South Park S29E02 (airs 2026-09-30) between 2026-09-17 and 2026-09-25, each
+# with a different release name, size and hash -- so blocklisting the release
+# was always one name behind.  malware-guard.sh destroys the payload, but that
+# leaves Sonarr stuck in importPending waiting for a file that no longer
+# exists (39h on the first one), and a jammed queue item can block the episode
+# from ever being grabbed properly.  The air date is the discriminator that
+# generalises.  Reaps AFTER the grab, not before: Sonarr has no air-date gate
+# on RSS matching, so this cleans up rather than prevents.  Every 5 min to keep
+# the jam window short.  Refuses to act on anything it cannot prove is
+# unaired -- see the module docstring for the three conservatism rules.
+*/5 * * * * python3 $HOME/media-stack/unaired-guard.py >> $HOME/media-stack/var/log/unaired-guard.log 2>&1
+

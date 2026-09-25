@@ -57,6 +57,17 @@ The groups below are a fast-lookup map for "where do tests for X live?":
 - `test_vpn_country.py` — VPN consensus + ISO-2/long-name
   normalization helper (round-cleanup-3 #1+#4; alias-equivalent
   provider consensus added in round-cleanup-4 #6).
+- `test_unaired_guard.py` — `unaired-guard.py`, the reaper for Sonarr
+  queue items whose episode has not aired yet (fake releases for
+  unaired episodes are a malware vector).  Weighted toward FALSE
+  POSITIVES rather than coverage of the happy path, because a wrong
+  reap deletes and blocklists a legitimate in-progress download:
+  unknown/TBA/malformed air dates, episodes missing from the series
+  fetch, the grace window in both directions, mixed vs fully-unaired
+  season packs, pending records with no `downloadId` (codex round-1
+  #1), bool-vs-int `episodeId` (#3), invalid grace falling back to the
+  default rather than to zero (#4), already-gone rows on a pack reap
+  (#5), and blind-vs-clean exit codes (#2).
 
 ## Run them
 
