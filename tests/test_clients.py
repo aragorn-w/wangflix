@@ -86,6 +86,32 @@ def test_arr_rescan_movie_false_on_failure():
         assert ArrClient("http://radarr:7878", "k").rescan_movie(42) is False
 
 
+def _command_resp(body):
+    resp = MagicMock(status_code=201, json=lambda: body)
+    resp.raise_for_status = lambda: None
+    return resp
+
+
+def test_arr_run_command_returns_id_and_posts_body():
+    with patch("requests.post", return_value=_command_resp({"id": 99})) as mock_post:
+        c = ArrClient("http://radarr:7878", "k")
+        assert c.run_command("MoviesSearch", movieIds=[1, 2]) == 99
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"name": "MoviesSearch", "movieIds": [1, 2]}
+        assert mock_post.call_args.args[0] == "http://radarr:7878/api/v3/command"
+
+
+def test_arr_run_command_none_on_failure():
+    with patch("requests.post", side_effect=Exception("boom")):
+        assert ArrClient("http://radarr:7878", "k").run_command("MoviesSearch") is None
+
+
+@pytest.mark.parametrize("body", [{}, {"id": "7"}, {"id": True}, [], None])
+def test_arr_run_command_none_without_real_int_id(body):
+    with patch("requests.post", return_value=_command_resp(body)):
+        assert ArrClient("http://radarr:7878", "k").run_command("MoviesSearch") is None
+
+
 def test_arr_series_returns_list():
     payload = [{"id": 29, "path": "/tv/Rick and Morty", "title": "Rick and Morty"}]
     with patch("requests.get") as mock_get:
@@ -206,6 +232,58 @@ def test_arr_get_queue_returns_records():
         mock_get.return_value = resp
         c = ArrClient("http://radarr:7878", "k")
         assert c.get_queue() == [{"id": 1}, {"id": 2}]
+
+
+def _queue_resp(body):
+    resp = MagicMock(status_code=200, json=lambda: body)
+    resp.raise_for_status = lambda: None
+    return resp
+
+
+def test_arr_get_queue_empty_queue_is_empty_list():
+    with patch("requests.get", return_value=_queue_resp(
+            {"page": 1, "totalRecords": 0, "records": []})):
+        assert ArrClient("http://radarr:7878", "k").get_queue() == []
+
+
+@pytest.mark.parametrize("body", [{"totalRecords": 1}, {"records": None},
+                                  {"records": "x"}, [{"id": 1}],
+                                  {"records": [None]}, {"records": [{"id": 1}, "x"]}])
+def test_arr_get_queue_raises_on_malformed_reply(body):
+    """codex search-missing round-1 #2 — a 200 without a records LIST used to
+    read as an empty queue, telling callers nothing was downloading."""
+    with patch("requests.get", return_value=_queue_resp(body)):
+        with pytest.raises(ValueError):
+            ArrClient("http://radarr:7878", "k").get_queue()
+
+
+@pytest.mark.parametrize("body", [{"totalRecords": 1, "records": []},
+                                  {"totalRecords": 5, "records": []}])
+def test_arr_get_queue_raises_on_empty_page_short_of_total(body):
+    """codex search-missing round-3 #1 — an empty page while totalRecords says
+    entries remain is an incomplete read, not an empty queue."""
+    with patch("requests.get", return_value=_queue_resp(body)):
+        with pytest.raises(ValueError):
+            ArrClient("http://radarr:7878", "k").get_queue()
+
+
+@pytest.mark.parametrize("total", ["1", 1.5, True, [], {}, None])
+@pytest.mark.parametrize("records", [[], [{"id": 1}]])
+def test_arr_get_queue_raises_on_non_integer_total(total, records):
+    """codex search-missing pre-push #1 — a present but non-integer
+    totalRecords (e.g. the string "1", or an explicit null) slipped past the
+    empty-page check and read as an empty queue.  Only an ABSENT key may fall
+    back to the short-page rule."""
+    with patch("requests.get", return_value=_queue_resp({"totalRecords": total, "records": records})):
+        with pytest.raises(ValueError):
+            ArrClient("http://radarr:7878", "k").get_queue()
+
+
+def test_arr_remove_by_download_id_malformed_queue_is_queue_error():
+    """Same finding, seen from nuke_stalled: malformed must be queue_error,
+    not not_found (not_found lets it fall through to an unblocklisted delete)."""
+    with patch("requests.get", return_value=_queue_resp({"totalRecords": 1})):
+        assert ArrClient("http://sonarr:8989", "k").remove_by_download_id("abc") == "queue_error"
 
 
 def test_arr_remove_by_download_id_success():

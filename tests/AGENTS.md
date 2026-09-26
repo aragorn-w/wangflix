@@ -68,6 +68,16 @@ The groups below are a fast-lookup map for "where do tests for X live?":
   #1), bool-vs-int `episodeId` (#3), invalid grace falling back to the
   default rather than to zero (#4), already-gone rows on a pack reap
   (#5), and blind-vs-clean exit codes (#2).
+- `test_search_missing.py` — `search-missing.py`, the weekly missing-item
+  search.  Weighted toward the movie PICK rather than the posting, because a
+  wrong pick grabs pre-release junk for a film still in cinemas: unreleased,
+  `isAvailable` absent or merely truthy, `isAvailable` true but `status` still
+  inCinemas/announced (codex round-1 #1), released by Radarr's 90-day cinema
+  fallback with no home-release date, or a future/malformed one (round-2 #1),
+  unknown `hasFile`, already queued, bool ids in either list, a null title
+  (round-1 #3).  Also: Radarr's bulk `MissingMoviesSearch` is never
+  used, an unreadable movie list or queue searches no movies, and a failure or
+  missing key on one app still lets the other search.
 
 ## Run them
 

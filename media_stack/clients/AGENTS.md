@@ -35,7 +35,13 @@ return values; callers decide whether to retry or alert (codex round-16
        — codex round-7 #2 caught the previous early-stop bug).
     3. `totalRecords` absent AND short page (< pageSize) returns →
        stop (this is the fallback for servers that omit totalRecords).
-    4. Empty page → stop.
+    4. Empty page → stop.  (A 200 whose body has no `records` list, or a
+       list holding anything but objects, is malformed, not empty, and
+       raises; reading it as `[]` told callers nothing was downloading —
+       codex search-missing round-1 #2, round-2 #2.  So does an empty page
+       while `totalRecords` says more remain — round-3 #1 — and a
+       `totalRecords` that is present but not an integer, null included —
+       pre-push #1, #2.  Only an absent key falls back to rule 3.)
     5. 100k safety cap → stop.
   See `ArrClient.get_queue` for the canonical implementation +
   regression tests `test_arr_get_queue_keeps_paginating_on_short_page_when_total_is_known`

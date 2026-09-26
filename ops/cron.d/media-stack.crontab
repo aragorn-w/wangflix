@@ -102,3 +102,19 @@
 # unaired -- see the module docstring for the three conservatism rules.
 */5 * * * * python3 $HOME/media-stack/unaired-guard.py >> $HOME/media-stack/var/log/unaired-guard.log 2>&1
 
+# Weekly search for anything missing (Saturday 03:15, host time).  Sonarr and
+# Radarr search an item once, when it is added, then only watch RSS for NEW
+# uploads; a request whose first search came up empty, or whose download was
+# reaped, otherwise stays "processing" in Jellyseerr forever (12 released movies
+# and 282 aired episodes on 2026-09-26).  Sonarr gets its own missing search
+# (aired episodes only; unaired-guard above is the backstop).  Radarr gets an
+# explicit list of RELEASED missing movies (status "released", isAvailable, AND
+# a digital or physical release date in the past) instead of its bulk missing
+# search,
+# because the profile approves pre-release junk for films still in cinemas --
+# see the module docstring.  Saturday 03:15 avoids the Sunday 03:00 prune and
+# starts 45 min ahead of the 04:00 nightly upgrade, which can reboot.  The
+# searches run asynchronously inside the apps, so a reboot could still cut one
+# short; the first full run on 2026-09-26 (200 episodes) finished in under 9 min.
+15 3 * * 6 python3 $HOME/media-stack/search-missing.py >> $HOME/media-stack/var/log/search-missing.log 2>&1
+

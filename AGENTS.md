@@ -160,6 +160,22 @@ Bazarr settings, etc.) stays where it is so the bind-mounts in
     S09E01), so `tv-dedupe.py` also deletes that row via the Sonarr API
     after the physical move. Recycles to `.dupe-recycle/tv/`; RISKY cases
     need manual review (`tv-dedupe.py --apply --force`).
+  - Cron Saturday 03:15 (weekly) — `search-missing.py`, the search Sonarr and
+    Radarr never repeat on their own: each searches an item once, when it is
+    added, then only watches RSS for new uploads, so a request whose first
+    search found nothing (or whose download was reaped) stayed "processing" in
+    Jellyseerr indefinitely (12 released movies and 282 aired episodes on
+    2026-09-26).  Sonarr gets its own `MissingEpisodeSearch` (aired episodes
+    only).  Radarr does NOT get `MissingMoviesSearch`: the script sends
+    `MoviesSearch` for an explicit list of movies that are monitored, fileless,
+    released and not already queued, because the quality profile approves
+    pre-release junk for films still in cinemas and a manual search does not
+    reject it.  "Released" is stricter than Radarr's word for it: `status ==
+    "released"`, `isAvailable`, AND a past `digitalRelease` or
+    `physicalRelease`.  `isAvailable` alone follows each movie's
+    `minimumAvailability` ("In Cinemas" reports available at the theatrical
+    date), and both Radarr flags fall back to "90 days after cinemas" when no
+    home-release date is known.  269 of 270 released movies had one.  `--dry-run` shows the picks without queueing anything.
 
 - **Bazarr:** English profile (id=1) attached to everything. Sidecar SRTs ingested by the watcher.
 

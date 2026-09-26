@@ -73,11 +73,30 @@ class ArrClient:
             )
             r.raise_for_status()
             d = r.json()
-            records = d.get("records") or []
+            records = d.get("records") if isinstance(d, dict) else None
+            if not isinstance(records, list) or not all(isinstance(x, dict) for x in records):
+                # A 200 with no records list is malformed, not empty.  Reading
+                # it as [] told callers nothing was downloading: search-missing
+                # would re-search movies already in the queue, and
+                # remove_by_download_id would say "not_found" instead of
+                # "queue_error".
+                raise ValueError("queue response has no list of record objects")
+            total = d.get("totalRecords")
+            if "totalRecords" in d and (not isinstance(total, int) or isinstance(total, bool)):
+                # An ABSENT key is the legitimate fallback (short-page rule
+                # below).  Present but not an int -- a string like "1", or null
+                # -- is malformed and used to slip past the empty-page check
+                # (codex search-missing pre-push #1, #2).
+                raise ValueError("queue response has a non-integer totalRecords")
             if not records:
+                if total is not None and len(out) < total:
+                    # The server says more exist but sent none: an incomplete
+                    # read, not the end of the queue (codex search-missing
+                    # round-3 #1).  Past page 1 this could also be the queue
+                    # shrinking mid-read; failing one run is the safe side.
+                    raise ValueError("queue page is empty but totalRecords says more remain")
                 break
             out.extend(records)
-            total = d.get("totalRecords")
             if total is not None:
                 if len(out) >= total:
                     break
@@ -321,6 +340,26 @@ class ArrClient:
         if not isinstance(data, list) or not all(isinstance(m, dict) for m in data):
             return None
         return data
+
+    def run_command(self, name: str, **fields: object) -> int | None:
+        """POST /api/v3/command {name, **fields}.  Returns the queued
+        command's id, or None on any failure (network, non-2xx, or a body
+        without a genuine int id).  The app runs the command asynchronously;
+        a caller that needs the outcome polls /api/v3/command/{id}."""
+        try:
+            r = requests.post(
+                f"{self.base_url}/api/v3/command",
+                json={"name": name, **fields},
+                headers=self.headers, timeout=self.timeout,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception:
+            return None
+        cid = data.get("id") if isinstance(data, dict) else None
+        if isinstance(cid, int) and not isinstance(cid, bool):
+            return cid
+        return None
 
     def rescan_movie(self, movie_id: int) -> bool:
         """POST /api/v3/command {name: RescanMovie, movieId}.  Triggers a
