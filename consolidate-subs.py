@@ -36,7 +36,7 @@ from media_stack.config import (  # noqa: E402
     TEXT_CODECS, TMP_MKV_RE, TRAIL_WS_RE,
 )
 from media_stack.lang import (  # noqa: E402
-    ENG_AUDIO_LANGS, JPN_AUDIO_LANGS, KOR_AUDIO_LANGS, canonical_lang,
+    ENG_AUDIO_LANGS, JPN_AUDIO_LANGS, KOR_AUDIO_LANGS, canonical_lang, is_english_tag,
 )
 from media_stack.probe import (  # noqa: E402
     already_processed, file_key, probe, real_video_streams,
@@ -45,8 +45,10 @@ from media_stack.state import (  # noqa: E402
     load_state, save_state, update_state_entry,
 )
 from media_stack.audio import (  # noqa: E402
-    get_audio_lang_pref, is_commentary_audio, is_dub_audio, select_keep_audio,
+    confident_default_audio, get_audio_lang_pref, is_commentary_audio,
+    is_dub_audio, select_keep_audio,
 )
+from media_stack.arrlang import original_language_for  # noqa: E402
 from media_stack.subtitles import (  # noqa: E402
     ass_to_srt, clean_srt_text, count_subtitle_lines, extract_track,
     fetch_via_subliminal, find_sidecar_subs, is_forced_track, is_sdh_track,
@@ -198,10 +200,29 @@ def _normalize_audio_inline(path: Path, locked_path: Path | None = None) -> None
 
 
 def _expose_tag_normalize(out: Path, path: Path, replacement: Path,
-                          path_str: str) -> tuple[dict | None, bool]:
+                          path_str: str, tag: bool = True,
+                          normalize: bool = True) -> tuple[dict | None, bool]:
     """Swap the muxed `out` into `replacement`, stamp the CONSOLIDATED_SUBS
-    idempotency tag, and run inline loudness normalization — all while
-    holding the destination .mkv's lock.
+    idempotency tag, and (optionally) run inline loudness normalization —
+    all while holding the destination .mkv's lock.
+
+    `tag=False` skips the CONSOLIDATED_SUBS write entirely (tag_written is
+    always False in that case) — used by the no-main-English-subtitle
+    AUDIO-AND-SUBTITLE CLEANUP REMUX (`_cleanup_no_main_english`), which
+    must NOT mark the file as fully consolidated: it still needs the full
+    pass once an English subtitle shows up.
+
+    `normalize=False` skips the inline loudness-normalization subprocess
+    entirely — ALSO used by that same cleanup, and for an independent
+    reason: `normalize-audio.py` can re-encode the primary audio track
+    AND ffmpeg auto-marks the first stream `default` when none is
+    flagged, either of which would re-flag audio without going through
+    `confident_default_audio`'s confidence gate.  Normalization stays a
+    FULL-pass-only step, exactly as it was before this cleanup existed;
+    every other caller (the default `True`) is unaffected.
+
+    The swap + lock protocol are identical in every combination of
+    `tag`/`normalize`.
 
     Returns `(early_result, tag_written)`:
       - `early_result` is a result dict the caller must return as-is when we
@@ -243,23 +264,303 @@ def _expose_tag_normalize(out: Path, path: Path, replacement: Path,
         os.replace(out, replacement)
         if replacement != path and path.exists():
             path.unlink()
-        # Treat a tag-write EXCEPTION like a False return: the remux is
-        # already swapped in (and the .mp4 may be gone), so an uncaught raise
-        # would escape with state un-updated + sidecars un-cleaned, and the
-        # next scan would reprocess the already-mutated file.  Record
-        # tag_written=False and continue the "consolidated but untagged" path.
-        try:
-            tag_written = set_consolidated_tag(replacement, PIPELINE_VERSION)
-        except Exception as exc:
-            tag_written = False
-            log(f"ERROR: CONSOLIDATED_SUBS tag write raised for {replacement}: "
-                f"{type(exc).__name__}: {exc} (consolidation done; tag missing)")
-        else:
-            if not tag_written:
-                log(f"ERROR: CONSOLIDATED_SUBS tag write failed for {replacement} "
-                    f"(consolidation done + state recorded; MKV idempotency marker missing)")
-        _normalize_audio_inline(replacement, locked_path=replacement)
+        tag_written = False
+        if tag:
+            # Treat a tag-write EXCEPTION like a False return: the remux is
+            # already swapped in (and the .mp4 may be gone), so an uncaught
+            # raise would escape with state un-updated + sidecars un-cleaned,
+            # and the next scan would reprocess the already-mutated file.
+            # Record tag_written=False and continue the "consolidated but
+            # untagged" path.
+            try:
+                tag_written = set_consolidated_tag(replacement, PIPELINE_VERSION)
+            except Exception as exc:
+                tag_written = False
+                log(f"ERROR: CONSOLIDATED_SUBS tag write raised for {replacement}: "
+                    f"{type(exc).__name__}: {exc} (consolidation done; tag missing)")
+            else:
+                if not tag_written:
+                    log(f"ERROR: CONSOLIDATED_SUBS tag write failed for {replacement} "
+                        f"(consolidation done + state recorded; MKV idempotency marker missing)")
+        if normalize:
+            _normalize_audio_inline(replacement, locked_path=replacement)
         return (None, tag_written)
+
+
+# Fix 2 (codex round 3): a subtitle is droppable as "positively foreign"
+# only when its base subtag is a well-formed 2-3 letter ASCII-alphabetic
+# language code that ISN'T English and isn't one of these special
+# non-language codes (und/mul/mis/zxx) or in the qaa-qtz private-use
+# range.  Anything else -- empty, und-*, an unknown shape, a non-ASCII
+# "letter" like an accented "éé" (codex round 4 #3: Python's str.isalpha()
+# is Unicode-aware and would wrongly accept it) -- is ambiguous and must
+# be KEPT, not guessed at.
+_SUBTITLE_SPECIAL_LANG_CODES = frozenset({"und", "mul", "mis", "zxx"})
+_SUBTITLE_LANG_BASE_RE = re.compile(r"[a-z]{2,3}")
+
+
+def _is_positively_foreign_sub(s: dict) -> bool:
+    """True iff subtitle stream `s` is positively identifiable as a
+    non-English language (see module-level comment above `_SUBTITLE_
+    SPECIAL_LANG_CODES` for the exact rule). Used by
+    `_cleanup_no_main_english` to decide which subtitle tracks are safe
+    to drop."""
+    lang = ((s.get("tags") or {}).get("language") or "").strip().lower()
+    base = lang.split("-", 1)[0]
+    if not _SUBTITLE_LANG_BASE_RE.fullmatch(base):
+        return False
+    if base in _SUBTITLE_SPECIAL_LANG_CODES:
+        return False
+    if "qaa" <= base <= "qtz":
+        return False
+    return not is_english_tag(lang)
+
+
+def _cleanup_no_main_english(
+    path: Path, path_str: str, status: str, base_detail: str,
+    sub_streams: list[dict], audio_streams: list[dict], video_streams: list[dict],
+    forced_text: dict | None, eng_image: list[dict],
+    dry_run: bool,
+) -> dict:
+    """AUDIO-AND-SUBTITLE CLEANUP REMUX for the "no main English subtitle
+    yet" situation — DEFECT 1's fix.  Called from FOUR places in
+    `_process_locked`: the early-return gate's NEEDS_BAZARR "no English
+    candidates" and FAIL "only forced English" branches; and later, past
+    the gate (a text/sidecar candidate existed but didn't pan out), the
+    NEEDS_BAZARR "only image subs (subliminal fetch failed)" branch and
+    the FAIL "all extracts failed" branch (every text/sidecar candidate
+    failed extraction, no image candidate to fall back to either).
+
+    Without this, a file that will never get a main English subtitle until
+    Bazarr (or subliminal) finds one kept EVERY foreign subtitle track and
+    whatever audio track happened to be flagged default, however wrong —
+    e.g. a MULTI release with French default audio + English second audio
+    + French-only subs kept French as the default audio for as long as
+    Bazarr took to find an English sub (can be weeks).
+
+    GOVERNING PRINCIPLE: this cleanup must never DELETE a track that might
+    be wanted, and must never silently change a flag it didn't mean to.
+    A wrong default flag is recoverable (the next pass, or a manual
+    remux, can fix it); a deleted track is not.  Consequences of that,
+    each a fix for a real finding:
+      - Video is NOT TOUCHED AT ALL (codex round 4 #1) — not dropped,
+        not reduced, cover art included.  Cover-art removal stays the
+        FULL path's job; this cleanup runs long before an English
+        subtitle exists to consolidate onto, so it has no business
+        making container-repair decisions. `video_streams` here is the
+        caller's RAW, unfiltered list of every video-type stream.
+      - Audio is NEVER dropped and NEVER physically reordered — every
+        stream from the source survives, in its ORIGINAL physical
+        order.  The only audio action available is changing WHICH ONE
+        carries the `default` flag, and that only happens when
+        `confident_default_audio` (`media_stack.audio`) says so with
+        actual confidence (a keyword rule, a KNOWN Radarr/Sonarr
+        `original_language`, or an explicit `original` disposition —
+        NEVER a bare `default` disposition, NEVER a guess).  `None`
+        means "leave the audio exactly as it is" — the thrash guard: an
+        Arr outage can't make this cleanup re-remux the same file over
+        and over, alternating the default track each time.  mkvmerge's
+        `--audio-tracks` is a SELECTOR, not a reorder instruction
+        (`--track-order` would be needed for that, and isn't used
+        here), so there is no "reorder" to begin with — only the
+        `default` flag moves, targeted by source track ID.
+      - Subtitles: only a track whose language is POSITIVELY identified
+        as foreign is dropped (see `_is_positively_foreign_sub`) — a
+        well-formed ASCII 2-3 letter code that isn't English and isn't
+        one of the special/private-use codes.  Everything ambiguous
+        (untagged, `und`, `mul`, `zxx`, non-ASCII letters, an
+        unrecognized shape) is kept; it might be English (or might
+        matter) and guessing wrong means deleting it.
+      - EXACT flag preservation (codex round 4 #2): mkvmerge does NOT
+        leave a track TYPE's `default` flag alone when the source
+        provides none for that type at all — it picks one itself.
+        Omitting `--default-track` overrides therefore does NOT mean
+        "nothing changes"; it means "mkvmerge decides".  So every kept
+        track of every type gets an EXPLICIT `--default-track`, and
+        every kept subtitle ALSO an explicit `--forced-track`, built
+        from the SOURCE dispositions (`_cleanup_track_flags`) — the
+        ONLY intentional change anywhere in that map is the confident
+        audio pick, if any.
+      - A verify-after-mux step (see below) catches anything this
+        reasoning missed before the file is swapped into place.
+      - Loudness normalization is NOT run from this path at all (see
+        `_expose_tag_normalize`'s `normalize=False`): it can re-encode
+        audio and ffmpeg auto-marks a stream `default` when none is
+        flagged, either of which would re-flag audio outside the
+        confidence gate above. Normalization stays FULL-pass-only.
+
+    Keeps: EVERY stream in `video_streams` and `audio_streams` (byte-for-
+    byte same tracks, same order; only a `default`-flag change on audio,
+    and only when confident), the forced-English text track if present,
+    every English image-subtitle track (`eng_image` — a later subliminal
+    OCR source; must NOT be dropped here), AND every subtitle that isn't
+    positively foreign.
+
+    Does NOT stamp CONSOLIDATED_SUBS and does NOT touch sidecar files:
+    the file must still get the FULL pass (sidecar cleanup included) once
+    an English subtitle becomes available.  Idempotent: once cleaned,
+    `something_to_clean` is False on the next pass, so no remux runs and
+    no tag is needed to short-circuit it.
+
+    After a successful remux, the output is re-probed and its track
+    counts AND its audio/video default-flag pattern are checked against
+    what was INTENDED before the file is swapped in — belt-and-braces
+    against mkvmerge (or our own argv construction) silently dropping or
+    misflagging something.  A mismatch deletes the tmp output and
+    returns FAIL without touching the original.  The audio count must
+    equal the ORIGINAL audio count (never fewer — see above); video
+    count must equal the ORIGINAL video count (never touched at all).
+
+    `status`/`base_detail` are the caller's original early-return values —
+    the returned status is unchanged by this helper except on an actual
+    remux/verify failure (FAIL); only `detail` gains a cleanup summary.
+    """
+    original_language = original_language_for(path)
+    confident_idx = confident_default_audio(
+        path, audio_streams, original_language=original_language)
+
+    default_flagged = {
+        s["index"] for s in audio_streams
+        if (s.get("disposition") or {}).get("default")
+    }
+    if confident_idx is None:
+        # Not confident -> leave audio exactly as it is, regardless of
+        # whatever is (or isn't) currently flagged default.  This is the
+        # thrash guard: an Arr outage must not re-remux the file.
+        audio_default_change = False
+    elif default_flagged == {confident_idx}:
+        audio_default_change = False  # already the sole default -- nothing to do
+    else:
+        audio_default_change = True
+
+    # Video and audio are NEVER dropped or reordered -- every stream,
+    # every type, in its original physical order.
+    keep_video_idx = [s["index"] for s in video_streams]
+    keep_audio_idx = [s["index"] for s in audio_streams]
+
+    # Start from the tracks we KNOW we want, then also keep anything whose
+    # language we can't positively call foreign (untagged / "und" / any
+    # tag already English that isn't forced_text/eng_image -- e.g. a
+    # second, non-forced English track would stay too, harmlessly).
+    keep_sub_indices = {s["index"] for s in eng_image}
+    if forced_text is not None:
+        keep_sub_indices.add(forced_text["index"])
+    for s in sub_streams:
+        if s["index"] not in keep_sub_indices and not _is_positively_foreign_sub(s):
+            keep_sub_indices.add(s["index"])
+    kept_sub_streams = [s for s in sub_streams if s["index"] in keep_sub_indices]
+
+    dropped_subs = sum(1 for s in sub_streams if s["index"] not in keep_sub_indices)
+
+    something_to_clean = audio_default_change or dropped_subs > 0
+
+    if not something_to_clean:
+        return {"path": path_str, "status": status,
+                "detail": f"{base_detail}; nothing to clean"}
+
+    if dry_run:
+        return {"path": path_str, "status": status,
+                "detail": (f"{base_detail}; dry-run: would clean "
+                           f"audio_default_change={audio_default_change} "
+                           f"dropped_subs={dropped_subs}")}
+
+    # EXACT flag preservation (codex round 4 #2): build the explicit
+    # default/forced flag every kept track of every type must carry.
+    # The ONLY deliberate change anywhere in this map is the confident
+    # audio pick (if audio_default_change); everything else mirrors the
+    # SOURCE disposition exactly, because mkvmerge auto-assigns a
+    # default per track TYPE when the source has none at all for it --
+    # omitting the override is not "leave it alone".
+    cleanup_flags: dict[int, dict[str, bool]] = {}
+    for s in video_streams:
+        cleanup_flags[s["index"]] = {"default": bool((s.get("disposition") or {}).get("default"))}
+    for s in audio_streams:
+        is_default = (s["index"] == confident_idx) if audio_default_change \
+            else bool((s.get("disposition") or {}).get("default"))
+        cleanup_flags[s["index"]] = {"default": is_default}
+    for s in kept_sub_streams:
+        disp = s.get("disposition") or {}
+        cleanup_flags[s["index"]] = {
+            "default": bool(disp.get("default")),
+            "forced": bool(disp.get("forced")),
+        }
+
+    out = path.with_suffix(path.suffix + f".consol.{os.getpid()}.tmp.mkv")
+    if out.exists():
+        out.unlink()
+    ok, detail = remux(
+        path, out, keep_video_idx, keep_audio_idx, None, None,
+        keep_subtitle_indices=sorted(keep_sub_indices),
+        cleanup_flags=cleanup_flags,
+    )
+    if not ok:
+        if out.exists():
+            out.unlink()
+        return {"path": path_str, "status": "FAIL", "detail": f"cleanup remux: {detail}"}
+
+    # Verify the actual output BEFORE swapping it in -- belt-and-braces
+    # against mkvmerge (or our own argv) silently dropping or misflagging
+    # a track we intended to keep/preserve.  Never touch the original on
+    # a mismatch.
+    verify_info = probe(out)
+    if verify_info is None:
+        out.unlink()
+        return {"path": path_str, "status": "FAIL", "detail": "cleanup verify: probe failed"}
+    verify_streams = verify_info.get("streams", [])
+    out_video_streams = [s for s in verify_streams if s.get("codec_type") == "video"]
+    out_audio_streams = [s for s in verify_streams if s.get("codec_type") == "audio"]
+    out_subs = sum(1 for s in verify_streams if s.get("codec_type") == "subtitle")
+    expected_audio = len(audio_streams)  # cleanup NEVER drops audio
+    expected_subs = len(keep_sub_indices)
+    expected_video = len(video_streams)  # cleanup NEVER touches video
+    if (len(out_audio_streams) != expected_audio or out_subs != expected_subs
+            or len(out_video_streams) != expected_video):
+        out.unlink()
+        return {"path": path_str, "status": "FAIL",
+                "detail": (f"cleanup verify: expected audio={expected_audio} "
+                           f"subs={expected_subs} video={expected_video}, got "
+                           f"audio={len(out_audio_streams)} subs={out_subs} "
+                           f"video={len(out_video_streams)}")}
+
+    # Codex round 4 #4: counts alone aren't enough -- also verify the
+    # output's per-type default-flag PATTERN matches what we intended.
+    # Video/audio are never dropped or reordered, so the output streams
+    # of each type appear in the same relative order as keep_video_idx/
+    # keep_audio_idx; compare flag-by-position against that order.
+    intended_video_defaults = [cleanup_flags[i]["default"] for i in keep_video_idx]
+    intended_audio_defaults = [cleanup_flags[i]["default"] for i in keep_audio_idx]
+    out_video_defaults = [bool((s.get("disposition") or {}).get("default")) for s in out_video_streams]
+    out_audio_defaults = [bool((s.get("disposition") or {}).get("default")) for s in out_audio_streams]
+    if out_video_defaults != intended_video_defaults or out_audio_defaults != intended_audio_defaults:
+        out.unlink()
+        return {"path": path_str, "status": "FAIL",
+                "detail": (f"cleanup verify: default-flag mismatch -- "
+                           f"video expected={intended_video_defaults} got={out_video_defaults}, "
+                           f"audio expected={intended_audio_defaults} got={out_audio_defaults}")}
+
+    # Same sibling-collision guard as the full FIXED path (a suffix-
+    # changing replace, e.g. .mp4 -> .mkv, must not clobber an unrelated
+    # pre-existing sibling .mkv).
+    replacement = path.with_suffix(".mkv")
+    if replacement != path and replacement.exists():
+        if out.exists():
+            out.unlink()
+        return {"path": path_str, "status": "FAIL",
+                "detail": f"collision: sibling .mkv exists for {path.name}"}
+
+    # tag=False: this is a cleanup, not a full consolidation — must NOT
+    # stamp CONSOLIDATED_SUBS or this branch would never run again even
+    # though no English subtitle has actually been consolidated.
+    # normalize=False: loudness normalization is a FULL-pass-only step
+    # (see the docstring) — never run it from here.
+    early_result, _tag_written = _expose_tag_normalize(
+        out, path, replacement, path_str, tag=False, normalize=False)
+    if early_result is not None:
+        return early_result
+
+    return {"path": str(replacement), "status": status,
+            "detail": (f"{base_detail}; cleaned: audio_default_change={audio_default_change} "
+                       f"dropped_subs={dropped_subs}")}
 
 
 def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
@@ -292,8 +593,12 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
     # Note: do NOT early-return on empty sub_streams or empty eng_streams here.
     # Sidecar SRTs (Bazarr et al) are evaluated below and are a valid source —
     # MP4 rips with no embedded subs but rich sidecars must still flow through.
+    # is_english_tag() recognizes regional/script variants (en-US, eng-GB,
+    # ...) as English too, not just the bare eng/en/english aliases — an
+    # untagged/"und" track is deliberately NOT a candidate here (it might be
+    # anything; see media_stack.config.ENG_LANGS's docstring).
     eng_streams = [s for s in sub_streams
-                   if ((s.get("tags") or {}).get("language", "").lower() in ENG_LANGS)]
+                   if is_english_tag((s.get("tags") or {}).get("language"))]
 
     eng_text   = [s for s in eng_streams if s.get("codec_name") in TEXT_CODECS]
     eng_image  = [s for s in eng_streams if s.get("codec_name") in IMAGE_CODECS]
@@ -306,10 +611,53 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
     sidecar_main = [(p, sdh) for (p, forced, sdh) in sidecars if not forced]
     sidecar_forced = next(((p) for (p, forced, sdh) in sidecars if forced), None)
 
+    # Audio + real-video classification, hoisted above the early-return gate
+    # below (the full-FIXED-path code further down used to compute these
+    # itself, after the gate) so the "no main English subtitle yet" cleanup
+    # branch can also use them. See probe.real_video_streams for why cover
+    # art has to be excluded here, not just later.
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+    video_streams_all = [s for s in streams if s.get("codec_type") == "video"]
+    real_video = real_video_streams(streams)
+
+    # The CLEANUP does not touch video AT ALL (codex round 4 #1) -- not
+    # even cover art, which stays the FULL path's job.  It gets the raw,
+    # unfiltered `video_streams_all` directly; no selection to make here.
+
+    # The FULL FIXED path still drops cover art and reduces multiple real
+    # video streams down to one (belt-and-braces -- e.g. a director's-cut
+    # alt angle) when picking the final single-video-track output.
+    video_streams = real_video
+    if len(video_streams) > 1:
+        default_v = next(
+            (s for s in video_streams if (s.get("disposition") or {}).get("default")),
+            video_streams[0],
+        )
+        video_streams = [default_v]
+    keep_video_idx = [s["index"] for s in video_streams]
+    dropped_video = max(0, len(video_streams_all) - len(video_streams))
+
     if not main_candidates and not eng_image and not sidecar_main:
+        # DEFECT 1: this used to be a pure early return that mutated nothing,
+        # so a MULTI release with e.g. French default audio + English second
+        # + French-only subs kept the French dub as default and every
+        # foreign subtitle track for as long as Bazarr took to find an
+        # English sub (weeks, sometimes).  Now it still returns the same
+        # status (and FAIL/NEEDS_BAZARR keep their original exit-code
+        # mapping in main()) but first cleans up audio/subtitle tracks the
+        # documented policy would never have kept, if there's anything to
+        # clean. See `_cleanup_no_main_english`.
         if sidecar_forced or forced_text:
-            return {"path": path_str, "status": "FAIL", "detail": "only forced English"}
-        return {"path": path_str, "status": "NEEDS_BAZARR", "detail": "no English candidates"}
+            return _cleanup_no_main_english(
+                path, path_str, "FAIL", "only forced English",
+                sub_streams, audio_streams, video_streams_all,
+                forced_text, eng_image, dry_run,
+            )
+        return _cleanup_no_main_english(
+            path, path_str, "NEEDS_BAZARR", "no English candidates",
+            sub_streams, audio_streams, video_streams_all,
+            forced_text, eng_image, dry_run,
+        )
 
     if dry_run:
         # Past this point would mutate (workdir, extract, remux, replace, tag,
@@ -373,10 +721,26 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
                     # vetted than a Bazarr-curated sidecar but better than nothing.
                     scored.append((1000 + min(lc, 2000) // 5, fetched, "subliminal"))
                 else:
-                    return {"path": path_str, "status": "NEEDS_BAZARR",
-                            "detail": "only image subs (subliminal fetch failed)"}
+                    # Same "no main English subtitle yet" situation as the
+                    # early-return gate (DEFECT 1) -- we just discovered it
+                    # later, after an image-sub-only file's subliminal fetch
+                    # failed instead of up front.  Run the same cleanup.
+                    return _cleanup_no_main_english(
+                        path, path_str, "NEEDS_BAZARR",
+                        "only image subs (subliminal fetch failed)",
+                        sub_streams, audio_streams, video_streams_all,
+                        forced_text, eng_image, dry_run,
+                    )
             else:
-                return {"path": path_str, "status": "FAIL", "detail": "all extracts failed"}
+                # Every English text/sidecar candidate failed extraction
+                # and there's no image candidate to fall back to -- same
+                # "no main English subtitle yet" situation (DEFECT 1), so
+                # run the same cleanup. Status stays FAIL.
+                return _cleanup_no_main_english(
+                    path, path_str, "FAIL", "all extracts failed",
+                    sub_streams, audio_streams, video_streams_all,
+                    forced_text, eng_image, dry_run,
+                )
 
         scored.sort(key=lambda x: x[0], reverse=True)
         _, chosen_srt, _ = scored[0]
@@ -412,34 +776,21 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
 
         # v2: choose the single audio track to keep (prune commentary,
         # descriptive, and unwanted-language dubs; jpn for anime, kor for
-        # Korean cinema, otherwise eng).
-        audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
-
-        # Real motion video streams — see probe.real_video_streams, which is
-        # shared with normalize-audio's pass 2 so the two muxing steps cannot
-        # disagree about what counts as cover art.
-        video_streams_all = [s for s in streams if s.get("codec_type") == "video"]
-        video_streams = real_video_streams(streams)
-        # Belt-and-braces: if multiple real video tracks still remain (rare —
-        # e.g. director's-cut alt angle), keep only the default-disposition one,
-        # falling back to the first.
-        if len(video_streams) > 1:
-            default_v = next(
-                (s for s in video_streams if (s.get("disposition") or {}).get("default")),
-                video_streams[0],
-            )
-            video_streams = [default_v]
-        dropped_video = max(0, len(video_streams_all) - len(video_streams))
-
-        # Pass audio_streams so foreign-original films (input already carries
-        # eng+jpn or eng+kor with canonical disposition) can be detected and
-        # preserve all language tracks. multi_keep is True only for live-
-        # action foreign-original films (DUAL_AUDIO_KEYWORDS or the
-        # canonical-disposition path); anime/Korean keyword paths still use
-        # single-best-track selection per the documented audio rule.
-        allowed_langs, primary_lang, multi_keep = get_audio_lang_pref(path, audio_streams)
+        # Korean cinema, otherwise eng).  `audio_streams`/`keep_video_idx`/
+        # `dropped_video` were computed earlier (hoisted above the
+        # no-main-English-subtitle gate so that branch can use them too).
+        #
+        # Pass audio_streams + original_language_for(path) (Radarr/Sonarr's
+        # originalLanguage, via media_stack.arrlang — see DEFECT 2) so
+        # foreign-original films can be detected without trusting the
+        # Matroska `default` disposition, which release groups routinely set
+        # on a DUB. multi_keep is True only for live-action foreign-original
+        # films (DUAL_AUDIO_KEYWORDS or the original-language path);
+        # anime/Korean keyword paths still use single-best-track selection
+        # per the documented audio rule.
+        allowed_langs, primary_lang, multi_keep = get_audio_lang_pref(
+            path, audio_streams, original_language=original_language_for(path))
         keep_audio_idx = select_keep_audio(audio_streams, allowed_langs, primary_lang, multi_keep)
-        keep_video_idx = [s["index"] for s in video_streams]
         dropped_audio = max(0, len(audio_streams) - len(keep_audio_idx))
 
         out = path.with_suffix(path.suffix + f".consol.{os.getpid()}.tmp.mkv")
@@ -559,19 +910,19 @@ def main():
         if args.jobs <= 1:
             for f in files:
                 r = process_file(str(f), dry_run=args.dry_run)
-                log(f"{r['status']}: {Path(r['path']).name[:70]} | {r.get('detail','')}")
+                log(f"{r['status']}: {Path(r['path']).name} | {r.get('detail','')}")
         else:
             with ProcessPoolExecutor(max_workers=args.jobs) as ex:
                 futs = {ex.submit(process_file, str(f), args.dry_run): f for f in files}
                 for fut in as_completed(futs):
                     r = fut.result()
-                    log(f"{r['status']}: {Path(r['path']).name[:70]} | {r.get('detail','')}")
+                    log(f"{r['status']}: {Path(r['path']).name} | {r.get('detail','')}")
         log("scan complete")
         return 0
 
     if args.target:
         r = process_file(args.target, dry_run=args.dry_run)
-        log(f"{r['status']}: {Path(r['path']).name[:70]} | {r.get('detail','')}")
+        log(f"{r['status']}: {Path(r['path']).name} | {r.get('detail','')}")
         return 0 if r["status"] in ("FIXED", "SKIP", "NEEDS_BAZARR") else 1
 
     ap.print_help()

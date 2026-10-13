@@ -10,10 +10,112 @@ deterministic (no temp file lingering, no cwd dependence).
 Authoritative test list comes from `python3 -m pytest tests/ --collect-only -q`.
 The groups below are a fast-lookup map for "where do tests for X live?":
 
-- `test_media_lang.py` — `canonical_lang()` family aliases + CLI mode
+- `test_media_lang.py` — `canonical_lang()` family aliases + CLI mode;
+  regional/script variants (`en-US`, `eng-GB`, `ja-JP`, `ko-KR`, ...)
+  collapsing to their base family, and NOT guessing English from a bare
+  `-US`/`und-US` with no real base subtag; `is_english_tag()` (same
+  regional recognition, but untagged/`und` is NOT English — the
+  stricter subtitle-side rule)
 - `test_audio_selection.py` — `get_audio_lang_pref()` / `select_keep_audio()`
   multi_keep gating, dedup, primary-first ordering; regressions for
-  every codex audio-selection finding (rounds 1-4)
+  every codex audio-selection finding (rounds 1-4); the `original_language=`
+  kwarg (DEFECT 2 fix — Radarr/Sonarr signal beats the Matroska `default`
+  disposition, which release groups routinely set on a dub; `None` falls
+  back to the old disposition rule, sharpened so `default` alone can
+  neither promote a dub to primary NOR cause the foreign track to be
+  DROPPED — both are kept, eng primary/default, `multi_keep=True` —
+  including a simulated Arr-fetch-failure case on a Japanese-original-
+  style file; and codex round 2's ordering fix — `original` is checked
+  for BOTH jpn and kor before either's `default` is considered, so a
+  jpn `default` can never outrank a kor `original`); codex round 3 #1 —
+  `select_keep_audio`'s in-spec/scoring test is FAMILY-based
+  (`canonical_lang`), not a literal raw-string match: `eng + ja-JP` with
+  `original_language="jpn"` keeps BOTH (a literal match would wrongly
+  keep only eng), and `en-US + jpn` on an anime-keyword path still
+  behaves exactly as before; `confident_default_audio()` — keyword/
+  known-original_language/original-disposition confidence sources
+  (never `default`, never a guess), explicit-tag requirement (regional
+  variants count, untagged/`und` doesn't), commentary exclusion,
+  best-scored-candidate selection, and the Arr-outage-toggle
+  thrash-avoidance case (confident "jpn" -> unconfident "default-only"
+  None -> confident "jpn" again, never alternating)
+- `test_arrlang.py` — `original_language_for()`: movie/series path →
+  folder → `originalLanguage` mapping (mocked `ArrClient`, no real
+  network), None on client failure/missing key/no match/non-media path/
+  unmapped language name (anything other than English/Japanese/Korean —
+  the code never invents a non-ISO-639-2 code), per-process cache (one
+  fetch per kind); codex round 5 — the root check: a same-basename
+  record under an UNRELATED root (not `ARR_MOVIES_ROOT`/`ARR_TV_ROOT`,
+  default `/movies`/`/tv`) is ignored entirely (None, safe fallback); a
+  record under the configured/default root is used, trailing slashes
+  on either side included; two ACCEPTED records sharing a basename are
+  AMBIGUOUS -> None, without shadowing an unrelated, unambiguous
+  basename in the same fetch; a record rejected for the wrong root
+  does NOT itself trigger false ambiguity against an accepted one; the
+  root override works via process env AND via `.env` (same precedence
+  as the API keys, process-env still winning over a conflicting `.env`
+  entry), for both Radarr and Sonarr
+- `test_mux.py` — `media_stack.mux.remux()` mkvmerge argv, mocked
+  `subprocess.run`: the full consolidate-subs path (external English
+  srt + optional forced srt, `cleanup_flags` omitted) is pinned
+  byte-for-byte across every cleanup-mode addition; the `eng_srt=None`
+  cleanup mode (`--subtitle-tracks` for `keep_subtitle_indices`, or
+  `--no-subtitles` when none given, `forced_srt` ignored); codex round
+  4 #2 — `cleanup_flags={track_id: {"default": bool, "forced": bool}}`
+  emits an EXPLICIT `--default-track` for every kept video/audio/
+  subtitle id and an explicit `--forced-track` for every kept subtitle
+  id, by source track ID: a source with no default flags anywhere
+  produces explicit `default=no` for every one of its tracks (mkvmerge
+  auto-picks a default per type when the source has none at all for
+  it, so omitting the override would NOT mean "unchanged"); a confident
+  audio pick changes ONLY the audio defaults (video/subtitle flags
+  mirror source exactly); subtitle forced flags are re-emitted as in
+  the source independent of the audio/video decisions; a kept id
+  missing from the map defaults conservatively to `no`/`no`
+- `test_consolidate_cleanup.py` — the DEFECT 1 fix: the AUDIO-AND-
+  SUBTITLE CLEANUP REMUX run from `_process_locked`'s FOUR "no main
+  English subtitle yet" call sites (`_cleanup_no_main_english`) —
+  NEEDS_BAZARR "no English candidates", FAIL "only forced English",
+  NEEDS_BAZARR "only image subs (subliminal fetch failed)", and FAIL
+  "all extracts failed" (status unchanged in every case) — exercised
+  through the real gate wherever possible. Governing principle under
+  test throughout (codex rounds 2-4): never delete a track that might
+  be wanted, never silently change a flag that wasn't meant to change.
+  - **Video (round 4 #1, tightened from round 3):** NOT touched at
+    all — a cover-art mjpeg stream survives right alongside real video,
+    and its mere presence (nothing else wrong) does NOT trigger a
+    remux (contrast with round 3, where dropping cover art alone used
+    to count as "something to clean").
+  - **Audio:** NEVER dropped and NEVER physically reordered — a
+    confidently-decided change only sets the `default` flag by source
+    track ID (via `cleanup_flags`), list order untouched, including
+    when the confident pick is physically second or nothing is flagged
+    default at all; the narrow "already correct" guard (pick already
+    the SOLE default-flagged stream) skips the remux entirely; no
+    confidence signal at all (Arr down, no keyword, no disposition)
+    leaves every audio track's OWN source default flag preserved
+    exactly (round 4 #2 — re-verified per-track, not just "untouched"
+    in aggregate), including a French-original/Spanish-dub file with
+    no English track to anchor on.
+  - **Subtitles:** only POSITIVELY foreign tags are dropped under the
+    ASCII-only rule (round 4 #3) — `mul`/`und-Latn`/`zxx`/`qaa`
+    (special/private-use codes), untagged/unrecognized shapes, AND
+    non-ASCII "letters" like an accented `éé` or `日本語` all survive;
+    `fre`/`spa`/`jpn`/`fr-CA` (well-formed ASCII non-English codes) are
+    dropped; regional English (`en-US`) is recognized as a candidate
+    upstream and never reaches the foreign-check at all; every kept
+    subtitle's forced flag is re-emitted from its own source value.
+  - **Normalization:** `_normalize_audio_inline` is NEVER called from
+    this path (codex round 3 #4), even on a successful swap.
+  - No `CONSOLIDATED_SUBS` tag write; an already-clean file skips the
+    remux entirely (idempotency); `--dry-run` reports without mutating;
+    English image-subtitle tracks are never dropped; the post-remux
+    verify step (round 4 #4, strengthened) checks BOTH track counts
+    (audio/video expected = the ORIGINAL counts, since neither is ever
+    dropped) AND the per-track default-flag PATTERN for audio and
+    video — either kind of mismatch deletes the tmp output and FAILs
+    without touching the original; a full match lets the swap proceed,
+    still without normalizing.
 - `test_subtitles.py` — sub scoring + cleaning + recasing, sidecar
   discovery (bare + .en + .en.sdh + .en.forced + foreign-excluded),
   classification (forced/SDH/regular)
@@ -39,7 +141,10 @@ The groups below are a fast-lookup map for "where do tests for X live?":
 - `test_cli.py` — subcommand dispatch (canonicalize, expand,
   has_eng_sdh, dual_audio, telegram_send) with mocked ffprobe + adapter
 - `test_orchestration.py` — mock-based coverage of `_process_locked`'s
-  7 early-return branches (round-5 #4 mitigation)
+  7 early-return branches (round-5 #4 mitigation); the "no main English
+  subtitle yet" branches also cover the DEFECT 1 cleanup-remux trigger
+  vs. the already-clean no-op (see `test_consolidate_cleanup.py` for the
+  dedicated coverage of that mechanism)
 - `test_env_parser_no_eval.sh` + `test_env_parser_no_eval.py` —
   shell regression for round-10 #1 (lib/paths.sh must not eval
   values).  The .sh holds the actual assertion logic; the .py is

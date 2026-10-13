@@ -91,23 +91,79 @@ def test_already_processed_returns_skip(tmp_path):
 
 
 def test_no_english_candidates_returns_needs_bazarr(tmp_path):
-    """No embedded English subs, no image subs, no sidecars → kick
-    out to Bazarr instead of trying to mux nothing."""
+    """No embedded English subs, no image subs, no sidecars → kick out to
+    Bazarr instead of trying to mux a main subtitle.  DEFECT 1 fix: the
+    leftover German subtitle track is still something to clean, so this
+    also exercises the cleanup remux (`_cleanup_no_main_english`) — status
+    stays NEEDS_BAZARR, but the foreign sub is dropped on the way."""
     media = _media(tmp_path)
     streams = [
         {"index": 0, "codec_type": "video", "codec_name": "h264"},
         {"index": 1, "codec_type": "audio", "codec_name": "ac3",
          "tags": {"language": "eng"}},
-        # German sub track is not eligible
+        # German sub track is not an eligible English candidate, but IS
+        # something the cleanup remux must drop.
         {"index": 2, "codec_type": "subtitle", "codec_name": "subrip",
          "tags": {"language": "ger"}},
+    ]
+    calls = []
+
+    def _fake_remux(src, dst, video_idx, audio_idx, eng_srt, forced_srt,
+                     keep_subtitle_indices=None, cleanup_flags=None):
+        calls.append({"video_idx": video_idx, "audio_idx": audio_idx,
+                      "eng_srt": eng_srt, "forced_srt": forced_srt,
+                      "keep_subtitle_indices": keep_subtitle_indices,
+                      "cleanup_flags": cleanup_flags})
+        Path(dst).write_bytes(b"CLEANED")
+        return True, "ok"
+
+    # probe() is called twice: once for the ORIGINAL file (`streams`, with
+    # the German sub) and once to VERIFY the cleanup output (1 video
+    # default=False, 1 audio default=False -- both mirroring the source,
+    # which has no disposition at all; 0 subs — the German sub was
+    # dropped, nothing else to keep; the single eng audio track is left
+    # untouched -- no confidence signal).
+    verify_streams = {"streams": [
+        {"codec_type": "video", "disposition": {"default": 0}},
+        {"codec_type": "audio", "disposition": {"default": 0}},
+    ]}
+
+    def _probe_side_effect(p):
+        return {"streams": streams} if Path(p) == media else verify_streams
+
+    with patch.object(cs, "load_state", return_value={}), \
+         patch.object(cs, "probe", side_effect=_probe_side_effect), \
+         patch.object(cs, "already_processed", return_value=False), \
+         patch.object(cs, "find_sidecar_subs", return_value=[]), \
+         patch.object(cs, "remux", side_effect=_fake_remux), \
+         patch.object(cs, "_normalize_audio_inline"):
+        result = cs._process_locked(media, str(media), dry_run=False)
+    assert result["status"] == "NEEDS_BAZARR"
+    assert "cleaned" in result["detail"]
+    assert len(calls) == 1
+    assert calls[0]["eng_srt"] is None                      # cleanup mode, no external srt
+    assert calls[0]["audio_idx"] == [1]                      # the eng audio track kept
+    assert 2 not in (calls[0]["keep_subtitle_indices"] or [])  # German sub dropped
+
+
+def test_no_english_candidates_already_clean_skips_remux(tmp_path):
+    """Same gate, but nothing to clean (single untagged eng audio track,
+    no subtitle streams at all) → no remux attempted, idempotent."""
+    media = _media(tmp_path)
+    streams = [
+        {"index": 0, "codec_type": "video", "codec_name": "h264"},
+        {"index": 1, "codec_type": "audio", "codec_name": "ac3",
+         "tags": {"language": "eng"}},
     ]
     with patch.object(cs, "load_state", return_value={}), \
          patch.object(cs, "probe", return_value={"streams": streams}), \
          patch.object(cs, "already_processed", return_value=False), \
-         patch.object(cs, "find_sidecar_subs", return_value=[]):
+         patch.object(cs, "find_sidecar_subs", return_value=[]), \
+         patch.object(cs, "remux") as mock_remux:
         result = cs._process_locked(media, str(media), dry_run=False)
     assert result["status"] == "NEEDS_BAZARR"
+    assert "nothing to clean" in result["detail"]
+    assert mock_remux.call_count == 0
 
 
 def test_only_forced_english_returns_fail(tmp_path):
@@ -180,6 +236,21 @@ def test_expose_tag_normalize_mkv_success(tmp_path):
     assert replacement.read_bytes() == b"MUXED"             # swapped into place
     # #2: normalize must inherit the destination lock, not `path`.
     assert norm.call_args.kwargs["locked_path"] == replacement
+
+
+def test_expose_tag_normalize_normalize_false_skips_normalize(tmp_path):
+    """Codex round 3 #4: normalize=False (the cleanup's usage, alongside
+    tag=False) must skip `_normalize_audio_inline` entirely — the swap
+    and the (skipped) tag write still behave normally."""
+    out, path, replacement = _mux_and_dest(tmp_path, ".mkv")
+    with patch.object(cs, "set_consolidated_tag") as tag, \
+         patch.object(cs, "_normalize_audio_inline") as norm:
+        skip, tag_written = cs._expose_tag_normalize(
+            out, path, replacement, str(path), tag=False, normalize=False)
+    assert skip is None and tag_written is False
+    assert replacement.read_bytes() == b"MUXED"   # swap still happened
+    assert tag.call_count == 0                     # tag=False: never attempted
+    norm.assert_not_called()                       # normalize=False: never run
 
 
 def test_expose_tag_normalize_tagfail_does_not_roll_back(tmp_path):

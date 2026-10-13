@@ -12,6 +12,7 @@ from media_lang import (  # noqa: E402
     JPN_AUDIO_LANGS,
     KOR_AUDIO_LANGS,
     canonical_lang,
+    is_english_tag,
 )
 
 
@@ -42,6 +43,47 @@ def test_unknown_family_passes_through_lowercase():
     assert canonical_lang("fre") == "fre"
     assert canonical_lang("FRE") == "fre"
     assert canonical_lang("spa") == "spa"
+
+
+def test_regional_english_variants_collapse_to_eng():
+    """en-US, en-GB, eng-US, en_US, and any other en-*/eng-* regional or
+    script variant must canonicalize to eng, not pass through unchanged."""
+    for tag in ("en-US", "en-GB", "eng-US", "eng-GB", "en_US", "EN-us", "english-US"):
+        assert canonical_lang(tag) == "eng", tag
+
+
+def test_regional_japanese_korean_variants_collapse_too():
+    """The same base-subtag mechanism applies to every family, not just
+    English (ja-JP, ko-KR, ...)."""
+    assert canonical_lang("ja-JP") == "jpn"
+    assert canonical_lang("ko-KR") == "kor"
+
+
+def test_bare_regional_suffix_without_a_real_base_does_not_guess_english():
+    """A tag whose base subtag is empty or "und" has no meaningful
+    "regional variant" reading -- must NOT be guessed as English."""
+    assert canonical_lang("-US") == "-us"  # lowercased, but not promoted to eng
+    assert canonical_lang("und-US") == "und-us"
+
+
+def test_is_english_tag_recognizes_base_and_regional_aliases():
+    for tag in ("eng", "en", "english", "EN", "en-US", "en-GB", "eng-US"):
+        assert is_english_tag(tag) is True, tag
+
+
+def test_is_english_tag_rejects_untagged_and_und():
+    """Unlike canonical_lang, is_english_tag does NOT assume an
+    untagged/"und" stream is English -- that's the stricter subtitle-side
+    rule (see media_stack.config.ENG_LANGS)."""
+    assert is_english_tag("") is False
+    assert is_english_tag(None) is False
+    assert is_english_tag("und") is False
+
+
+def test_is_english_tag_rejects_foreign():
+    assert is_english_tag("ger") is False
+    assert is_english_tag("fre") is False
+    assert is_english_tag("jpn") is False
 
 
 def test_alias_sets_are_disjoint_except_for_und_in_eng():

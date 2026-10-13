@@ -48,9 +48,41 @@ def canonical_lang(raw: str | None) -> str:
     `jpn`/`ja`/`japanese`           → `jpn`
     `kor`/`ko`/`korean`             → `kor`
     Anything else                   → returned lowercase unchanged.
+
+    Regional/script variants also collapse to their base family: `en-US`,
+    `en-GB`, `eng-US`, `en_US`, `ja-JP`, `ko-KR`, ... — the subtag before
+    the first `-`/`_` is looked up the same way, as long as that base
+    subtag is itself a real alias (not the empty/`und` placeholder, which
+    has no meaningful "regional variant" — a bare `-US` or `_GB` tag
+    stays unmapped rather than guessing English).
     """
     r = (raw or "").lower()
-    return _FAMILY_MAP.get(r, r)
+    if r in _FAMILY_MAP:
+        return _FAMILY_MAP[r]
+    base = r.split("-", 1)[0].split("_", 1)[0]
+    if base and base != "und" and base in _FAMILY_MAP:
+        return _FAMILY_MAP[base]
+    return r
+
+
+def is_english_tag(raw: str | None) -> bool:
+    """True iff `raw` names the English language family, INCLUDING
+    regional/script variants (`en-US`, `eng-GB`, ...).
+
+    Unlike `canonical_lang`, an empty tag or explicit `und` (unknown) is
+    NOT treated as English here: that distinction matters for subtitles,
+    where an untagged/`und` track might be anything and must not be
+    assumed English for candidacy or foreign-ness decisions (the audio
+    side's "untagged defaults to English" assumption — `canonical_lang("")
+    == "eng"`, consumed via `ENG_AUDIO_LANGS` — is deliberately a
+    different, looser rule; see `media_stack.config.ENG_LANGS`'s
+    docstring). Callers that want the audio-side looseness should check
+    `canonical_lang(...) == "eng"` directly instead of this helper.
+    """
+    r = (raw or "").strip().lower()
+    if r in ("", "und"):
+        return False
+    return canonical_lang(r) == "eng"
 
 
 def _cli_canonicalize() -> int:
