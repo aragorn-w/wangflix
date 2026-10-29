@@ -21,13 +21,6 @@ ignore = [
     "E741",  # ambiguous single-char name — a couple of legacy loop vars
 ]
 
-[tool.ruff.lint.per-file-ignores]
-# The legacy monolithic CLI entry scripts carry pre-module-split import
-# cruft (AUDIT A4 territory). The package (media_stack/) is held to the
-# full ruleset; clean these opportunistically when next touched.
-"consolidate-subs.py" = ["F401", "F841"]
-"normalize-audio.py" = ["F401"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

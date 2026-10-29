@@ -1734,38 +1734,7 @@ def test_load_config_honors_overrides():
     assert cfg.jellyfin_key == "secret"
 
 
-# --- _env_float / _env_int: finite, positive, BOUNDED validation --------
-
-# 1e308 is finite and positive but overflows `timedelta()` and `* 60`, so the bound must reject it.
-@pytest.mark.parametrize("bad", ["nan", "inf", "-inf", "0", "-5", "abc", "1e308", "100.5"],
-                         ids=["nan", "inf", "-inf", "zero", "negative", "unparseable", "finite-but-huge",
-                              "just-over-the-limit"])
-def test_env_float_rejects_a_bad_value_with_a_warning(bad, capsys):
-    assert sf._env_float({"X": bad}, "X", 7.0, 100.0) == 7.0
-    assert "X" in capsys.readouterr().out  # a warning was logged
-
-
-@pytest.mark.parametrize("value, expected", [("12.5", 12.5), ("100.0", 100.0)], ids=["valid", "exactly-at-the-limit"])
-def test_env_float_accepts_a_value_up_to_the_limit(value, expected):
-    assert sf._env_float({"X": value}, "X", 7.0, 100.0) == expected
-
-
-def test_env_float_empty_or_missing_is_the_default_with_no_warning(capsys):
-    assert sf._env_float({}, "X", 7.0, 100.0) == 7.0
-    assert sf._env_float({"X": ""}, "X", 7.0, 100.0) == 7.0
-    assert capsys.readouterr().out == ""  # absence isn't a bad value
-
-
-@pytest.mark.parametrize("bad", ["0", "-5", "abc", "65"], ids=["zero", "negative", "unparseable", "over-the-limit"])
-def test_env_int_rejects_a_bad_value_with_a_warning(bad, capsys):
-    assert sf._env_int({"X": bad}, "X", 6, 64) == 6
-    assert "X" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize("value, expected", [("3", 3), ("64", 64)], ids=["valid", "exactly-at-the-limit"])
-def test_env_int_accepts_a_value_up_to_the_limit(value, expected):
-    assert sf._env_int({"X": value}, "X", 6, 64) == expected
-
+# --- load_config: finite, positive, BOUNDED validation of numeric settings ----
 
 _NUMERIC_SETTINGS = [  # (env var, Config attribute, upper bound)
     ("SUB_FALLBACK_AGE_HOURS", "age_hours", 8760),

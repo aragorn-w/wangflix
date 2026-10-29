@@ -54,7 +54,6 @@ run lock). `--device NAME` checks one device and leaves the stored state of the 
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import ipaddress
 import json
@@ -72,6 +71,7 @@ from typing import Callable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from media_stack.clients.telegram import send as telegram_send  # noqa: E402
+from media_stack.locking import acquire_singleton_lock  # noqa: E402
 from media_stack.paths import (  # noqa: E402
     MEDIA_STACK_ROOT, VAR_RUN, VAR_STATE, ensure_var_dirs, load_env_file,
 )
@@ -665,17 +665,6 @@ def send_alert(text: str) -> bool:
         return False
     log("notify sent" if ok else "notify failed (non-fatal)")
     return ok
-
-
-def acquire_singleton_lock(lock_path: Path):
-    """The locked file, or None if another run holds the lock. Keep it referenced: the flock goes with it."""
-    lock_fp = open(lock_path, "w")
-    try:
-        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        lock_fp.close()
-        return None
-    return lock_fp
 
 
 def main(argv: list[str] | None = None, *, adb: AdbRunner | None = None,

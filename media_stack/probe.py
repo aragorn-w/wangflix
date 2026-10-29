@@ -128,26 +128,20 @@ def ffprobe_strict(path: Path) -> dict:
     return json.loads(r.stdout)
 
 
+def _has_tag(info: dict, tag: str, version: int) -> bool:
+    tags = (info.get("format") or {}).get("tags") or {}
+    want = f"v{version}"
+    return any(k.upper() == tag and str(v) == want for k, v in tags.items())
+
+
 def already_processed(info: dict) -> bool:
     """Carries CONSOLIDATED_SUBS=v<PIPELINE_VERSION>."""
-    fmt = info.get("format") or {}
-    tags = fmt.get("tags") or {}
-    want = f"v{PIPELINE_VERSION}"
-    for k, v in tags.items():
-        if k.upper() == CONSOLIDATED_TAG and str(v) == want:
-            return True
-    return False
+    return _has_tag(info, CONSOLIDATED_TAG, PIPELINE_VERSION)
 
 
 def already_normalized(info: dict, audio_version: int = 1) -> bool:
     """Carries NORMALIZED_AUDIO=v<audio_version>."""
-    fmt = info.get("format") or {}
-    tags = fmt.get("tags") or {}
-    want = f"v{audio_version}"
-    for k, v in tags.items():
-        if k.upper() == NORMALIZED_TAG and str(v) == want:
-            return True
-    return False
+    return _has_tag(info, NORMALIZED_TAG, audio_version)
 
 
 def primary_audio_stream(info: dict) -> dict | None:

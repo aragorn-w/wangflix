@@ -1,15 +1,18 @@
-"""Tests for media_stack.locking: per-file flock shared by consolidate-subs and normalize-audio."""
+"""Tests for media_stack.locking: the per-file flock shared by consolidate-subs and normalize-audio, and the cron scripts' singleton lock."""
 
 import multiprocessing
+import signal
 import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from media_stack.locking import (
-    acquire_file_lock, lock_path_for,
+    acquire_file_lock, acquire_singleton_lock, handle_sigterm, lock_path_for,
 )
 
 
@@ -132,3 +135,22 @@ def test_inherit_from_relative_vs_absolute_same_file_bypasses(tmp_path, monkeypa
                 "aliasing on the same file; broken compare would re-"
                 "acquire the lock the parent already holds"
             )
+
+
+def test_singleton_lock_is_exclusive_until_released(tmp_path):
+    lock = tmp_path / "x.lock"
+    held = acquire_singleton_lock(lock)
+    assert held is not None
+    try:
+        assert acquire_singleton_lock(lock) is None
+    finally:
+        held.close()
+    again = acquire_singleton_lock(lock)
+    assert again is not None
+    again.close()
+
+
+def test_handle_sigterm_exits_with_128_plus_the_signal():
+    with pytest.raises(SystemExit) as exc:
+        handle_sigterm(signal.SIGTERM, None)
+    assert exc.value.code == 128 + signal.SIGTERM

@@ -7,7 +7,7 @@ Usage: normalize-audio.py <file> | --scan <dir> [--jobs N] | --measure-only <fil
 Exit codes: 0 ok/skip, 1 hard fail, 2 usage.
 """
 from __future__ import annotations
-import argparse, json, os, re, shutil, subprocess, sys, tempfile, time
+import argparse, json, os, re, sys, time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import nullcontext
 from pathlib import Path
@@ -20,7 +20,7 @@ from media_stack.probe import (  # noqa: E402
     primary_audio_stream, real_video_streams,
 )
 from media_stack.loudness import (  # noqa: E402
-    AAC_BITRATE, DEFAULT_AAC_BITRATE, TARGET_I, TARGET_LRA, TARGET_TP,
+    TARGET_I, TARGET_TP,
     fast_measure_ebur128, measure_loudness, render_normalized,
 )
 from media_stack.mux import mkvmerge_remux_simple as mkvmerge_remux  # noqa: E402
@@ -104,7 +104,6 @@ def _replace_and_tag(src: Path, remux_out: Path, final_path: Path,
     raising tag write rolls the swap back and returns False. Raises RuntimeError if the
     destination is locked or a sibling .mkv appeared; a failed rename restores `src` first.
     """
-    from media_stack.locking import acquire_file_lock
     dest_lock = (acquire_file_lock(final_path) if final_path != src
                  else nullcontext(True))
     with dest_lock as dest_acquired:
@@ -134,16 +133,10 @@ def _replace_and_tag(src: Path, remux_out: Path, final_path: Path,
             # Roll back, dropping the orphan output when the suffix changed.
             os.replace(backup_path, src)
             if final_path != src:
-                try:
-                    final_path.unlink()
-                except FileNotFoundError:
-                    pass
+                final_path.unlink(missing_ok=True)
             return False
 
-        try:
-            backup_path.unlink()
-        except FileNotFoundError:
-            pass
+        backup_path.unlink(missing_ok=True)
         return True
 
 
@@ -216,20 +209,14 @@ def _process_file_inner_locked(src: Path, path_str: str, dry_run: bool) -> dict:
     try:
         render_normalized(src, pass2_out, audio_idx, channels, measured, channel_layout)
         mkvmerge_remux(pass2_out, remux_out)
-        try:
-            pass2_out.unlink()
-        except FileNotFoundError:
-            pass
+        pass2_out.unlink(missing_ok=True)
 
         final_path = src.with_suffix(".mkv")
         backup_path = src.with_suffix(src.suffix + ".pre-norm.bak")
 
         # Refuse rather than overwrite a different sibling .mkv.
         if final_path != src and final_path.exists():
-            try:
-                remux_out.unlink()
-            except FileNotFoundError:
-                pass
+            remux_out.unlink(missing_ok=True)
             raise RuntimeError(
                 f"collision: sibling .mkv exists for {src.name}; refusing to overwrite"
             )
@@ -247,10 +234,7 @@ def _process_file_inner_locked(src: Path, path_str: str, dry_run: bool) -> dict:
 
     finally:
         for p in (pass2_out, remux_out):
-            try:
-                p.unlink()
-            except FileNotFoundError:
-                pass
+            p.unlink(missing_ok=True)
         try:
             workdir.rmdir()
         except OSError:

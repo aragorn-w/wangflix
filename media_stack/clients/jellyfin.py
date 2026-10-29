@@ -17,6 +17,17 @@ class JellyfinClient:
         self.base = base_url.rstrip("/")
         self.timeout = timeout
 
+    def _send(self, method: str, url: str, headers: dict[str, str],
+              data: bytes | None) -> tuple[int, bytes]:
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise NetworkError(f"{method} {url}: {type(e).__name__}: {e}") from e
+
     def request(self, path: str, key: str, *, method: str = "GET",
                 body: dict | None = None) -> tuple[int, bytes]:
         """(status, body) for ANY HTTP response; raises `NetworkError` on transport failure."""
@@ -28,14 +39,7 @@ class JellyfinClient:
             "Content-Type": "application/json",
         }
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return r.status, r.read()
-        except urllib.error.HTTPError as e:
-            return e.code, e.read()
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            raise NetworkError(f"{method} {url}: {type(e).__name__}: {e}") from e
+        return self._send(method, url, headers, data)
 
     def authenticate(self, username: str, password: str) -> tuple[int, bytes]:
         """(status, body), so the caller can check User.Policy.IsAdministrator."""
@@ -49,14 +53,7 @@ class JellyfinClient:
             ),
         }
         body = json.dumps({"Username": username, "Pw": password}).encode()
-        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return r.status, r.read()
-        except urllib.error.HTTPError as e:
-            return e.code, e.read()
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            raise NetworkError(f"POST {url}: {type(e).__name__}: {e}") from e
+        return self._send("POST", url, headers, body)
 
     def list_keys(self, key: str) -> list[dict]:
         """Raises RuntimeError on any malformed shape (a dict without `Items` must not read as []

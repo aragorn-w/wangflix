@@ -4,6 +4,7 @@ see `apikey_from_container()`."""
 from __future__ import annotations
 
 import subprocess
+from typing import Any
 
 import requests
 
@@ -23,9 +24,9 @@ class BazarrClient:
         except Exception:
             return "000"
 
-    def movies(self, length: int = 10000) -> list[dict] | None:
+    def _list(self, path: str, length: int) -> list[dict] | None:
         try:
-            r = requests.get(f"{self.base_url}/api/movies",
+            r = requests.get(f"{self.base_url}{path}",
                              params={"length": length},
                              headers=self.headers, timeout=self.timeout)
             r.raise_for_status()
@@ -34,16 +35,11 @@ class BazarrClient:
         except Exception:
             return None
 
+    def movies(self, length: int = 10000) -> list[dict] | None:
+        return self._list("/api/movies", length)
+
     def series(self, length: int = 10000) -> list[dict] | None:
-        try:
-            r = requests.get(f"{self.base_url}/api/series",
-                             params={"length": length},
-                             headers=self.headers, timeout=self.timeout)
-            r.raise_for_status()
-            d = r.json()
-            return d.get("data") or d.get("items") or []
-        except Exception:
-            return None
+        return self._list("/api/series", length)
 
     def unprofiled_count(self) -> tuple[int | None, int | None]:
         """`(movies, series)` with `profileId == None`; a side is None on endpoint failure."""
@@ -69,42 +65,26 @@ class BazarrClient:
             )
         return count_wrong(m), count_wrong(s)
 
+    def _post_ok(self, path: str, **kw: Any) -> bool:
+        try:
+            r = requests.post(f"{self.base_url}{path}",
+                              headers=self.headers, timeout=self.timeout, **kw)
+            r.raise_for_status()
+            return True
+        except Exception:
+            return False
+
     def assign_movie_profile(self, radarr_id: int, profile_id: int) -> bool:
         """Form-encoded (NOT JSON) body; True on 2xx."""
-        try:
-            r = requests.post(
-                f"{self.base_url}/api/movies",
-                data={"radarrid": radarr_id, "profileid": profile_id},
-                headers=self.headers, timeout=self.timeout,
-            )
-            r.raise_for_status()
-            return True
-        except Exception:
-            return False
+        return self._post_ok("/api/movies",
+                             data={"radarrid": radarr_id, "profileid": profile_id})
 
     def assign_series_profile(self, sonarr_series_id: int, profile_id: int) -> bool:
-        try:
-            r = requests.post(
-                f"{self.base_url}/api/series",
-                data={"seriesid": sonarr_series_id, "profileid": profile_id},
-                headers=self.headers, timeout=self.timeout,
-            )
-            r.raise_for_status()
-            return True
-        except Exception:
-            return False
+        return self._post_ok("/api/series",
+                             data={"seriesid": sonarr_series_id, "profileid": profile_id})
 
     def trigger_task(self, task_id: str) -> bool:
-        try:
-            r = requests.post(
-                f"{self.base_url}/api/system/tasks",
-                params={"taskid": task_id},
-                headers=self.headers, timeout=self.timeout,
-            )
-            r.raise_for_status()
-            return True
-        except Exception:
-            return False
+        return self._post_ok("/api/system/tasks", params={"taskid": task_id})
 
 
 def apikey_from_container(container: str = "bazarr",

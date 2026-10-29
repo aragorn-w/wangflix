@@ -1,4 +1,5 @@
-"""Per-file flock shared by consolidate-subs.py and normalize-audio.py.
+"""File locks shared by the pipeline scripts: the per-file flock of consolidate-subs.py and
+normalize-audio.py, and the singleton lock of the cron scripts.
 
 Lock files are NEVER unlinked (a fresh file at the same path could flock on a different
 inode while a sibling is mid-release). Only the acquirer releases; a BlockingIOError loser
@@ -10,7 +11,7 @@ from __future__ import annotations
 import fcntl
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import IO, Iterator
 
 
 def lock_path_for(media_path: Path) -> Path:
@@ -57,3 +58,19 @@ def acquire_file_lock(
                 pass
         lock_fp.close()
         # Deliberately NOT unlinking lp.
+
+
+def acquire_singleton_lock(lock_path: Path) -> IO[str] | None:
+    """The locked file (keep it referenced: closing drops the flock), or `None` if held."""
+    lock_fp = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_fp.close()
+        return None
+    return lock_fp
+
+
+def handle_sigterm(signum: int, frame: object) -> None:
+    """SystemExit on SIGTERM so `finally` blocks run (else child processes are orphaned)."""
+    raise SystemExit(128 + signum)

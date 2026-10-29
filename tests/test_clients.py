@@ -457,8 +457,10 @@ def test_jellyfin_request_http_error_returns_status_and_body():
     assert status == 404 and body == b"nf"
 
 
-def test_jellyfin_request_transport_raises_networkerror():
-    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("refused")):
+@pytest.mark.parametrize("exc", [urllib.error.URLError("refused"), TimeoutError("timeout")],
+                         ids=["urlerror", "timeout"])
+def test_jellyfin_request_transport_raises_networkerror(exc):
+    with patch("urllib.request.urlopen", side_effect=exc):
         with pytest.raises(NetworkError):
             JellyfinClient("http://jf:8096").request("/x", "k")
 
@@ -478,14 +480,38 @@ def test_jellyfin_list_keys_accepts_both_envelopes(payload):
 
 
 @pytest.mark.parametrize("payload", [
+    "not a list or dict",
+    {"Items": None},
+    {"Items": ["just-a-string", 42]},
     {"error": "masked"},
-    {"Items": [{"AppName": "a", "AccessToken": None}]},
-    {"Items": [{"AppName": "", "AccessToken": "tok"}]},
-], ids=["dict-without-items", "invalid-accesstoken", "invalid-appname"])
+    {"Items": [{"AppName": "ok", "AccessToken": "abcd"}, {"AppName": "broken"}]},
+    {"Items": [{"AppName": "broken", "AccessToken": None}]},
+    {"Items": [{"AppName": "broken", "AccessToken": ""}]},
+    {"Items": [{"AppName": "ok", "AccessToken": "abcd"}, {"AccessToken": "abcd"}]},
+    {"Items": [{"AppName": None, "AccessToken": "abcd"}]},
+    {"Items": [{"AppName": "", "AccessToken": "abcd"}]},
+], ids=["scalar", "null-items", "non-dict-items", "dict-without-items", "missing-access-token",
+        "null-access-token", "empty-access-token", "missing-app-name", "null-app-name",
+        "empty-app-name"])
 def test_jellyfin_list_keys_malformed_raises(payload):
+    """A contract violation must raise, never return [] and skip the duplicate-name check."""
     with patch("urllib.request.urlopen", return_value=_jf_resp(200, json.dumps(payload).encode())):
         with pytest.raises(RuntimeError):
             JellyfinClient("http://jf:8096").list_keys("k")
+
+
+def test_jellyfin_list_keys_diagnostic_doesnt_leak_tokens():
+    """Diagnostics must report only structural metadata: /Auth/Keys carries tokens."""
+    payload = json.dumps({
+        "Items": [
+            {"AppName": "x", "AccessToken": "super-secret-token-must-not-leak"},
+            "this-is-the-bad-entry-string-with-token-super-secret-token-must-not-leak",
+        ]
+    }).encode()
+    with patch("urllib.request.urlopen", return_value=_jf_resp(200, payload)):
+        with pytest.raises(RuntimeError) as exc_info:
+            JellyfinClient("http://jf:8096").list_keys("k")
+    assert "super-secret-token-must-not-leak" not in str(exc_info.value)
 
 
 def test_jellyfin_list_keys_non200_raises():

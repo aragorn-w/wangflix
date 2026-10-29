@@ -16,13 +16,8 @@ class QBitClient:
         self.password = password
         self.timeout = timeout
         self.session = requests.Session()
-        self._logged_in = False
 
-    def login(self) -> bool:
-        """A no-op True when `username` is empty (bypass mode); False on login failure."""
-        if not self.username:
-            self._logged_in = True
-            return True
+    def _post_login(self) -> tuple[int, str] | None:
         try:
             r = self.session.post(
                 f"{self.base_url}/api/v2/auth/login",
@@ -30,27 +25,24 @@ class QBitClient:
                 headers={"Referer": self.base_url},
                 timeout=self.timeout,
             )
-            self._logged_in = (r.status_code == 200
-                               and r.text.strip().lower() == "ok.")
-            return self._logged_in
+            return r.status_code, r.text
         except Exception:
-            return False
+            return None
+
+    def login(self) -> bool:
+        """A no-op True when `username` is empty (bypass mode); False on login failure."""
+        if not self.username:
+            return True
+        resp = self._post_login()
+        return resp is not None and resp[0] == 200 and resp[1].strip().lower() == "ok."
 
     def login_response(self) -> str:
         """Raw login text ('Ok.', 'Fails.'), '' on a connection error, 'Ok.' without a request in
         bypass mode. Sets the SID cookie."""
         if not self.username:
             return "Ok."
-        try:
-            r = self.session.post(
-                f"{self.base_url}/api/v2/auth/login",
-                data={"username": self.username, "password": self.password},
-                headers={"Referer": self.base_url},
-                timeout=self.timeout,
-            )
-            return r.text
-        except Exception:
-            return ""
+        resp = self._post_login()
+        return "" if resp is None else resp[1]
 
     def reachable_status(self) -> str:
         """'000' on a connection failure."""

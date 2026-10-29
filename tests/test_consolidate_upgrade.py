@@ -552,7 +552,7 @@ def test_wrong_episode_sidecar_is_left_alone_and_not_verified_again(tmp_path, mo
     assert len(h.window_reads) == 3
     rejection = h.state()["upgrade_rejected"]
     assert rejection["sidecars"][0][0] == "Movie (2024).en.srt"
-    assert rejection["video"] == list(cs._identity(h.media))   # and the video it was judged against
+    assert rejection["video"] == list(cs.file_identity(h.media))   # and the video it was judged against
 
     h.window_reads.clear()
     h.probes.clear()
@@ -722,7 +722,7 @@ def _rejected_once(tmp_path, monkeypatch):
     h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", right)], asr=wrong_asr)
     assert h.run()["detail"] == "tag present"
     assert len(h.window_reads) == 3 and h.remuxes == []
-    assert h.state()["upgrade_rejected"]["video"] == list(cs._identity(h.media))
+    assert h.state()["upgrade_rejected"]["video"] == list(cs.file_identity(h.media))
     return h, right_asr
 
 
@@ -1263,10 +1263,10 @@ def test_a_video_that_changes_before_the_swap_aborts_and_removes_the_temp_output
 def test_the_video_identity_is_recorded_when_the_gate_probes_it(tmp_path, monkeypatch):
     h = _upgrade_ready(tmp_path, monkeypatch)
     seen = []
-    with patch.object(cs, "probe", side_effect=lambda p: seen.append(cs._identity(Path(p))) or h.info), \
+    with patch.object(cs, "probe", side_effect=lambda p: seen.append(cs.file_identity(Path(p))) or h.info), \
          patch.object(sv, "embedded_text_window", side_effect=h._window):
         upgrade, _info_, _rej = cs._generated_upgrade_check(h.media, cs.file_key(h.media), None)
-    assert upgrade.video_identity == cs._identity(h.media) == seen[0]
+    assert upgrade.video_identity == cs.file_identity(h.media) == seen[0]
 
 
 # --- the bytes are compared again before the sidecar is deleted ----------------------------------------
@@ -1276,7 +1276,7 @@ def test_the_snapshot_identity_is_the_four_field_identity_with_ctime(tmp_path):
     p.write_text("hello")
     snap = cs._snapshot_sidecar(p)
     st = p.stat()
-    assert snap.identity == (st.st_ino, 5, st.st_mtime_ns, st.st_ctime_ns) == cs._identity(p)
+    assert snap.identity == (st.st_ino, 5, st.st_mtime_ns, st.st_ctime_ns) == cs.file_identity(p)
 
 
 class _MidRead:
@@ -1737,7 +1737,7 @@ def test_check_reports_a_rejection_fingerprint_only_for_a_judged_sidecar(tmp_pat
         upgrade, info, rejected = cs._generated_upgrade_check(h.media, cur, None)
     assert upgrade is None and info is h.info
     assert [r[0] for r in rejected["sidecars"]] == ["Movie (2024).en.srt"]
-    assert rejected["video"] == list(cs._identity(h.media))
+    assert rejected["video"] == list(cs.file_identity(h.media))
     h.window_failure = True
     with patch.object(cs, "probe", side_effect=h._probe), \
          patch.object(sv, "embedded_text_window", side_effect=h._window):
@@ -1996,7 +1996,7 @@ def _record_for(h, reasons):
     sidecar = h.tmp_path / "Movie (2024).en.srt"
     snap = cs._read_snapshot(sidecar)
     fp = cs._sidecar_fingerprint({sidecar: snap})
-    return sidecar, snap, cs._rejection_record(cs._identity(h.media), fp, reasons)
+    return sidecar, snap, cs._rejection_record(cs.file_identity(h.media), fp, reasons)
 
 
 def test_rejection_reasons_only_apply_while_the_record_still_holds(tmp_path, monkeypatch):
@@ -2015,7 +2015,7 @@ def test_rejection_reasons_only_apply_while_the_record_still_holds(tmp_path, mon
     assert reasons(no_reasons) is None                                     # older format: invalid
     assert reasons({**record, "reasons": {}}) == {}                        # holds, but no verdict
 
-    other = cs._rejection_record(cs._identity(h.media), [["Movie (2024).en.srt", 1, "0" * 64]],
+    other = cs._rejection_record(cs.file_identity(h.media), [["Movie (2024).en.srt", 1, "0" * 64]],
                                  {"Movie (2024).en.srt": "why"})
     assert reasons(other) == {}                                            # its content differs: no verdict for it
     time.sleep(0.02)                                                       # past ctime granularity

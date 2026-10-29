@@ -56,7 +56,6 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -75,7 +74,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from media_stack.clients.jellyfin import JellyfinClient  # noqa: E402
 from media_stack.envconfig import env_float, env_int  # noqa: E402
 from media_stack.fileid import identity_matches  # noqa: E402
-from media_stack.locking import acquire_file_lock  # noqa: E402
+from media_stack.locking import (  # noqa: E402
+    acquire_file_lock, acquire_singleton_lock, handle_sigterm as _handle_sigterm,
+)
 from media_stack.paths import (  # noqa: E402
     MEDIA_LAN_IP, MEDIA_STACK_ROOT, VAR_DIR, VAR_LOG, VAR_RUN, VAR_STATE,
     ensure_var_dirs, load_env_file,
@@ -149,39 +150,30 @@ class Config:
     whisper_threads: int
 
 
-def _env_float(env: dict[str, str], key: str, default: float, max_value: float) -> float:
-    """See `media_stack.envconfig.env_float`."""
-    return env_float(env, key, default, max_value, log=log)
-
-
-def _env_int(env: dict[str, str], key: str, default: int, max_value: int) -> int:
-    """Integer `_env_float`."""
-    return env_int(env, key, default, max_value, log=log)
-
-
 # Past these a value is a typo that overflows on conversion (`* 60` -> inf, `timedelta`).
 _MAX_MINUTES_SETTING = 1440.0
 _MAX_AGE_HOURS = 8760.0
 
 
 def load_config(env: dict[str, str]) -> Config:
-    # The default must respect the bound `_env_int` enforces on overrides.
+    # The default must respect the bound `env_int` enforces on overrides.
     cpu_bound = os.cpu_count() or 64
     default_threads = min(6, cpu_bound)
     return Config(
         jellyfin_url=env.get("JELLYFIN_URL") or f"http://{MEDIA_LAN_IP}:8096",
         jellyfin_key=env.get("JELLYFIN_API_KEY", ""),
-        age_hours=_env_float(env, "SUB_FALLBACK_AGE_HOURS", 24.0, _MAX_AGE_HOURS),
-        budget_min=_env_float(env, "SUB_FALLBACK_BUDGET_MIN", 50.0, _MAX_MINUTES_SETTING),
-        pipeline_timeout_min=_env_float(
-            env, "SUB_FALLBACK_PIPELINE_TIMEOUT_MIN", 60.0, _MAX_MINUTES_SETTING),
-        max_wait_min=_env_float(env, "SUB_FALLBACK_MAX_WAIT_MIN", 30.0, _MAX_MINUTES_SETTING),
-        asr_timeout_min=_env_float(
-            env, "SUB_FALLBACK_ASR_TIMEOUT_MIN", 90.0, _MAX_MINUTES_SETTING),
+        age_hours=env_float(env, "SUB_FALLBACK_AGE_HOURS", 24.0, _MAX_AGE_HOURS, log=log),
+        budget_min=env_float(env, "SUB_FALLBACK_BUDGET_MIN", 50.0, _MAX_MINUTES_SETTING, log=log),
+        pipeline_timeout_min=env_float(
+            env, "SUB_FALLBACK_PIPELINE_TIMEOUT_MIN", 60.0, _MAX_MINUTES_SETTING, log=log),
+        max_wait_min=env_float(
+            env, "SUB_FALLBACK_MAX_WAIT_MIN", 30.0, _MAX_MINUTES_SETTING, log=log),
+        asr_timeout_min=env_float(
+            env, "SUB_FALLBACK_ASR_TIMEOUT_MIN", 90.0, _MAX_MINUTES_SETTING, log=log),
         whisper_model=env.get("WHISPER_MODEL") or "medium.en",
         whisper_verify_model=env.get("WHISPER_VERIFY_MODEL") or "small.en",
         whisper_lid_model=env.get("WHISPER_LID_MODEL") or "small",
-        whisper_threads=_env_int(env, "WHISPER_THREADS", default_threads, cpu_bound),
+        whisper_threads=env_int(env, "WHISPER_THREADS", default_threads, cpu_bound, log=log),
     )
 
 
@@ -915,22 +907,6 @@ def process_candidate(video: Path, cfg: Config, jellyfin: JellyfinClient,
 def _append_jsonl(path: Path, rec: dict) -> None:
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec) + "\n")
-
-
-def acquire_singleton_lock(lock_path: Path):
-    """The locked file (keep it referenced: closing drops the flock), or `None` if held."""
-    lock_fp = open(lock_path, "w")
-    try:
-        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        lock_fp.close()
-        return None
-    return lock_fp
-
-
-def _handle_sigterm(signum: int, frame: object) -> None:
-    """SystemExit on SIGTERM so `finally` blocks run (else the transcribe child and ffmpeg are orphaned)."""
-    raise SystemExit(128 + signum)
 
 
 def main() -> int:

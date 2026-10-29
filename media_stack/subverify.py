@@ -591,10 +591,10 @@ def _cli_transcribe(argv: list[str]) -> int:
         return 3
     raw_max_wait = env.get("SUB_FALLBACK_MAX_WAIT_MIN")
     max_wait_min = 30.0
-    # 24h bound as in the parent's `_env_float`: `1e308 * 60` overflows to inf.
+    # 24h bound as in the parent's `env_float`: `1e308 * 60` overflows to inf.
     max_wait_min_limit = 1440.0
     if raw_max_wait:
-        # Unlike the parent's `_env_float`, `0` is ACCEPTED: an exhausted allowance
+        # Unlike the parent's `env_float`, `0` is ACCEPTED: an exhausted allowance
         # means "no waiting", not the 30-minute default.
         try:
             parsed = float(raw_max_wait)

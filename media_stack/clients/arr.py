@@ -190,17 +190,20 @@ class ArrClient:
                     return "delete_failed"
         return "not_found"
 
-    def movies(self) -> list[dict] | None:
+    def _get_list(self, path: str, params: dict | None = None) -> list[dict] | None:
         try:
-            r = requests.get(f"{self.base_url}/api/v3/movie",
+            r = requests.get(f"{self.base_url}{path}", params=params,
                              headers=self.headers, timeout=self.timeout)
             r.raise_for_status()
             data = r.json()
         except Exception:
             return None
-        if not isinstance(data, list) or not all(isinstance(m, dict) for m in data):
+        if not isinstance(data, list) or not all(isinstance(x, dict) for x in data):
             return None
         return data
+
+    def movies(self) -> list[dict] | None:
+        return self._get_list("/api/v3/movie")
 
     def run_command(self, name: str, **fields: object) -> int | None:
         """The queued command's id, or None on any failure (including a non-int id). Asynchronous."""
@@ -219,12 +222,10 @@ class ArrClient:
             return cid
         return None
 
-    def rescan_movie(self, movie_id: int) -> bool:
-        """So Radarr re-imports the keeper after dedupe removes the file it tracked; True on 2xx."""
+    def _post_command_ok(self, payload: dict) -> bool:
         try:
             r = requests.post(
-                f"{self.base_url}/api/v3/command",
-                json={"name": "RescanMovie", "movieId": movie_id},
+                f"{self.base_url}/api/v3/command", json=payload,
                 headers=self.headers, timeout=self.timeout,
             )
             r.raise_for_status()
@@ -232,61 +233,23 @@ class ArrClient:
         except Exception:
             return False
 
+    def rescan_movie(self, movie_id: int) -> bool:
+        """So Radarr re-imports the keeper after dedupe removes the file it tracked; True on 2xx."""
+        return self._post_command_ok({"name": "RescanMovie", "movieId": movie_id})
+
     def series(self) -> list[dict] | None:
-        try:
-            r = requests.get(f"{self.base_url}/api/v3/series",
-                             headers=self.headers, timeout=self.timeout)
-            r.raise_for_status()
-            data = r.json()
-        except Exception:
-            return None
-        if not isinstance(data, list) or not all(isinstance(s, dict) for s in data):
-            return None
-        return data
+        return self._get_list("/api/v3/series")
 
     def episodes(self, series_id: int) -> list[dict] | None:
-        try:
-            r = requests.get(
-                f"{self.base_url}/api/v3/episode",
-                params={"seriesId": series_id},
-                headers=self.headers, timeout=self.timeout,
-            )
-            r.raise_for_status()
-            data = r.json()
-        except Exception:
-            return None
-        if not isinstance(data, list) or not all(isinstance(e, dict) for e in data):
-            return None
-        return data
+        return self._get_list("/api/v3/episode", {"seriesId": series_id})
 
     def episode_files(self, series_id: int) -> list[dict] | None:
         """A record may be an orphan row left after an upgrade-import (see `delete_episode_file`)."""
-        try:
-            r = requests.get(
-                f"{self.base_url}/api/v3/episodefile",
-                params={"seriesId": series_id},
-                headers=self.headers, timeout=self.timeout,
-            )
-            r.raise_for_status()
-            data = r.json()
-        except Exception:
-            return None
-        if not isinstance(data, list) or not all(isinstance(f, dict) for f in data):
-            return None
-        return data
+        return self._get_list("/api/v3/episodefile", {"seriesId": series_id})
 
     def rescan_series(self, series_id: int) -> bool:
         """So Sonarr re-imports the keeper after dedupe removes the file it tracked; True on 2xx."""
-        try:
-            r = requests.post(
-                f"{self.base_url}/api/v3/command",
-                json={"name": "RescanSeries", "seriesId": series_id},
-                headers=self.headers, timeout=self.timeout,
-            )
-            r.raise_for_status()
-            return True
-        except Exception:
-            return False
+        return self._post_command_ok({"name": "RescanSeries", "seriesId": series_id})
 
     def delete_episode_file(self, episode_file_id: int) -> bool:
         """Removes the DB row AND any file still on disk, so tv-dedupe.py must move the file to

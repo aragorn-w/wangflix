@@ -47,7 +47,6 @@ from media_stack.clients.jellyfin import JellyfinClient, NetworkError
 
 def _default_url() -> str:
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
         from media_stack.paths import MEDIA_LAN_IP
         return f"http://{MEDIA_LAN_IP}:8096"
     except Exception:
@@ -58,22 +57,6 @@ def _default_url() -> str:
 DEFAULT_URL = _default_url()
 
 
-# Thin shims over JellyfinClient, kept for this script's call surface and tests.
-def _api(base: str, path: str, key: str, *, method: str = "GET",
-         body: dict | None = None, timeout: int = 10) -> tuple[int, bytes]:
-    return JellyfinClient(base, timeout=timeout).request(
-        path, key, method=method, body=body)
-
-
-def _login(base: str, username: str, password: str, *,
-           timeout: int = 10) -> tuple[int, bytes]:
-    return JellyfinClient(base, timeout=timeout).authenticate(username, password)
-
-
-def list_keys(base: str, key: str) -> list[dict]:
-    return JellyfinClient(base).list_keys(key)
-
-
 def _redact(token: str) -> str:
     """Last 4 chars only; tokens of 4 or fewer get a fixed marker (`token[-4:]` would reveal them whole)."""
     if not token:
@@ -81,10 +64,6 @@ def _redact(token: str) -> str:
     if len(token) <= 4:
         return "…<short-redacted>"
     return f"…{token[-4:]}"
-
-
-def mint_key(base: str, key: str, name: str) -> None:
-    JellyfinClient(base).create_key(key, name)
 
 
 class _UsageError(Exception):
@@ -128,11 +107,12 @@ def main() -> int:
         print("FATAL: key name must be non-empty", file=sys.stderr)
         return 4
 
+    client = JellyfinClient(base)
     print(f"[pre-flight] base URL: {base}", file=sys.stderr)
     print("[pre-flight] verifying bootstrap key works...", file=sys.stderr)
     # every pre-flight failure must surface as rc=1 with a FATAL line, not a traceback
     try:
-        status, raw = _api(base, "/System/Info", bootstrap_key)
+        status, raw = client.request("/System/Info", bootstrap_key)
     except NetworkError as e:
         print(f"FATAL: cannot reach Jellyfin: {e}", file=sys.stderr)
         return 1
@@ -151,7 +131,7 @@ def main() -> int:
 
     print("[pre-flight] snapshotting current ApiKeys table...", file=sys.stderr)
     try:
-        pre_keys = list_keys(base, bootstrap_key)
+        pre_keys = client.list_keys(bootstrap_key)
     except NetworkError as e:
         print(f"FATAL: cannot reach Jellyfin during snapshot: {e}", file=sys.stderr)
         return 1
@@ -180,8 +160,8 @@ def main() -> int:
     # all three map to rc=2 "MAY have landed": the error site can't tell whether the POST ran
     print(f"[mint] POST /Auth/Keys?App={args.name!r}...", file=sys.stderr)
     try:
-        mint_key(base, bootstrap_key, args.name)
-        post_keys = list_keys(base, bootstrap_key)
+        client.create_key(bootstrap_key, args.name)
+        post_keys = client.list_keys(bootstrap_key)
     except (NetworkError, RuntimeError, ValueError) as e:
         print(f"FATAL: mint/post-list failed: {type(e).__name__}: {e}",
               file=sys.stderr)
@@ -204,7 +184,7 @@ def main() -> int:
     print("[verify] confirming new key works against /System/Info...",
           file=sys.stderr)
     try:
-        status, _ = _api(base, "/System/Info", new_token)
+        status, _ = client.request("/System/Info", new_token)
     except NetworkError as e:
         print(f"FATAL: verify of new key failed (network): {e}", file=sys.stderr)
         return 3
@@ -219,7 +199,7 @@ def main() -> int:
         tok = k.get("AccessToken", "")
         name = k.get("AppName", "?")
         try:
-            status, _ = _api(base, "/System/Info", tok)
+            status, _ = client.request("/System/Info", tok)
         except NetworkError as e:
             print(f"FATAL: verify of pre-existing key {name!r} "
                   f"({_redact(tok)}) failed (network): {e}", file=sys.stderr)
@@ -234,7 +214,7 @@ def main() -> int:
         print(f"[verify] confirming login as {verify_user!r} still works "
               f"AND retains IsAdministrator...", file=sys.stderr)
         try:
-            code, auth_body = _login(base, verify_user, verify_pw)
+            code, auth_body = client.authenticate(verify_user, verify_pw)
         except NetworkError as e:
             print(f"FATAL: login test failed (network): {e}", file=sys.stderr)
             return 3

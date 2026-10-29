@@ -19,16 +19,10 @@ from media_stack.paths import (  # noqa: E402
 )
 ensure_var_dirs()
 from media_stack.config import (  # noqa: E402
-    ASS_OVERRIDE_RE, CODEC_PREF, COMMENT_TITLE_RE, CONSOLSUB_DIR_RE,
-    DUAL_AUDIO_KEYWORDS, ENG_SIDECAR_SUFFIXES,
-    ASS_CODECS, HTML_FONT_RE, HTML_OTHER_RE, IMAGE_CODECS, JAPANESE_KEYWORDS,
-    KOREAN_KEYWORDS, LITERAL_NH_RE, MULTI_BLANK_RE, PIPELINE_VERSION,
-    NORMALIZE_TMP_DIR, SUBLIMINAL_MIN_COVERAGE, SWEEP_MIN_AGE_S,
-    TEXT_CODECS, TMP_MKV_RE, TRAIL_WS_RE,
+    ASS_CODECS, IMAGE_CODECS, PIPELINE_VERSION, NORMALIZE_TMP_DIR,
+    SUBLIMINAL_MIN_COVERAGE, TEXT_CODECS, TMP_MKV_RE,
 )
-from media_stack.lang import (  # noqa: E402
-    ENG_AUDIO_LANGS, JPN_AUDIO_LANGS, KOR_AUDIO_LANGS, canonical_lang, is_english_tag,
-)
+from media_stack.lang import is_english_tag  # noqa: E402
 from media_stack.probe import (  # noqa: E402
     already_processed, duration_shortfall, file_key, parse_duration, probe,
     real_video_streams,
@@ -36,25 +30,23 @@ from media_stack.probe import (  # noqa: E402
 from media_stack.fileid import (  # noqa: E402
     Identity, file_identity, identity_from_stat, identity_matches,
 )
-from media_stack.state import (  # noqa: E402
-    load_state, mutate_state, save_state, update_state_entry,
-)
+from media_stack.state import load_state, mutate_state, update_state_entry  # noqa: E402
 from media_stack.audio import (  # noqa: E402
-    confident_default_audio, get_audio_lang_pref, is_commentary_audio,
-    is_dub_audio, select_keep_audio,
+    confident_default_audio, get_audio_lang_pref, select_keep_audio,
 )
 from media_stack.arrlang import original_language_for  # noqa: E402
 from media_stack.subtitles import (  # noqa: E402
     ass_to_srt, clean_srt_text, count_subtitle_lines, extract_track,
     decode_subtitle_bytes, decode_subtitle_text, fetch_via_subliminal, find_sidecar_subs,
     is_forced_track, is_generated_sidecar, is_generated_track, is_sdh_track,
-    normalize_subtitle_caps, run_ffsubsync, score_text_track,
+    run_ffsubsync, score_text_track,
 )
 from media_stack.sublang import classify_candidate  # noqa: E402
 from media_stack.mux import (  # noqa: E402
     ENG_GENERATED_TRACK_NAME, ENG_TRACK_NAME, remux,
 )
 from media_stack.loudness import normalize_budget_s  # noqa: E402
+from media_stack.locking import acquire_file_lock  # noqa: E402
 from media_stack.tags import set_consolidated_tag  # noqa: E402
 from media_stack import sublang, subverify  # noqa: E402
 from media_stack.subverify import (  # noqa: E402
@@ -175,7 +167,6 @@ def process_file(path_str: str, dry_run: bool = False) -> dict:
 
 
 def _process_file_inner(path_str: str, dry_run: bool = False) -> dict:
-    from media_stack.locking import acquire_file_lock
     path = Path(path_str)
     if not path.is_file():
         return {"path": path_str, "status": "FAIL", "detail": "not a file"}
@@ -294,28 +285,24 @@ def _expose_tag_normalize(out: Path, path: Path, replacement: Path,
     return, else None. A failed tag is
     logged, not rolled back (state.json backstops idempotency).
     """
-    from media_stack.locking import acquire_file_lock
     dest_lock = (acquire_file_lock(replacement) if replacement != path
                  else nullcontext(True))
     with dest_lock as dest_acquired:
         if replacement != path and not dest_acquired:
-            if out.exists():
-                out.unlink()
+            out.unlink(missing_ok=True)
             return ({"path": path_str, "status": "SKIP",
                      "detail": f"destination {replacement.name} locked by other runner"},
                     False)
         # Re-check under the lock (TOCTOU with _process_locked's check).
         if replacement != path and replacement.exists():
-            if out.exists():
-                out.unlink()
+            out.unlink(missing_ok=True)
             return ({"path": path_str, "status": "FAIL",
                      "detail": f"collision: sibling .mkv appeared for {path.name}"},
                     False)
         # A short remux output once replaced full episodes: compare durations before the swap.
         problem = duration_shortfall(probe(path), probe(out), log)
         if problem:
-            if out.exists():
-                out.unlink()
+            out.unlink(missing_ok=True)
             return ({"path": path_str, "status": "FAIL",
                      "detail": f"duration verify: {problem}"}, False)
         # atomic same-filesystem rename: readers see the old file or the finished mux, never a partial one
@@ -328,7 +315,6 @@ def _expose_tag_normalize(out: Path, path: Path, replacement: Path,
             try:
                 tag_written = set_consolidated_tag(replacement, PIPELINE_VERSION)
             except Exception as exc:
-                tag_written = False
                 log(f"ERROR: CONSOLIDATED_SUBS tag write raised for {replacement}: "
                     f"{type(exc).__name__}: {exc} (consolidation done; tag missing)")
             else:
@@ -913,12 +899,7 @@ def _cleanup_no_main_english_impl(
         s["index"] for s in audio_streams
         if (s.get("disposition") or {}).get("default")
     }
-    if confident_idx is None:
-        audio_default_change = False
-    elif default_flagged == {confident_idx}:
-        audio_default_change = False
-    else:
-        audio_default_change = True
+    audio_default_change = confident_idx is not None and default_flagged != {confident_idx}
 
     keep_video_idx = [s["index"] for s in video_streams]
     keep_audio_idx = [s["index"] for s in audio_streams]
@@ -964,16 +945,14 @@ def _cleanup_no_main_english_impl(
         }
 
     out = path.with_suffix(path.suffix + f".consol.{os.getpid()}.tmp.mkv")
-    if out.exists():
-        out.unlink()
+    out.unlink(missing_ok=True)
     ok, detail = remux(
         path, out, keep_video_idx, keep_audio_idx, None, None,
         keep_subtitle_indices=sorted(keep_sub_indices),
         cleanup_flags=cleanup_flags,
     )
     if not ok:
-        if out.exists():
-            out.unlink()
+        out.unlink(missing_ok=True)
         return {"path": path_str, "status": "FAIL", "detail": f"cleanup remux: {detail}"}
 
     # Verify BEFORE the swap; never touch the original on a mismatch.
@@ -1011,8 +990,7 @@ def _cleanup_no_main_english_impl(
 
     replacement = path.with_suffix(".mkv")
     if replacement != path and replacement.exists():
-        if out.exists():
-            out.unlink()
+        out.unlink(missing_ok=True)
         return {"path": path_str, "status": "FAIL",
                 "detail": f"collision: sibling .mkv exists for {path.name}"}
 
@@ -1082,12 +1060,9 @@ UPGRADE_REJECTED_KEY = "upgrade_rejected"
 # A sidecar is read ONCE; anything bigger is refused, never judged on a prefix.
 UPGRADE_MAX_SIDECAR_BYTES = 8 * 1024 * 1024
 
-_Identity = Identity
-
-
 class _Snapshot(NamedTuple):
     """One sidecar, read once: what was verified is exactly these bytes."""
-    identity: _Identity  # fstat on the same handle, unchanged across the read
+    identity: Identity  # fstat on the same handle, unchanged across the read
     digest: str          # sha256 of `data`
     data: bytes
 
@@ -1095,7 +1070,7 @@ class _Snapshot(NamedTuple):
 class _Verified(NamedTuple):
     srt: bytes           # the verified working SRT bytes
     sdh: bool            # ranking only
-    identity: _Identity
+    identity: Identity
     digest: str          # sha256 of the sidecar as read (before conversion)
 
 
@@ -1104,10 +1079,7 @@ class _Upgrade(NamedTuple):
     # what was read, and nothing else.
     sidecars: dict[Path, _Verified]
     # Re-checked before the remux and the swap; any change aborts.
-    video_identity: _Identity
-
-
-_identity = file_identity
+    video_identity: Identity
 
 
 _KEEPABLE_SUB_CODECS = TEXT_CODECS | IMAGE_CODECS
@@ -1156,7 +1128,7 @@ def _sidecar_fingerprint(snaps: dict[Path, _Snapshot]) -> list[list]:
             for p, s in sorted(snaps.items(), key=lambda kv: kv[0].name)]
 
 
-def _rejection_record(video_identity: _Identity, fingerprint: list[list],
+def _rejection_record(video_identity: Identity, fingerprint: list[list],
                       reasons: dict[str, str] | None = None) -> dict:
     """Fingerprint of each sidecar with a NON-TRANSIENT outcome (a verdict, or undecided)
     plus the video identity; a transiently failed sidecar is left out so it stays
@@ -1166,7 +1138,7 @@ def _rejection_record(video_identity: _Identity, fingerprint: list[list],
             "reasons": dict(reasons or {})}
 
 
-def _recorded_verdicts(record: object, video_identity: _Identity,
+def _recorded_verdicts(record: object, video_identity: Identity,
                        snaps: dict[Path, "_Snapshot"]) -> dict[str, str | None] | None:
     """What a rejection `record` still says PER SIDECAR. None if it does not apply to this
     video (old format or identity differs); else `{name: reason or None}` for sidecars
@@ -1231,7 +1203,7 @@ def _generated_upgrade_check(path: Path, cur: tuple[int, int], prev: dict | None
         log(f"UPGRADE-SKIP: {path.name}: {'; '.join(notes)}")
         return None, None, None
 
-    video_identity = _identity(path)  # before the probe
+    video_identity = file_identity(path)  # before the probe
     if video_identity is None:
         return None, None, None
     remembered = _recorded_verdicts((prev or {}).get(UPGRADE_REJECTED_KEY),
@@ -1436,10 +1408,10 @@ def _upgrade_video_changed(path: Path, path_str: str, upgrade: _Upgrade, when: s
                            out: Path | None = None) -> dict | None:
     """The SKIP result that aborts the upgrade if the video is no longer the file the gate
     probed (temp output removed, retried next scan); else None."""
-    if _identity(path) == upgrade.video_identity:
+    if file_identity(path) == upgrade.video_identity:
         return None
-    if out is not None and out.exists():
-        out.unlink()
+    if out is not None:
+        out.unlink(missing_ok=True)
     log(f"UPGRADE-SKIP: {path.name}: the video changed {when}; keeping it as it is")
     return {"path": path_str, "status": "SKIP",
             "detail": f"upgrade: the video changed {when}, original kept"}
@@ -1851,8 +1823,7 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
         dropped_audio = max(0, len(audio_streams) - len(keep_audio_idx))
 
         out = path.with_suffix(path.suffix + f".consol.{os.getpid()}.tmp.mkv")
-        if out.exists():
-            out.unlink()
+        out.unlink(missing_ok=True)
         if upgrade is not None:
             # ffsubsync ran since the gate probed: remux only if unchanged.
             changed = _upgrade_video_changed(path, path_str, upgrade, "before the remux")
@@ -1875,16 +1846,14 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
             eng_track_name=ENG_GENERATED_TRACK_NAME if chosen_generated else ENG_TRACK_NAME,
             **({"kept_source_subs": kept_source_subs} if kept_source_subs else {}))
         if not ok:
-            if out.exists():
-                out.unlink()
+            out.unlink(missing_ok=True)
             return {"path": path_str, "status": "FAIL", "detail": f"remux: {detail}"}
         if kept_source_subs is not None:
             problem = _verify_kept_source_subs(
                 out, len(keep_video_idx), len(keep_audio_idx), unreadable_forced_stream,
                 kept_source_subs)
             if problem:
-                if out.exists():
-                    out.unlink()
+                out.unlink(missing_ok=True)
                 return {"path": path_str, "status": "FAIL",
                         "detail": f"forced track verify: {problem}"}
         if upgrade is not None:
@@ -1892,16 +1861,14 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
             problem = _verify_upgrade_output(
                 out, video_streams_all, audio_streams, kept_forced, upgrade_flags)
             if problem:
-                if out.exists():
-                    out.unlink()
+                out.unlink(missing_ok=True)
                 return {"path": path_str, "status": "FAIL",
                         "detail": f"upgrade verify: {problem}"}
 
         # Refuse to overwrite a sibling .mkv ("Movie.mp4" must not destroy "Movie.mkv").
         replacement = path.with_suffix(".mkv")
         if replacement != path and replacement.exists():
-            if out.exists():
-                out.unlink()
+            out.unlink(missing_ok=True)
             return {"path": path_str, "status": "FAIL",
                     "detail": f"collision: sibling .mkv exists for {path.name}"}
         if upgrade is not None:

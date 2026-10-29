@@ -112,7 +112,6 @@ writes nothing; `main()` creates the directories for a run that writes).
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import math
 import os
@@ -134,6 +133,9 @@ from media_stack.clients.jellyfin import JellyfinClient  # noqa: E402
 from media_stack.clients.telegram import send as telegram_send  # noqa: E402
 from media_stack.envconfig import env_float, env_int  # noqa: E402
 from media_stack.lang import is_english_tag  # noqa: E402
+from media_stack.locking import (  # noqa: E402
+    acquire_singleton_lock, handle_sigterm as _handle_sigterm,
+)
 from media_stack.paths import (  # noqa: E402
     MEDIA_LAN_IP, MEDIA_ROOT, MEDIA_STACK_ROOT, VAR_DIR, VAR_LOG, VAR_RUN,
     VAR_STATE, ensure_var_dirs, load_env_file,
@@ -239,14 +241,13 @@ def _utc_now_iso() -> str:
 
 
 def iter_media_files(media_root: Path) -> Iterator[Path]:
-    """`.mkv`/`.mp4` under `movies/` and `tv/`, skipping hidden names (`.dupe-recycle` is
-    also named explicitly, as defense in depth)."""
+    """`.mkv`/`.mp4` under `movies/` and `tv/`, skipping hidden names (e.g. `.dupe-recycle`)."""
     for sub in ("movies", "tv"):
         root = media_root / sub
         if not root.is_dir():
             continue
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != ".dupe-recycle"]
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
             for name in filenames:
                 if name.startswith("."):
                     continue
@@ -328,12 +329,12 @@ def select_candidates(identity_state: dict, media_root: Path, now_s: float) -> l
     return [p for _, p in aged]
 
 
-def _agreeing_pair(windows: list[dict], floor: float) -> tuple[str, float] | None:
-    """Two windows with the SAME non-English language at >= `floor`, >= `MIN_WINDOW_GAP_S`
-    apart: `(language, lower raw probability)`, else `None`."""
+def _mislabeled_language(windows: list[dict]) -> tuple[str, float] | None:
+    """Two windows with the SAME non-English language at >= `MISLABEL_PROBABILITY_FLOOR`,
+    >= `MIN_WINDOW_GAP_S` apart: `(language, lower raw probability)`, else `None`."""
     by_lang: dict[str, list[dict]] = {}
     for w in windows:
-        if w["language"] != "en" and w["probability"] >= floor:
+        if w["language"] != "en" and w["probability"] >= MISLABEL_PROBABILITY_FLOOR:
             by_lang.setdefault(w["language"], []).append(w)
     for lang, ws in by_lang.items():
         for i, a in enumerate(ws):
@@ -341,11 +342,6 @@ def _agreeing_pair(windows: list[dict], floor: float) -> tuple[str, float] | Non
                 if abs(a["start"] - b["start"]) >= MIN_WINDOW_GAP_S:
                     return lang, min(a["probability"], b["probability"])
     return None
-
-
-def _mislabeled_language(windows: list[dict]) -> tuple[str, float] | None:
-    """`_agreeing_pair` at the MISLABELED bar."""
-    return _agreeing_pair(windows, MISLABEL_PROBABILITY_FLOOR)
 
 
 def _lid_scan(
@@ -373,11 +369,6 @@ def _lid_scan(
     return windows
 
 
-def _best_window(windows: list[dict]) -> dict:
-    """Highest-probability window, for display only."""
-    return max(windows, key=lambda w: w["probability"])
-
-
 def _classify_windows(windows: list[dict]) -> str:
     """`"english"` (any window English at >= `LID_PROBABILITY_FLOOR`), `"foreign"` (every
     window confident, none English; the only reading that rules a stream out) or `"unclear"`."""
@@ -387,11 +378,6 @@ def _classify_windows(windows: list[dict]) -> str:
                        for w in windows):
         return "foreign"
     return "unclear"
-
-
-def _display_windows(windows: list[dict]) -> list[dict]:
-    """Probabilities rounded for storage (decisions use raw)."""
-    return [{**w, "probability": round(w["probability"], 3)} for w in windows]
 
 
 def _program_indices(streams: list[dict]) -> set[int]:
@@ -453,14 +439,15 @@ def analyze_candidate(
             continue
 
         windows = _lid_scan(video, idx, duration, cfg, jellyfin, budget, workdir)
-        best = _best_window(windows)
+        best = max(windows, key=lambda w: w["probability"])  # display only
         reading = _classify_windows(windows)
+        # Stored probabilities are rounded; decisions use the raw windows.
         rec = {
             "index": idx,
             "tag": raw_tag or None,
             "detected_language": best["language"],
             "probability": round(best["probability"], 3),
-            "windows": _display_windows(windows),
+            "windows": [{**w, "probability": round(w["probability"], 3)} for w in windows],
             "reading": reading,
         }
 
@@ -563,16 +550,12 @@ def _is_identity(value: object) -> bool:
             and all(isinstance(x, int) and not isinstance(x, bool) for x in value))
 
 
-def _is_number(value: object) -> bool:
-    return _finite_number(value)
-
-
 def _is_str_or_none(value: object) -> bool:
     return value is None or isinstance(value, str)
 
 
 def _is_probability(value: object) -> bool:
-    return _is_number(value) and 0.0 <= value <= 1.0  # type: ignore[operator]
+    return _finite_number(value) and 0.0 <= value <= 1.0  # type: ignore[operator]
 
 
 def _is_index(value: object) -> bool:
@@ -661,7 +644,7 @@ def _retry_problem(retry: object) -> str | None:
         return "retry is not an object"
     required = {"identity": _is_identity,
                 "attempts": lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 1,
-                "next_retry_at": _is_number}
+                "next_retry_at": _finite_number}
     for field, ok in required.items():
         if field not in retry or not ok(retry[field]):
             return f"retry.{field} is missing or has the wrong type"
@@ -1188,22 +1171,6 @@ def _end_of_run() -> None:
     state = _load_state(STATE_FILE)
     if state is not None:
         write_report(state)
-
-
-def acquire_singleton_lock(lock_path: Path):
-    """The locked file (keep it referenced: closing drops the flock), or `None` if held."""
-    lock_fp = open(lock_path, "w")
-    try:
-        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        lock_fp.close()
-        return None
-    return lock_fp
-
-
-def _handle_sigterm(signum: int, frame: object) -> None:
-    """SystemExit so `_extract_wav`'s cleanup runs and ffmpeg is not orphaned."""
-    raise SystemExit(128 + signum)
 
 
 def _process_one(

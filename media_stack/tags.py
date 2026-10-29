@@ -55,10 +55,7 @@ def set_global_tag(path: Path, name: str, value: str) -> bool:
     except Exception:
         return False
     finally:
-        try:
-            xml_path.unlink()
-        except FileNotFoundError:
-            pass
+        xml_path.unlink(missing_ok=True)
 
 
 def set_consolidated_tag(path: Path, version: int) -> bool:
