@@ -12,7 +12,7 @@ Pure helpers, unit-testable without subprocess shims; invariants: root `AGENTS.m
 - `mux.py`: full-path (`cleanup_flags=None`) argv is pinned byte-for-byte. Cleanup mode `cleanup_flags={track_id: {"default": bool, "forced": bool}}` emits an EXPLICIT `--default-track`/`--forced-track` per kept track by source track ID, never by reordering `audio_indices`/`video_indices` (selectors) and never by omission. `kept_source_subs` / `keep_subtitle_indices` stream-copy source subtitle tracks ahead of the external srt .
 - `loudness.py`: size-scaled budgets (`pass1_timeout_s`, `pass2_timeout_s`) and `normalize_budget_s()` (their sum plus `mux.remux_timeout_s` and a margin), the outer cap for the inline normalize run.
 - `playback.py`: the fail-closed Jellyfin gate shared by `sub-fallback.py` (thin `Config`-binding adapters) and `audio-lang-check.py`: `PlaybackWaitBudget` (ONE per candidate, cumulative), `wait_while_playing`, `call_with_playback_pause` (wires `should_abort`, retries after `ExtractionInterrupted`), `PlaybackWaitTimeout`.
-- `envconfig.py` (finite/positive/BOUNDED env parsing), `fileid.py`, `locking.py`, `state.py` (flock-protected `mutate_state`), `sweeps.py`, `dedupe.py`, `vpn_country.py`, `health.py` (behind `healthcheck.sh`; shells out to `docker`/`curl`/`ip`/`systemctl`/`find`/`ops/audit.sh`, service APIs via `clients/`), `cli.py` (`python3 -m media_stack.cli <subcommand>`), `clients/` (see `clients/AGENTS.md`).
+- `envconfig.py` (finite/positive/BOUNDED env parsing), `fileid.py`, `locking.py`, `state.py` (flock-protected `mutate_state`), `sweeps.py`, `dedupe.py`, `vpn_country.py`, `health.py` (behind `healthcheck.sh`; first probe checks the mergerfs pool and each branch are mounted and non-empty; shells out to `docker`/`curl`/`ip`/`systemctl`/`ops/audit.sh`, service APIs via `clients/`), `clients/` (see `clients/AGENTS.md`).
 
 ## subverify.py
 
@@ -24,7 +24,7 @@ Pure helpers, unit-testable without subprocess shims; invariants: root `AGENTS.m
 
 ## Rules
 
-- **No circular imports:** the arrow points outward from `config`/`paths`; helpers must not import from the CLI wrappers (`cli.py` and top-level scripts may import anything).
+- **No circular imports:** the arrow points outward from `config`/`paths`; helpers must not import from the CLI wrappers (top-level scripts may import anything).
 - **No I/O at module top level, no fs writes on import** (only `paths.py`'s bounded read-only `.env` read): read-only importers never mutate the filesystem.
 - **Allow-listed binaries only:** `ffmpeg`, `ffprobe`, `mkvmerge`, `mkvpropedit`, `mkvextract`, `ffsubsync`, `subliminal`; a new one first needs a `preflight.sh` presence check. **No `shell=True`** (argv lists). **Timeouts on every external call** (loudness steps scale with file size). **Network only in `clients/`** (exception: `health.py`).
 - **Orchestration glue stays in the CLI scripts** (`_process_locked`, `_process_file_inner_locked`, argparse/logging, `--scan`): one caller each; extract `media_stack/consolidate.py` / `normalize.py` only when a second caller appears.

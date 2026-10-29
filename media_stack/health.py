@@ -27,23 +27,6 @@ REQUIRED_SVCS = [
 ]
 OPTIONAL_SVCS = ["tdarr-node", "watchtower"]
 
-REPO_ROOT_EXPECTED = {
-    "AGENTS.md", "AUDIT.md", "README.md",
-    "docker-compose.yml", ".env", ".env.example", ".git", ".gitignore",
-    ".claude",
-    "audio-lang-check.py", "bazarr-profile-audit.py",
-    "consolidate-status.sh", "consolidate-subs.py", "consolidate-watch.sh",
-    "healthcheck.sh", "jellyfin-mint-api-key.py", "malware-guard.sh",
-    "movie-dedupe.py", "normalize-audio.py", "nuke_stalled.py", "preflight.sh",
-    "pyproject.toml", "requirements-dev.txt", "search-missing.py",
-    "shield-check.py", "sub-fallback.py", "sync-forwarded-port.py",
-    "tv-dedupe.py", "unaired-guard.py",
-    "config", "data", "lib", "media_stack", "ops", "requirements.txt", "reviews",
-    "tests", "var",
-}
-REPO_ROOT_SKIP = {".", "..", ".DS_Store", ".pytest_cache", "__pycache__",
-                  ".mypy_cache", ".ruff_cache"}
-
 # .env keys beyond what media_stack.paths resolves. Process env wins over .env with "is set"
 # (not "is non-empty") semantics.
 _ENV_WHITELIST = [
@@ -68,12 +51,45 @@ def _which(name: str) -> bool:
     return rc == 0
 
 
-def _bash_q_join(items: list[str]) -> str:
-    """Delegated to bash ``printf '%q '`` so the WARN string keeps its exact escaping."""
-    if not items:
+# `user.mergerfs.branches` reads like "/mnt/disk1=RW:/mnt/disk2=RO,50G"; the `=MODE[,minfree]` tail
+# is not part of the path.
+_BRANCH_MODE = re.compile(r"=[A-Z]+(,[^:=]*)?$")
+_MOUNTS = "/proc/self/mounts"
+_MOUNT_HINT = ("a dropped disk leaves an empty mountpoint, so the library looks deleted: "
+               "check findmnt and dmesg before deleting or re-importing anything")
+
+
+def _mount_problem(path: Path) -> str:
+    """Why `path` is not a live mount (not a mountpoint, empty, unreadable), or "" when it is.
+    Read-only: a few lstats and the first real directory entry (an ext4 root always has
+    `lost+found`, which proves nothing), never a walk or a SMART query.
+    """
+    if not os.path.ismount(os.path.realpath(path)):
+        return "not a mountpoint"
+    try:
+        with os.scandir(path) as it:
+            if next((e for e in it if e.name != "lost+found"), None) is None:
+                return "mounted but empty"
+    except OSError as e:
+        return f"unreadable ({e.strerror or e.__class__.__name__})"
+    return ""
+
+
+def _fs_type(path: Path) -> str:
+    """Type of the filesystem mounted exactly at `path` per the kernel mount table (topmost
+    wins), or "" when it is not listed or the table cannot be read."""
+    target = os.path.realpath(path)
+    fstype = ""
+    try:
+        with open(_MOUNTS) as f:
+            for line in f:
+                fields = line.split(" ")
+                if len(fields) >= 3 and re.sub(
+                        r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[1]) == target:
+                    fstype = fields[2]
+    except OSError:
         return ""
-    rc, out, _ = _run(["bash", "-c", 'printf "%q " "$@"', "_", *items])
-    return out
+    return fstype
 
 
 def _bash_q(s: str) -> str:
@@ -111,24 +127,67 @@ class HealthCheck:
         self.vpn_country: str = ""
         self.bazarr_key: str = ""
 
-    def ok(self, check: str) -> None:
-        self.results.append(("OK", check, ""))
-        if self.verbose and not self.json_mode:
+    def _record(self, state: str, check: str, detail: str = "") -> None:
+        self.results.append((state, check, detail))
+        if self.json_mode or (state == "OK" and not self.verbose):
+            return
+        if state == "OK":
             print(f"OK:   {check}")
+        else:
+            print(f"{state}: {check} — {detail}",
+                  file=sys.stderr if state == "FAIL" else sys.stdout)
 
-    def fail(self, check: str, detail: str) -> None:
-        self.results.append(("FAIL", check, detail))
-        if not self.json_mode:
-            print(f"FAIL: {check} — {detail}", file=sys.stderr)
+    def ok(self, check: str) -> None:
+        self._record("OK", check)
 
     def warn(self, check: str, detail: str) -> None:
-        self.results.append(("WARN", check, detail))
-        if not self.json_mode:
-            print(f"WARN: {check} — {detail}")
+        self._record("WARN", check, detail)
+
+    def fail(self, check: str, detail: str) -> None:
+        self._record("FAIL", check, detail)
+
+    def _verdict(self, passed: bool, ok_check: str, bad_check: str, detail: str,
+                 bad_state: str = "FAIL") -> None:
+        """OK under `ok_check` when `passed`, else `bad_state` under `bad_check` with `detail`."""
+        if passed:
+            self.ok(ok_check)
+        else:
+            self._record(bad_state, bad_check, detail)
 
     @property
     def _compose(self) -> str:
         return str(self.repo_root / COMPOSE)
+
+    def probe_mounts(self) -> None:
+        """The media pool and each mergerfs branch behind it must be a live, non-empty mount.
+        A USB disk that drops out leaves an empty mountpoint and the library looks deleted.
+        Branches come from the pool's control file; a pool that is not mergerfs, or whose
+        branch list cannot be read, is not a failure.
+        """
+        pool = paths.MEDIA_ROOT
+        problem = _mount_problem(pool)
+        self._verdict(not problem, f"mount:pool {pool} mounted, non-empty", "mount:pool",
+                      f"{pool} is {problem}: {_MOUNT_HINT}")
+        if problem == "not a mountpoint":
+            return
+        try:
+            raw = os.getxattr(pool / ".mergerfs", "user.mergerfs.branches")
+        except OSError as e:
+            # Not mergerfs is fine; a mergerfs pool (or an unknown one) we cannot ask is a gap.
+            fstype = _fs_type(pool)
+            self._verdict(bool(fstype) and "mergerfs" not in fstype,
+                          f"mount:branches not checked (pool is {fstype}, not mergerfs)",
+                          "mount:branches",
+                          f"not checked, could not read the branch list ({e.strerror})", "WARN")
+            return
+        listed = raw.decode(errors="replace").strip("\0").split(":")
+        branches = [_BRANCH_MODE.sub("", b) for b in listed if b]
+        if not branches:
+            self.warn("mount:branches", "not checked, the pool reported no branches")
+        for branch in branches:
+            problem = _mount_problem(Path(branch))
+            self._verdict(not problem, f"mount:branch {branch} mounted, non-empty",
+                          f"mount:branch {branch}", f"{problem}: {_MOUNT_HINT}")
 
     def probe_gluetun(self) -> None:
         rc, out, _ = _run(["docker", "compose", "-f", self._compose, "ps",
@@ -211,10 +270,8 @@ class HealthCheck:
             self.warn(f"api:{name}", f"{key_var} missing from .env — reachability not checked")
             return
         status = ArrClient(url, key).reachable_status()
-        if status == "200":
-            self.ok(f"api:{name} reachable")
-        else:
-            self.fail(f"api:{name}", f"{url}/api/v3/system/status returned {status}")
+        self._verdict(status == "200", f"api:{name} reachable", f"api:{name}",
+                      f"{url}/api/v3/system/status returned {status}")
 
     def probe_arr_hardlinks(self, name: str, url: str, key_var: str) -> None:
         key = self.env.get(key_var, "")
@@ -275,6 +332,9 @@ class HealthCheck:
     OUTCOME_STATE = "health-outcomes.json"
     STUCK_AFTER_S = 6 * 3600
     NO_PORT_AFTER_S = 30 * 60
+    _RESET_FAILED = ("could not reset outcome history — ageing is unreliable "
+                     "until var/state is writable")
+    _CANNOT_AGE = "cannot age this: the outcome state file is unreadable/unwritable"
 
     def _age_conditions(self, prefix: str, active: set[str]) -> tuple[dict[str, float], bool]:
         """`({key: seconds persisted}, persisted)`. Stored keys under `prefix` not in `active`
@@ -321,16 +381,14 @@ class HealthCheck:
         ages, persisted = self._age_conditions(prefix, active)
         oldest = max(ages.values(), default=0.0)
         if not bad:
-            if persisted:
-                self.ok(f"outcome:{name} queue clean ({len(records)} item(s), none erroring)")
-            else:
-                # The clear did not stick; a recurrence would FAIL instantly on stale history.
-                self.warn(f"outcome:{name} queue clean ({len(records)} item(s))",
-                          "could not reset outcome history — ageing is unreliable "
-                          "until var/state is writable")
+            # Not persisted: the clear did not stick; a recurrence would FAIL instantly on
+            # stale history.
+            self._verdict(persisted,
+                          f"outcome:{name} queue clean ({len(records)} item(s), none erroring)",
+                          f"outcome:{name} queue clean ({len(records)} item(s))",
+                          self._RESET_FAILED, "WARN")
         elif not persisted:
-            self.warn(f"outcome:{name} queue erroring={len(bad)}",
-                      "cannot age this: the outcome state file is unreadable/unwritable")
+            self.warn(f"outcome:{name} queue erroring={len(bad)}", self._CANNOT_AGE)
         elif oldest >= self.STUCK_AFTER_S:
             self.fail(f"outcome:{name} queue stuck={len(bad)}",
                       f"oldest has been erroring {oldest / 3600:.1f}h — a persistently failing "
@@ -356,15 +414,11 @@ class HealthCheck:
         ages, persisted = self._age_conditions("qbit:", active)
         oldest = max(ages.values(), default=0.0)
         if not bad:
-            if persisted:
-                self.ok(f"outcome:qbit no missing-file torrents ({len(torrents)} total)")
-            else:
-                self.warn("outcome:qbit no missing-file torrents",
-                          "could not reset outcome history — ageing is unreliable "
-                          "until var/state is writable")
+            self._verdict(persisted,
+                          f"outcome:qbit no missing-file torrents ({len(torrents)} total)",
+                          "outcome:qbit no missing-file torrents", self._RESET_FAILED, "WARN")
         elif not persisted:
-            self.warn(f"outcome:qbit missing-files={len(bad)}",
-                      "cannot age this: the outcome state file is unreadable/unwritable")
+            self.warn(f"outcome:qbit missing-files={len(bad)}", self._CANNOT_AGE)
         elif oldest >= self.STUCK_AFTER_S:
             self.fail(f"outcome:qbit missing-files={len(bad)}",
                       f"oldest {oldest / 3600:.1f}h — if MANY appeared at once suspect a dropped "
@@ -417,11 +471,9 @@ class HealthCheck:
 
         if listen == port:
             _a, ok_clear = self._age_conditions("portforward:", set())
-            if ok_clear:
-                self.ok(f"outcome:port-forward {port} == qBittorrent listen_port")
-            else:
-                self.warn(f"outcome:port-forward {port} == listen_port",
-                          "could not reset outcome history")
+            self._verdict(ok_clear, f"outcome:port-forward {port} == qBittorrent listen_port",
+                          f"outcome:port-forward {port} == listen_port",
+                          "could not reset outcome history", "WARN")
             return
         ages, persisted = self._age_conditions("portforward:", {"portforward:mismatch"})
         age = ages.get("portforward:mismatch", 0.0)
@@ -477,19 +529,15 @@ class HealthCheck:
             self.warn("api:bazarr", "could not read apikey from container config")
             return
         status = BazarrClient(bazarr_url, self.bazarr_key).reachable_status()
-        if status == "200":
-            self.ok("api:bazarr reachable")
-        else:
-            self.fail("api:bazarr", f"/api/system/status returned {status}")
+        self._verdict(status == "200", "api:bazarr reachable", "api:bazarr",
+                      f"/api/system/status returned {status}")
 
     def probe_qbit(self, qbit_url: str) -> None:
         qbit_user = self.env.get("QBIT_USER", "")
         if not qbit_user:
             status = QBitClient(qbit_url).reachable_status()
-            if status == "200":
-                self.ok("api:qbit reachable (bypass-auth-on-LAN)")
-            else:
-                self.fail("api:qbit", f"/api/v2/torrents/info returned {status} (no auth)")
+            self._verdict(status == "200", "api:qbit reachable (bypass-auth-on-LAN)",
+                          "api:qbit", f"/api/v2/torrents/info returned {status} (no auth)")
             return
         client = QBitClient(qbit_url, qbit_user, self.env.get("QBIT_PASS", ""))
         resp_text = client.login_response()
@@ -497,10 +545,8 @@ class HealthCheck:
             self.fail("api:qbit", f"login returned {resp_text or '<empty>'}")
             return
         auth_status = client.reachable_status()
-        if auth_status == "200":
-            self.ok("api:qbit auth round-trip + cookie-verified API call")
-        else:
-            self.fail("api:qbit", f"login Ok but /torrents/info via cookie returned {auth_status}")
+        self._verdict(auth_status == "200", "api:qbit auth round-trip + cookie-verified API call",
+                      "api:qbit", f"login Ok but /torrents/info via cookie returned {auth_status}")
 
     def probe_bazarr_profiles(self, bazarr_url: str) -> None:
         if not self.bazarr_key:
@@ -605,36 +651,13 @@ class HealthCheck:
         _, out, _ = _run(["ip", "-o", "link", "show"])
         if "enp6s0f1" not in out:
             return
-        rc, _, _ = _run(["systemctl", "is-active", "--quiet", "realtek-fix.service"])
-        if rc == 0:
-            self.ok("realtek-fix.service active (this host has enp6s0f1)")
-        else:
-            self.fail("realtek-fix.service",
-                      "inactive — enp6s0f1 detected; NIC will drop under load")
-
-    def probe_repo_root(self) -> None:
-        rc, out, _ = _run(["find", str(self.repo_root), "-maxdepth", "1",
-                           "-mindepth", "1", "-print0"])
-        entries = [e for e in out.split("\0") if e]
-        unexpected: list[str] = []
-        for entry in entries:
-            base = entry.rsplit("/", 1)[-1]
-            if base in REPO_ROOT_SKIP:
-                continue
-            if base not in REPO_ROOT_EXPECTED:
-                unexpected.append(base)
-        if unexpected:
-            self.warn("repo-root-hygiene",
-                      f"unexpected top-level entries: {_bash_q_join(unexpected)}")
-        else:
-            self.ok("repo-root-hygiene: only whitelisted entries")
+        self.probe_service("realtek-fix.service",
+                           "realtek-fix.service active (this host has enp6s0f1)",
+                           "inactive — enp6s0f1 detected; NIC will drop under load")
 
     def probe_service(self, unit: str, ok_msg: str, fail_detail: str) -> None:
         rc, _, _ = _run(["systemctl", "is-active", "--quiet", unit])
-        if rc == 0:
-            self.ok(ok_msg)
-        else:
-            self.fail(unit, fail_detail)
+        self._verdict(rc == 0, ok_msg, unit, fail_detail)
 
     def probe_vpn_country(self) -> None:
         vc_raw = self.env.get("VPN_COUNTRY", "")
@@ -667,6 +690,7 @@ class HealthCheck:
                       "live cron or systemd differs from ops/ snapshot — run ops/audit.sh")
 
     def run_all(self) -> int:
+        self.probe_mounts()
         self.probe_gluetun()
         self.probe_containers()
         self.probe_arr("sonarr", paths.SONARR_URL, "SONARR_API_KEY")
@@ -687,7 +711,6 @@ class HealthCheck:
         self.probe_ufw()
         self.probe_perimeter()
         self.probe_realtek()
-        self.probe_repo_root()
         self.probe_service("consolidate-watch.service",
                            "consolidate-watch.service active",
                            "inactive — new imports won't auto-trigger v2 pipeline")

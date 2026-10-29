@@ -28,30 +28,34 @@ SERVICE_GROUP_ESC=$(sed_repl_escape "$SERVICE_GROUP")
 
 render_snapshot() {
   # Mirrors install.sh: `$HOME/media-stack` -> MEDIA_STACK_ROOT first (more specific), then `$HOME`.
+  # Prints the rendered snapshot without comments and blank lines.
   sed -e "s|\$HOME/media-stack|${MEDIA_STACK_ROOT_ESC}|g" \
       -e "s|\$HOME|${HOME_ESC}|g" \
       -e "s|^User=mediauser$|User=${SERVICE_USER_ESC}|" \
       -e "s|^Group=mediauser$|Group=${SERVICE_GROUP_ESC}|" \
-      "$1"
+      "$1" | grep -vE '^\s*(#|$)'
+}
+
+# compare_state <live> <expected> <drift-text> <ok-text>: both texts already have comments and
+# blanks stripped. Prints `OK: <ok-text>`, or `DRIFT: <drift-text> (rendered with ...)` plus the
+# diff and sets drift=1. An empty live side is compared as zero bytes (what the stripping grep
+# prints), so empty-vs-empty is still drift, as it always was.
+compare_state() {
+  local live="$1" expected="$2" drift_text="$3" ok_text="$4" delta
+  if delta=$(diff -u <(printf '%s' "${live:+$live$'\n'}") <(printf '%s\n' "$expected")); then
+    printf 'OK: %s\n' "$ok_text"
+  else
+    printf 'DRIFT: %s (rendered with MEDIA_STACK_ROOT=%s)\n' "$drift_text" "$MEDIA_STACK_ROOT"
+    printf '%s\n' "$delta"
+    drift=1
+  fi
 }
 
 expected_cron="$REPO_ROOT/ops/cron.d/media-stack.crontab"
 if [[ -r "$expected_cron" ]]; then
-  rendered_cron=$(render_snapshot "$expected_cron" | grep -vE '^\s*(#|$)')
-  if ! diff -u \
-      <(crontab -l 2>/dev/null | grep -vE '^\s*(#|$)') \
-      <(printf '%s\n' "$rendered_cron") \
-      > /dev/null
-  then
-    printf 'DRIFT: crontab differs from %s (rendered with MEDIA_STACK_ROOT=%s)\n' \
-        "$expected_cron" "$MEDIA_STACK_ROOT"
-    diff -u \
-        <(crontab -l 2>/dev/null | grep -vE '^\s*(#|$)') \
-        <(printf '%s\n' "$rendered_cron")
-    drift=1
-  else
-    printf 'OK: crontab matches ops/cron.d/media-stack.crontab\n'
-  fi
+  compare_state "$(crontab -l 2>/dev/null | grep -vE '^\s*(#|$)')" "$(render_snapshot "$expected_cron")" \
+      "crontab differs from $expected_cron" \
+      "crontab matches ops/cron.d/media-stack.crontab"
 fi
 
 # Host-specific units (e.g. realtek-fix.service) are skipped on hosts without the hardware.
@@ -90,21 +94,9 @@ for unit_file in "$REPO_ROOT"/ops/systemd/*.service; do
       continue
     fi
   fi
-  rendered_unit=$(render_snapshot "$unit_file" | grep -vE '^\s*(#|$)')
-  if ! diff -u \
-      <(printf '%s\n' "$live" | grep -vE '^\s*(#|$)') \
-      <(printf '%s\n' "$rendered_unit") \
-      > /dev/null
-  then
-    printf 'DRIFT: %s body differs from %s (rendered with MEDIA_STACK_ROOT=%s)\n' \
-        "$unit" "$unit_file" "$MEDIA_STACK_ROOT"
-    diff -u \
-        <(printf '%s\n' "$live" | grep -vE '^\s*(#|$)') \
-        <(printf '%s\n' "$rendered_unit")
-    drift=1
-  else
-    printf 'OK: %s matches\n' "$unit"
-  fi
+  compare_state "$(printf '%s\n' "$live" | grep -vE '^\s*(#|$)')" "$(render_snapshot "$unit_file")" \
+      "$unit body differs from $unit_file" \
+      "$unit matches"
 done
 
 # Live /etc/logrotate.d/media-stack is root-owned 644, readable without sudo; render_snapshot's
@@ -116,21 +108,9 @@ if [[ -r "$expected_logrotate" ]]; then
     printf 'DRIFT: logrotate config %s not installed (run: bash ops/install.sh --apply)\n' "$live_logrotate"
     drift=1
   else
-    rendered_lr=$(render_snapshot "$expected_logrotate" | grep -vE '^\s*(#|$)')
-    if ! diff -u \
-        <(grep -vE '^\s*(#|$)' "$live_logrotate") \
-        <(printf '%s\n' "$rendered_lr") \
-        > /dev/null
-    then
-      printf 'DRIFT: %s differs from %s (rendered with MEDIA_STACK_ROOT=%s)\n' \
-          "$live_logrotate" "$expected_logrotate" "$MEDIA_STACK_ROOT"
-      diff -u \
-          <(grep -vE '^\s*(#|$)' "$live_logrotate") \
-          <(printf '%s\n' "$rendered_lr")
-      drift=1
-    else
-      printf 'OK: logrotate config matches ops/logrotate.d/media-stack\n'
-    fi
+    compare_state "$(grep -vE '^\s*(#|$)' "$live_logrotate")" "$(render_snapshot "$expected_logrotate")" \
+        "$live_logrotate differs from $expected_logrotate" \
+        "logrotate config matches ops/logrotate.d/media-stack"
   fi
 fi
 

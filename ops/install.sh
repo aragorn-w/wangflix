@@ -24,11 +24,8 @@ done
 SERVICE_USER="${SERVICE_USER:-$(id -un)}"
 SERVICE_GROUP="${SERVICE_GROUP:-$(id -gn)}"
 
-printf 'Rendering with:\n'
-printf '  MEDIA_STACK_ROOT = %s\n' "$MEDIA_STACK_ROOT"
-printf '  SERVICE_USER     = %s\n' "$SERVICE_USER"
-printf '  SERVICE_GROUP    = %s\n' "$SERVICE_GROUP"
-printf '\n'
+printf 'Rendering with MEDIA_STACK_ROOT=%s SERVICE_USER=%s SERVICE_GROUP=%s\n' \
+    "$MEDIA_STACK_ROOT" "$SERVICE_USER" "$SERVICE_GROUP"
 
 # Escape `\`, `&` and the `|` delimiter in sed replacement strings (must match ops/audit.sh).
 sed_repl_escape() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
@@ -37,17 +34,14 @@ HOME_ESC=$(sed_repl_escape "$HOME")
 SERVICE_USER_ESC=$(sed_repl_escape "$SERVICE_USER")
 SERVICE_GROUP_ESC=$(sed_repl_escape "$SERVICE_GROUP")
 
-# Private per-run temp dir (not a predictable /tmp path); printed for inspection before --apply.
+# Private per-run temp dir (not a predictable /tmp path); its rendered files are listed below.
 INSTALL_TMP=$(mktemp -d -t media-stack-install.XXXXXX)
-printf 'Rendering into: %s\n\n' "$INSTALL_TMP"
 CRON_OUT="$INSTALL_TMP/media-stack.crontab.rendered"
 # `$HOME/media-stack` first (more specific), then `$HOME`.
 sed -e "s|\$HOME/media-stack|${MEDIA_STACK_ROOT_ESC}|g" \
     -e "s|\$HOME|${HOME_ESC}|g" \
     "$REPO_ROOT/ops/cron.d/media-stack.crontab" > "$CRON_OUT"
-printf '=== rendered crontab (%s) ===\n' "$CRON_OUT"
-head -20 "$CRON_OUT"
-printf '...\n\n'
+printf 'Rendered crontab:   %s\n' "$CRON_OUT"
 
 SYSTEMD_DIR="$INSTALL_TMP/systemd"
 mkdir -p "$SYSTEMD_DIR"
@@ -59,27 +53,19 @@ for unit in "$REPO_ROOT"/ops/systemd/*.service; do
       -e "s|^User=mediauser$|User=${SERVICE_USER_ESC}|" \
       -e "s|^Group=mediauser$|Group=${SERVICE_GROUP_ESC}|" \
       "$unit" > "$out"
-  printf '=== rendered %s (%s) ===\n' "$unit_name" "$out"
-  head -20 "$out"
-  printf '\n'
+  printf 'Rendered unit:      %s\n' "$out"
 done
 
 # Only the path placeholder needs rendering (`su root root` is literal).
 LOGROTATE_OUT="$INSTALL_TMP/logrotate-media-stack"
 sed -e "s|\$HOME/media-stack|${MEDIA_STACK_ROOT_ESC}|g" \
     "$REPO_ROOT/ops/logrotate.d/media-stack" > "$LOGROTATE_OUT"
-printf '=== rendered logrotate (%s) ===\n' "$LOGROTATE_OUT"
-head -20 "$LOGROTATE_OUT"
-printf '\n'
+printf 'Rendered logrotate: %s\n' "$LOGROTATE_OUT"
 
 if [[ $APPLY -ne 1 ]]; then
-  printf '\nDRY RUN — nothing installed.  Re-run with --apply to:\n'
-  printf '  1. crontab %s\n' "$CRON_OUT"
-  printf '  2. sudo install -m 644 <NON-host-specific>.service files from %s\n' "$SYSTEMD_DIR"
-  printf '       (host-specific units like realtek-fix.service are SKIPPED\n'
-  printf '        at install time by default; override with INCLUDE_HOST_SPECIFIC=1)\n'
-  printf '  3. sudo systemctl daemon-reload && enable+start each non-host-specific unit\n'
-  printf '  4. sudo install -m 644 %s /etc/logrotate.d/media-stack\n' "$LOGROTATE_OUT"
+  printf 'DRY RUN, nothing installed. --apply installs the crontab, the systemd units (host-specific\n'
+  printf 'ones such as realtek-fix.service are skipped unless INCLUDE_HOST_SPECIFIC=1) and the\n'
+  printf 'logrotate config at /etc/logrotate.d/media-stack.\n'
   exit 0
 fi
 

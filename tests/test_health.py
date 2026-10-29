@@ -1,9 +1,9 @@
 """Tests for media_stack/health.py: every probe's FAIL/WARN/OK branch, print routing,
 --json shape and exit codes, with subprocess/HTTP/clients mocked."""
+import errno
 import json
-import subprocess
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -92,44 +92,35 @@ def _gluetun_run(vpn_ip, host_ip, ipinfo=None, ip2=None):
     return fake_run
 
 
-def test_gluetun_not_running_fails(tmp_path):
+@pytest.mark.parametrize("fake, expected, country, then_vpn_country", [
+    (lambda args, **kw: (1, "", ""),
+     [("FAIL", "gluetun", "gluetun container not running")], "", False),
+    # host != vpn ip
+    (_gluetun_run("146.70.226.218", "8.8.8.8", "CH\n", '{"country_code": "CH"}'),
+     [("OK", "gluetun-egress ip=146.70.226.218 country=Switzerland", "")], "Switzerland", False),
+    # host egress == vpn ip
+    (_gluetun_run("5.5.5.5", "5.5.5.5"),
+     [("FAIL", "gluetun-egress",
+       "VPN IP 5.5.5.5 matches host IP — tunnel is LEAKING direct traffic")], ANY, False),
+    # host egress unavailable
+    (_gluetun_run("5.5.5.5", None),
+     [("WARN", "gluetun-egress",
+       "VPN ip=5.5.5.5 — could not query host egress, leak check skipped")], ANY, False),
+    # ipinfo rate-limited (empty) but ip2location confirms CH: the single source must still
+    # resolve to a country name (not a debug string) and pass the country check.
+    (_gluetun_run("146.70.226.218", "8.8.8.8", "\n", '{"country_code": "CH"}'),
+     [("OK", "gluetun-egress ip=146.70.226.218 country=Switzerland", ""),
+      ("OK", "vpn-country=Switzerland", "")], "Switzerland", True),
+], ids=["not-running-fails", "ok", "leak-fails", "no-host-ip-warns",
+        "single-geo-source-still-verifies-country"])
+def test_probe_gluetun(tmp_path, fake, expected, country, then_vpn_country):
     hc = _hc(tmp_path)
-    with patch.object(health, "_run", return_value=(1, "", "")):
-        hc.probe_gluetun()
-    assert hc.results == [("FAIL", "gluetun", "gluetun container not running")]
-
-
-def test_gluetun_ok(tmp_path):
-    hc = _hc(tmp_path)
-    fake = _gluetun_run("146.70.226.218", "8.8.8.8", "CH\n", '{"country_code": "CH"}')  # host != vpn ip
     with patch.object(health, "_run", side_effect=fake):
         hc.probe_gluetun()
-    assert hc.results == [("OK", "gluetun-egress ip=146.70.226.218 country=Switzerland", "")]
-    assert hc.vpn_country == "Switzerland"
-
-
-@pytest.mark.parametrize("host_ip, state, frag", [
-    ("5.5.5.5", "FAIL", "LEAKING"),     # host egress == vpn ip
-    (None, "WARN", "leak check skipped"),   # host egress unavailable
-], ids=["leak-fails", "no-host-ip-warns"])
-def test_gluetun_host_egress_check(tmp_path, host_ip, state, frag):
-    hc = _hc(tmp_path)
-    with patch.object(health, "_run", side_effect=_gluetun_run("5.5.5.5", host_ip)):
-        hc.probe_gluetun()
-    assert hc.results[0][0] == state
-    assert frag in hc.results[0][2]
-
-
-def test_gluetun_single_geo_source_still_verifies_country(tmp_path):
-    # ipinfo rate-limited (empty) but ip2location confirms CH: must not fail the country check.
-    hc = _hc(tmp_path)
-    fake = _gluetun_run("146.70.226.218", "8.8.8.8", "\n", '{"country_code": "CH"}')
-    with patch.object(health, "_run", side_effect=fake):
-        hc.probe_gluetun()
-    assert hc.vpn_country == "Switzerland"   # single source resolved, not a debug string
-    hc.probe_vpn_country()                   # uses the real consensus/match helpers
-    vc = [r for r in hc.results if r[1].startswith("vpn-country")]
-    assert vc and vc[0][0] == "OK"           # was a false FAIL before the fix
+        if then_vpn_country:
+            hc.probe_vpn_country()   # uses the real consensus/match helpers
+    assert hc.results == expected
+    assert hc.vpn_country == country
 
 
 # ---------------- containers ----------------
@@ -431,41 +422,105 @@ def test_ops_audit_tristate(tmp_path, rc, state, frag):
     assert frag in hc.results[0][1] + hc.results[0][2]
 
 
-# ---------------- repo-root hygiene ----------------
+# ---------------- media mounts ----------------
 
-def test_repo_root_clean_ok(tmp_path):
-    """Whitelisted entries and tool caches are not flagged."""
-    (tmp_path / "AGENTS.md").write_text("")
-    for name in ("media_stack", ".mypy_cache", ".pytest_cache"):
-        (tmp_path / name).mkdir()
+def _mount_hc(tmp_path, monkeypatch, *, unmounted=(), empty=(), bare=(), gone=(), xattr=None,
+              fstype="fuse.mergerfs"):
+    """pool + disk1..3 under tmp_path; `unmounted`/`empty`/`bare`/`gone` name the dirs to degrade
+    (`bare` holds only lost+found; `gone` still counts as mounted but cannot be listed); `xattr`
+    is the branch list (default: all three), or an OSError to raise; `fstype` is the pool's."""
+    pool = tmp_path / "pool"
+    disks = [tmp_path / f"disk{i}" for i in (1, 2, 3)]
+    for d in (pool, *disks):
+        d.mkdir()
+        if d.name in bare:
+            (d / "lost+found").mkdir()
+        elif d.name not in empty:
+            (d / "movies").mkdir()
+        if d.name in gone:
+            (d / "movies").rmdir()
+            d.rmdir()
+    if xattr is None:
+        xattr = ":".join(f"{d}=RW" for d in disks).encode()
+
+    def getxattr(path, name):
+        assert (Path(path), name) == (pool / ".mergerfs", "user.mergerfs.branches")
+        if isinstance(xattr, OSError):
+            raise xattr
+        return xattr
+
+    monkeypatch.setattr(health.paths, "MEDIA_ROOT", pool)
+    monkeypatch.setattr(health.os.path, "ismount", lambda p: Path(p).name not in unmounted)
+    monkeypatch.setattr(health.os, "getxattr", getxattr)
+    monkeypatch.setattr(health, "_fs_type", lambda p: fstype)
     hc = _hc(tmp_path)
-    hc.probe_repo_root()
-    assert hc.results == [("OK", "repo-root-hygiene: only whitelisted entries", "")]
+    hc.probe_mounts()
+    shown = [(r[0], r[1].replace(f"{tmp_path}/", "")) for r in hc.results]
+    return hc, shown
 
 
-def test_repo_root_unexpected_warns(tmp_path):
-    (tmp_path / "AGENTS.md").write_text("")
-    (tmp_path / "mystery_file").write_text("")
-    (tmp_path / "scratch").mkdir()
-    hc = _hc(tmp_path)
-    hc.probe_repo_root()
-    assert hc.results[0][0] == "WARN"
-    assert hc.results[0][1] == "repo-root-hygiene"
-    # bash %q format: plain names appear verbatim, single trailing space.
-    detail = hc.results[0][2]
-    assert detail.startswith("unexpected top-level entries: ")
-    assert "mystery_file" in detail and "scratch" in detail
+POOL_OK = ("OK", "mount:pool pool mounted, non-empty")
+DISKS_OK = [("OK", f"mount:branch disk{i} mounted, non-empty") for i in (1, 2, 3)]
 
 
-def test_repo_root_whitelist_covers_tracked_top_level_entries():
-    """Every top-level entry git tracks must be whitelisted, or the hourly healthcheck warns."""
-    root = Path(__file__).resolve().parent.parent
-    r = subprocess.run(["git", "ls-files", "-z"], cwd=root, capture_output=True, text=True, timeout=30)
-    if r.returncode != 0:
-        pytest.skip("not a git checkout")
-    tracked = {p.split("/", 1)[0] for p in r.stdout.split("\0") if p}
-    assert tracked
-    assert tracked - health.REPO_ROOT_EXPECTED == set()
+@pytest.mark.parametrize("kw, expected, frag", [
+    ({}, [POOL_OK, *DISKS_OK], ""),
+    ({"unmounted": ("pool",)}, [("FAIL", "mount:pool")], "is not a mountpoint"),
+    ({"empty": ("pool",)}, [("FAIL", "mount:pool"), *DISKS_OK], "is mounted but empty"),
+    ({"unmounted": ("disk2",)},
+     [POOL_OK, DISKS_OK[0], ("FAIL", "mount:branch disk2"), DISKS_OK[2]], "not a mountpoint"),
+    ({"empty": ("disk3",)},
+     [POOL_OK, *DISKS_OK[:2], ("FAIL", "mount:branch disk3")], "mounted but empty"),
+    ({"bare": ("disk3",)},
+     [POOL_OK, *DISKS_OK[:2], ("FAIL", "mount:branch disk3")], "mounted but empty"),
+    ({"gone": ("disk1",)}, [POOL_OK, ("FAIL", "mount:branch disk1"), *DISKS_OK[1:]],
+     "unreadable"),
+    # branch modes (`=RW`, `=NC`, `=RO,50G`) are not part of the path
+    ({"xattr": b"{d}/disk1=RW,50G:{d}/disk2=NC:{d}/disk3=RO\0"}, [POOL_OK, *DISKS_OK], ""),
+], ids=["all-ok", "pool-unmounted-fails", "pool-empty-fails", "branch-unmounted-fails",
+        "branch-empty-fails", "branch-only-lost+found-fails", "branch-unreadable-fails", "branch-modes-stripped"])
+def test_probe_mounts(tmp_path, monkeypatch, kw, expected, frag):
+    if isinstance(kw.get("xattr"), bytes):
+        kw = {**kw, "xattr": kw["xattr"].replace(b"{d}", str(tmp_path).encode())}
+    hc, shown = _mount_hc(tmp_path, monkeypatch, **kw)
+    assert shown == expected
+    assert frag in " ".join(r[2] for r in hc.results)
+
+
+NOT_CHECKED = ("WARN", "mount:branches")
+
+
+@pytest.mark.parametrize("err, fstype, expected", [
+    (OSError(errno.ENODATA, "No data available"), "ext4",
+     [POOL_OK, ("OK", "mount:branches not checked (pool is ext4, not mergerfs)")]),
+    (OSError(errno.ENOENT, "No such file or directory"), "nfs4",
+     [POOL_OK, ("OK", "mount:branches not checked (pool is nfs4, not mergerfs)")]),
+    # xattr=nosys on a mergerfs pool: the kernel answers ENOTSUP, which must not read as "fine"
+    (OSError(errno.ENOTSUP, "Operation not supported"), "fuse.mergerfs", [POOL_OK, NOT_CHECKED]),
+    (OSError(errno.EACCES, "Permission denied"), "fuse.mergerfs", [POOL_OK, NOT_CHECKED]),
+    (OSError(errno.ENODATA, "No data available"), "", [POOL_OK, NOT_CHECKED]),
+    (b"", "fuse.mergerfs", [POOL_OK, NOT_CHECKED]),
+], ids=["not-mergerfs-ok", "not-mergerfs-no-control-file-ok", "mergerfs-xattr-disabled-warns",
+        "mergerfs-unreadable-warns", "unknown-fs-warns", "no-branches-listed-warns"])
+def test_probe_mounts_branch_list_unavailable_is_not_a_failure(
+        tmp_path, monkeypatch, err, fstype, expected):
+    hc, shown = _mount_hc(tmp_path, monkeypatch, xattr=err, fstype=fstype)
+    assert shown == expected
+    assert hc.summary() != 1
+
+
+def test_fs_type_reads_topmost_mount_and_decodes_escapes(tmp_path, monkeypatch):
+    pool = tmp_path / "my pool"
+    pool.mkdir()
+    esc = str(pool).replace(" ", "\\040")   # the mount table writes a space as \040
+    table = tmp_path / "mounts"
+    table.write_text(f"proc /proc proc rw 0 0\n/dev/sdb {esc} ext4 rw 0 0\n"
+                     f"media-pool {esc} fuse.mergerfs rw 0 0\n")
+    monkeypatch.setattr(health, "_MOUNTS", str(table))
+    assert health._fs_type(pool) == "fuse.mergerfs"
+    assert health._fs_type(tmp_path / "elsewhere") == ""
+    monkeypatch.setattr(health, "_MOUNTS", str(tmp_path / "missing"))
+    assert health._fs_type(pool) == ""
 
 
 # ---------------- arg parsing ----------------

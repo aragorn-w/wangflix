@@ -33,13 +33,13 @@ One-line markers; the resolution detail is in git history.
 
 - **A1** `godzilla-add-sdh.sh` outlived its purpose: script, cron, log and sentinels deleted.
 - **A2** `clean-subs.py` deprecation stub: deleted (v2 logic lives in `consolidate-subs.py`).
-- **A3** inline Python in bash heredocs: migrated to `python3 -m media_stack.cli` subcommands.
+- **A3** inline Python in bash heredocs: moved out of the shell scripts into `media_stack/` modules.
 - **A4** verbose fix-history docstrings: trimmed.
 - **A5** status scripts stale vs v2 pipeline: `consolidate-status.sh` reports the real `jq length` entry count; disk-free uses `$MEDIA_ROOT`, not hardcoded `/mnt/disk{1,3}`.
 - **A6** README replication walkthrough: added (8 steps).
 - **A7** `healthcheck.sh` missed media-policy invariants: perimeter, hardlinks, Bazarr equality and custom-format scores are all machine-enforced via `media_stack/clients/*`.
 - **A8** pending Gluetun recreate for compose port-list changes: force-recreated, orphan ports gone.
-- **A9** healthcheck failures had no alert path: `ops/healthcheck-alert.sh` wraps `healthcheck.sh`; logrotate for `var/log` is wired (`ops/logrotate.d/media-stack` + install/audit). The operator page is OPT-IN (`HEALTHCHECK_ALERT_NOTIFY`, default off): non-zero results record to `var/log/healthcheck-issues.log` and the self-healing crons + agent handle resolution; Telegram pages only when `HEALTHCHECK_ALERT_NOTIFY=1`.
+- **A9** healthcheck failures had no alert path: `ops/healthcheck-alert.sh` wraps `healthcheck.sh`; logrotate for `var/log` is wired (`ops/logrotate.d/media-stack` + install/audit). The operator is not paged: non-zero results record to `var/log/healthcheck-issues.log` and the self-healing crons + agent handle resolution.
 - **A10** Docker admin ports bind to all interfaces: closed as accepted (trade-off documented; trusted-LAN-only perimeter).
 - **A11** live VPN routed through the wrong country: gluetun force-recreated; `healthcheck` uses 2-source ISO-2 consensus + alias normalization, so stale geo no longer false-fails.
 - **A12** `healthcheck.sh` extracted into the typed `media_stack/health.py`; `healthcheck.sh` is a thin `exec python3 -m media_stack.health` wrapper, proven byte-identical (plain stdout+stderr, `--verbose`, `--json`, all three exit codes against the same live state). `tests/test_health.py` drives every probe's FAIL/WARN/OK branch with mocked subprocess/HTTP/clients; ruff + mypy clean. Preserved intentionally: qBit no-auth reachability semantics, the credential `.env` whitelist `lib/paths.sh` deliberately omits, and process-env > `.env` precedence with is-set semantics.

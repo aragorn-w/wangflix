@@ -20,15 +20,16 @@ REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 fail=0
 optfail=0
 
-require_cmd() {
-  # require_cmd <bin> <description> [-- <probe argv...>]: the probe, if given, must exit 0 (a broken
-  # binary must not pass). Argv-style, not an eval'd string.
-  local cmd="$1" desc="$2"
-  shift 2
+_probe_cmd() {
+  # _probe_cmd <counter-var> <missing-tag> <missing-suffix> <broken-tag> <bin> <description>
+  # [-- <probe argv...>]: the probe, if given, must exit 0 (a broken binary must not pass).
+  # Argv-style, not an eval'd string.
+  local counter="$1" miss_tag="$2" miss_sfx="$3" broken_tag="$4" cmd="$5" desc="$6"
+  shift 6
   [[ "${1:-}" == "--" ]] && shift
   if ! command -v "$cmd" >/dev/null 2>&1; then
-    printf 'MISSING: %s — %s\n' "$cmd" "$desc"
-    fail=$((fail + 1))
+    printf '%s%s — %s%s\n' "$miss_tag" "$cmd" "$desc" "$miss_sfx"
+    printf -v "$counter" '%d' $(( ${!counter} + 1 ))
     return
   fi
   if (( $# > 0 )); then
@@ -36,8 +37,8 @@ require_cmd() {
     out=$("$@" 2>&1 | head -1)
     rc=$?
     if [[ $rc -ne 0 ]]; then
-      printf 'BROKEN:  %s — probe exit %d: %s\n' "$cmd" "$rc" "$out"
-      fail=$((fail + 1))
+      printf '%s%s — probe exit %d: %s\n' "$broken_tag" "$cmd" "$rc" "$out"
+      printf -v "$counter" '%d' $(( ${!counter} + 1 ))
       return
     fi
     if [[ $verbose -eq 1 ]]; then
@@ -48,32 +49,9 @@ require_cmd() {
   printf 'OK:      %s\n' "$cmd"
 }
 
-optional_cmd() {
-  # Same shape as require_cmd; missing or broken is OPT, not FAIL.
-  local cmd="$1" desc="$2"
-  shift 2
-  [[ "${1:-}" == "--" ]] && shift
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    printf 'OPT:     %s — %s (not installed)\n' "$cmd" "$desc"
-    optfail=$((optfail + 1))
-    return
-  fi
-  if (( $# > 0 )); then
-    local out rc
-    out=$("$@" 2>&1 | head -1)
-    rc=$?
-    if [[ $rc -ne 0 ]]; then
-      printf 'OPT:     %s — probe exit %d: %s\n' "$cmd" "$rc" "$out"
-      optfail=$((optfail + 1))
-      return
-    fi
-    if [[ $verbose -eq 1 ]]; then
-      printf 'OK:      %s — %s\n' "$cmd" "$out"
-      return
-    fi
-  fi
-  printf 'OK:      %s\n' "$cmd"
-}
+# require_cmd/optional_cmd <bin> <description> [-- <probe argv...>]: a miss is FAIL or OPT.
+require_cmd()  { _probe_cmd fail    'MISSING: ' ''                  'BROKEN:  ' "$@"; }
+optional_cmd() { _probe_cmd optfail 'OPT:     ' ' (not installed)' 'OPT:     ' "$@"; }
 
 require_cmd ffmpeg      "two-pass loudnorm + remux"             -- ffmpeg -version
 require_cmd ffprobe     "metadata probe used everywhere"        -- ffprobe -version
