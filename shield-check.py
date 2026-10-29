@@ -38,8 +38,8 @@ ALERTING (at most ONE Telegram message per run, combining devices)
     is retried next run. A missing or corrupt state file is logged and treated as empty.
   * An alert describes the CURRENT condition against the last DELIVERED state; there is no
     queue, so a condition that clears before delivery is never reported.
-  * Every alerted device's header line is always sent; only long finding lists are cut
-    ("...and N more (see the log)").
+  * The message is a summary: per device the finding count, outage or recovery notice, and a
+    pointer to the log. The full findings and hints are written to the log on every run.
 
 Exit codes:
   0   every checked device matches the profile
@@ -87,11 +87,8 @@ DEVICES_TIMEOUT_S = 10.0
 PROBE_TIMEOUT_S = 60.0
 
 UNREACHABLE_ALERT_AT = 3
-# Telegram's limit is 4096 characters; leave room for the footer.
-MAX_MESSAGE_CHARS = 3800
 MAX_VALUE_CHARS = 80
-MORE_RESERVE = 40   # room per device for its "  ...and N more (see the log)" line
-LOG_POINTER = "Remediation hints are in var/log/shield-check.log"
+LOG_POINTER = "Findings and remediation hints are in var/log/shield-check.log"
 EXIT_BUSY = 75   # sysexits.h EX_TEMPFAIL
 
 NAMESPACES = ("global", "secure", "system")
@@ -100,6 +97,9 @@ PROFILE_KEYS = frozenset({
     "settings", "component_lists",
 })
 PACKAGE_LISTS = ("disabled_packages", "required_enabled_packages", "absent_packages")
+# Pairs that cannot both hold for one package.
+CONFLICTING_LISTS = (("disabled_packages", "required_enabled_packages"),
+                     ("absent_packages", "required_enabled_packages"))
 
 DEVICE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,30}")
 HOSTNAME_RE = re.compile(
@@ -190,9 +190,7 @@ def parse_devices(raw: str) -> tuple[list[Device], list[str]]:
 
 
 class ProfileError(Exception):
-    def __init__(self, problems: list[str]):
-        super().__init__("; ".join(problems))
-        self.problems = problems
+    """The profile cannot be used; the message says why."""
 
 
 @dataclass(frozen=True)
@@ -204,82 +202,59 @@ class Profile:
     components: dict[str, dict[str, tuple[str, ...]]] = field(default_factory=dict)
 
 
-def _package_list(value: object, key: str, problems: list[str]) -> tuple[str, ...]:
-    if not isinstance(value, list):
-        problems.append(f"{key}: must be a list of package names")
-        return ()
-    out = []
-    for item in value:
-        if isinstance(item, str) and PACKAGE_RE.fullmatch(item):
-            out.append(item)
-        else:
-            problems.append(f"{key}: invalid package name {item!r}")
-    return tuple(out)
+def _all_match(value: object, pattern: re.Pattern[str]) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(item, str) and pattern.fullmatch(item) for item in value)
 
 
-def _namespaced(value: object, key: str, problems: list[str]) -> dict[str, dict]:
-    if not isinstance(value, dict):
-        problems.append(f"{key}: must be an object keyed by namespace")
-        return {}
-    out: dict[str, dict] = {}
-    for ns, entries in value.items():
+def _namespaced(raw: dict, key: str, valid: Callable[[object], bool], what: str) -> dict[str, dict]:
+    """The `key` section, `{namespace: {setting name: value}}`. Namespaces and setting names are
+    interpolated into `settings get <ns> <name>` in the adb shell, so both are allowlisted."""
+    section = raw.get(key, {})
+    if not isinstance(section, dict):
+        raise ProfileError(f"{key}: must be an object keyed by namespace")
+    for ns, entries in section.items():
         if ns not in NAMESPACES:
-            problems.append(f"{key}: unknown namespace {ns!r} (expected one of {', '.join(NAMESPACES)})")
-        elif not isinstance(entries, dict):
-            problems.append(f"{key}.{ns}: must be an object")
-        else:
-            out[ns] = entries
-            for name in entries:
-                if not SETTING_KEY_RE.fullmatch(name):
-                    problems.append(f"{key}.{ns}: invalid setting name {name!r}")
-    return out
+            raise ProfileError(
+                f"{key}: unknown namespace {ns!r} (expected one of {', '.join(NAMESPACES)})")
+        if not (isinstance(entries, dict) and all(
+                SETTING_KEY_RE.fullmatch(name) and valid(value) for name, value in entries.items())):
+            raise ProfileError(
+                f"{key}.{ns}: setting names must match [A-Za-z0-9_.]+ and values must be {what}")
+    return section
 
 
 def parse_profile(raw: object) -> Profile:
+    """The first problem raises ProfileError. Package, namespace and setting names are checked
+    because they reach the adb shell command or the printed hints."""
     if not isinstance(raw, dict):
-        raise ProfileError(["the profile must be a JSON object"])
-    problems: list[str] = []
+        raise ProfileError("the profile must be a JSON object")
     unknown = sorted(set(raw) - PROFILE_KEYS)
     if unknown:
-        problems.append(f"unknown top-level key(s): {', '.join(unknown)}")
-    lists = {key: _package_list(raw.get(key, []), key, problems) for key in PACKAGE_LISTS}
-    both = sorted(set(lists["disabled_packages"]) & set(lists["required_enabled_packages"]))
-    if both:
-        problems.append("in both disabled_packages and required_enabled_packages: " + ", ".join(both))
-    both = sorted(set(lists["absent_packages"]) & set(lists["required_enabled_packages"]))
-    if both:
-        problems.append("in both absent_packages and required_enabled_packages: " + ", ".join(both))
-
-    settings: dict[str, dict[str, str]] = {}
-    for ns, entries in _namespaced(raw.get("settings", {}), "settings", problems).items():
-        settings[ns] = {}
-        for name, expected in entries.items():
-            if isinstance(expected, str):
-                settings[ns][name] = expected
-            else:
-                problems.append(f"settings.{ns}.{name}: the expected value must be a string")
-
-    components: dict[str, dict[str, tuple[str, ...]]] = {}
-    for ns, entries in _namespaced(raw.get("component_lists", {}), "component_lists", problems).items():
-        components[ns] = {}
-        for name, wanted in entries.items():
-            ok = isinstance(wanted, list) and all(
-                isinstance(c, str) and COMPONENT_RE.fullmatch(c) for c in wanted)
-            if ok:
-                components[ns][name] = tuple(wanted)
-            else:
-                problems.append(f"component_lists.{ns}.{name}: must be a list of pkg/Class components")
-    if problems:
-        raise ProfileError(problems)
-    return Profile(lists["disabled_packages"], lists["required_enabled_packages"],
-                   lists["absent_packages"], settings, components)
+        raise ProfileError(f"unknown top-level key(s): {', '.join(unknown)}")
+    for key in PACKAGE_LISTS:
+        if not _all_match(raw.get(key, []), PACKAGE_RE):
+            raise ProfileError(f"{key}: must be a list of package names")
+    lists = {key: tuple(raw.get(key, [])) for key in PACKAGE_LISTS}
+    for first, second in CONFLICTING_LISTS:
+        both = sorted(set(lists[first]) & set(lists[second]))
+        if both:
+            raise ProfileError(f"in both {first} and {second}: " + ", ".join(both))
+    settings = _namespaced(raw, "settings", lambda v: isinstance(v, str), "strings")
+    components = _namespaced(raw, "component_lists", lambda v: _all_match(v, COMPONENT_RE),
+                             "lists of pkg/Class components")
+    return Profile(
+        lists["disabled_packages"], lists["required_enabled_packages"], lists["absent_packages"],
+        settings,
+        {ns: {name: tuple(wanted) for name, wanted in entries.items()}
+         for ns, entries in components.items()})
 
 
 def load_profile(path: Path) -> Profile:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        raise ProfileError([f"cannot read {path.name}: {type(exc).__name__}: {exc}"]) from exc
+        raise ProfileError(f"cannot read {path.name}: {type(exc).__name__}: {exc}") from exc
     return parse_profile(raw)
 
 
@@ -579,8 +554,8 @@ def save_states(state_file: Path, states: dict[str, DeviceState]) -> None:
 
 
 def advance(prev: DeviceState, rep: DeviceReport) -> tuple[DeviceState, list[str]]:
-    """`(state to store once delivered, alert lines)`. Lines starting with two spaces detail
-    the line above."""
+    """`(state to store once delivered, alert lines)`: counts and recovery notices, never the
+    finding text (that is in the log)."""
     if not rep.reachable:
         count = prev.unreachable + 1
         lines = []
@@ -595,42 +570,17 @@ def advance(prev: DeviceState, rep: DeviceReport) -> tuple[DeviceState, list[str
     if current != prev.findings:
         if current:
             lines.append(f"{len(current)} finding(s) vs the profile")
-            lines += [f"  {text}" for text in current]
         else:
             lines.append("back in line with the profile")
     return DeviceState(current, 0), lines
 
 
 def build_message(alerts: dict[str, list[str]]) -> str:
-    """One message under `MAX_MESSAGE_CHARS`. Header lines always appear; only indented detail
-    lines are cut (with a count). Headers are reserved first and the rest shared evenly, so one
-    long list can't push another device out. Device names only, no addresses or hints."""
-    head = f"Shield check: {len(alerts)} device(s) changed"
-    blocks = {}
-    room = MAX_MESSAGE_CHARS - len(head) - len(LOG_POINTER) - 4
-    for name, lines in alerts.items():
-        headers = [f"{name}: {ln}" for ln in lines if not ln.startswith("  ")]
-        details = [ln for ln in lines if ln.startswith("  ")]
-        blocks[name] = (headers, details)
-        room -= 1 + sum(len(h) + 1 for h in headers) + MORE_RESERVE
-    kept = {}
-    by_size = sorted(blocks, key=lambda n: sum(len(d) + 1 for d in blocks[n][1]))
-    for i, name in enumerate(by_size):
-        share = room // (len(by_size) - i)
-        used = count = 0
-        for detail in blocks[name][1]:
-            if used + len(detail) + 1 > share:
-                break
-            used += len(detail) + 1
-            count += 1
-        kept[name] = count
-        room -= used
-    out = [head]
-    for name, (headers, details) in blocks.items():
-        out += ["", *headers, *details[: kept[name]]]
-        if kept[name] < len(details):
-            out.append(f"  ...and {len(details) - kept[name]} more (see the log)")
-    return "\n".join([*out, "", LOG_POINTER])
+    """Summary only: per changed device its name and the alert lines (finding count, outage or
+    recovery notice), then a pointer to the log. No finding text, address or hint."""
+    lines = [f"Shield check: {len(alerts)} device(s) changed"]
+    lines += [f"{name}: {line}" for name, notes in alerts.items() for line in notes]
+    return "\n".join([*lines, "", LOG_POINTER])
 
 
 def telegram_credentials() -> tuple[str, str]:
@@ -698,8 +648,7 @@ def main(argv: list[str] | None = None, *, adb: AdbRunner | None = None,
     try:
         profile = load_profile(PROFILE_PATH)
     except ProfileError as exc:
-        for problem in exc.problems:
-            log(f"ERROR: profile: {problem}")
+        log(f"ERROR: profile: {exc}")
         return 2
 
     if adb is None:

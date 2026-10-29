@@ -172,10 +172,6 @@ class World:
     def devices(self, value):
         self.monkeypatch.setenv("SHIELD_DEVICES", value)
 
-    def single(self):
-        self.devices(f"living={LIVING}")
-        return self
-
     def run(self, *argv):
         return sc.main(list(argv), adb=self.adb, send=self.sender)
 
@@ -207,6 +203,13 @@ def _isolate(tmp_path, monkeypatch):
 @pytest.fixture
 def world(monkeypatch):
     return World(monkeypatch)
+
+
+@pytest.fixture
+def single_world(world):
+    """`world` with only the living device configured."""
+    world.devices(f"living={LIVING}")
+    return world
 
 
 def snap(installed=(), disabled=(), settings=None):
@@ -314,11 +317,10 @@ def test_main_reads_shield_devices_from_the_stack_env_file(world, tmp_path, monk
     assert world.adb.serials_touched() == {LIVING}
 
 
-def test_main_process_env_beats_the_stack_env_file(world, tmp_path):
+def test_main_process_env_beats_the_stack_env_file(single_world, tmp_path):
     (tmp_path / "stack" / ".env").write_text(f"SHIELD_DEVICES=bedroom={BEDROOM}\n")
-    world.single()
-    assert world.run("--no-notify") == 0
-    assert world.adb.serials_touched() == {LIVING}
+    assert single_world.run("--no-notify") == 0
+    assert single_world.adb.serials_touched() == {LIVING}
 
 
 # ===========================================================================
@@ -352,25 +354,34 @@ def test_profile_without_the_optional_sections_is_valid():
     (lambda d: d.update(extra=[]), "unknown top-level key"),
     (lambda d: d["disabled_packages"].append("com.example.keep"), "both disabled_packages and required_enabled_packages"),
     (lambda d: d["absent_packages"].append("com.example.keep"), "both absent_packages and required_enabled_packages"),
-    (lambda d: d["disabled_packages"].append("singleword"), "invalid package name"),
-    (lambda d: d["disabled_packages"].append("com.example bloat"), "invalid package name"),
-    (lambda d: d["absent_packages"].append("com.example;reboot"), "invalid package name"),
-    (lambda d: d["absent_packages"].append("1com.example"), "invalid package name"),
-    (lambda d: d["absent_packages"].append("com..example"), "invalid package name"),
-    (lambda d: d["absent_packages"].append(5), "invalid package name"),
-    (lambda d: d.update(disabled_packages="com.example.bloat"), "must be a list"),
+    (lambda d: d.update(disabled_packages="com.example.bloat"), "must be a list of package names"),
     (lambda d: d.update(settings=[]), "settings: must be an object"),
-    (lambda d: d["settings"].update(sys={"a": "1"}), "unknown namespace"),
-    (lambda d: d["settings"].update(system="x"), "settings.system: must be an object"),
-    (lambda d: d["settings"]["system"].update({"bad key": "1"}), "invalid setting name"),
-    (lambda d: d["settings"]["system"].update(nv_fan_mode=5), "must be a string"),
-    (lambda d: d["component_lists"].update(sys={}), "unknown namespace"),
-    (lambda d: d["component_lists"]["secure"].update(enabled_input_methods="a/b"), "list of pkg/Class"),
-    (lambda d: d["component_lists"]["secure"].update(enabled_input_methods=["noslash"]), "list of pkg/Class"),
-    (lambda d: d["component_lists"]["secure"].update(enabled_input_methods=["a/b c"]), "list of pkg/Class"),
-    (lambda d: d["component_lists"]["secure"].update(enabled_input_methods=[5]), "list of pkg/Class"),
+    (lambda d: d["settings"]["system"].update(nv_fan_mode=5), "values must be strings"),
+    (lambda d: d["component_lists"]["secure"].update(enabled_input_methods="a/b"), "pkg/Class"),
 ])
 def test_profile_validation_failures(tmp_path, mutate, expected):
+    with pytest.raises(sc.ProfileError) as exc:
+        sc.load_profile(_profile_with(tmp_path, mutate))
+    assert expected in str(exc.value)
+
+
+@pytest.mark.parametrize("mutate, expected", [
+    # package names reach the printed hints, namespaces and setting names the adb shell command
+    (lambda d: d["absent_packages"].append("com.example;reboot"), "package names"),
+    (lambda d: d["disabled_packages"].append("com.example bloat"), "package names"),
+    (lambda d: d["disabled_packages"].append("singleword"), "package names"),
+    (lambda d: d["absent_packages"].append(5), "package names"),
+    (lambda d: d["settings"].update(sys={"a": "1"}), "unknown namespace"),
+    (lambda d: d["settings"].update({"system;reboot": {}}), "unknown namespace"),
+    (lambda d: d["component_lists"].update(sys={}), "unknown namespace"),
+    (lambda d: d["settings"]["system"].update({"bad key": "1"}), "setting names"),
+    (lambda d: d["settings"]["system"].update({"x; reboot": "1"}), "setting names"),
+    (lambda d: d["settings"]["system"].update({"$(reboot)": "1"}), "setting names"),
+    (lambda d: d["component_lists"]["secure"].update({"x`reboot`": ["a/b"]}), "setting names"),
+    (lambda d: d["component_lists"]["secure"].update(enabled_input_methods=["a/b;reboot"]), "pkg/Class"),
+    (lambda d: d["component_lists"]["secure"].update(enabled_input_methods=["noslash"]), "pkg/Class"),
+])
+def test_profile_rejects_names_that_could_reach_a_shell(tmp_path, mutate, expected):
     with pytest.raises(sc.ProfileError) as exc:
         sc.load_profile(_profile_with(tmp_path, mutate))
     assert expected in str(exc.value)
@@ -386,25 +397,14 @@ def test_profile_that_is_not_an_object_or_not_json_or_missing_is_an_error(tmp_pa
         sc.load_profile(tmp_path / "missing.json")
 
 
-def test_profile_reports_every_problem_at_once(tmp_path):
-    def mutate(d):
-        d["disabled_packages"].append("com.example.keep")
-        d["settings"]["system"]["nv_fan_mode"] = 5
-        d["extra"] = 1
-    with pytest.raises(sc.ProfileError) as exc:
-        sc.load_profile(_profile_with(tmp_path, mutate))
-    assert len(exc.value.problems) == 3
-
-
 @pytest.mark.parametrize("content", ['{"nope": 1}', None], ids=["invalid", "missing"])
-def test_main_bad_profile_exits_2_and_checks_nothing(world, content, capsys):
+def test_main_bad_profile_exits_2_and_checks_nothing(single_world, content, capsys):
     if content is None:
         sc.PROFILE_PATH.unlink()
     else:
         sc.PROFILE_PATH.write_text(content)
-    world.single()
-    assert world.run() == 2
-    assert world.adb.calls == [] and world.messages == [] and not sc.STATE_FILE.exists()
+    assert single_world.run() == 2
+    assert single_world.adb.calls == [] and single_world.messages == [] and not sc.STATE_FILE.exists()
     assert "ERROR: profile" in capsys.readouterr().out
 
 
@@ -614,15 +614,14 @@ def test_value_just_at_the_limit_is_not_cut_and_one_over_is():
     assert "sha256" in _fan(exact + "y")[0].text
 
 
-def test_a_change_between_two_long_wrong_values_alerts(world):
-    world.single()
-    world.living.settings[("system", "nv_fan_mode")] = "x" * 200 + "A"
-    world.run()
-    world.living.settings[("system", "nv_fan_mode")] = "x" * 200 + "B"
-    world.run()
-    assert len(world.messages) == 2
-    world.run()
-    assert len(world.messages) == 2
+def test_a_change_between_two_long_wrong_values_alerts(single_world):
+    single_world.living.settings[("system", "nv_fan_mode")] = "x" * 200 + "A"
+    single_world.run()
+    single_world.living.settings[("system", "nv_fan_mode")] = "x" * 200 + "B"
+    single_world.run()
+    assert len(single_world.messages) == 2
+    single_world.run()
+    assert len(single_world.messages) == 2
 
 
 def test_missing_component_is_a_finding_and_extra_components_are_fine():
@@ -718,10 +717,9 @@ def test_probe_output_is_read_the_same_with_any_line_ending(eol):
     assert not any("\r" in p for p in parsed.installed | parsed.disabled)
 
 
-def test_crlf_device_matching_the_profile_has_no_findings(world):
-    world.single()
-    world.living.eol = "\r\n"
-    assert world.run("--no-notify") == 0
+def test_crlf_device_matching_the_profile_has_no_findings(single_world):
+    single_world.living.eol = "\r\n"
+    assert single_world.run("--no-notify") == 0
 
 
 def test_an_empty_setting_value_reads_as_the_empty_string():
@@ -866,14 +864,13 @@ def test_a_missing_status_line_makes_the_device_unreachable(n):
     assert not report.reachable and "no exit status" in report.detail
 
 
-def test_a_failing_probe_counts_as_unreachable_and_keeps_the_stored_findings(world):
-    world.single()
-    world.living.enable("com.example.bloat")
-    world.run()
-    world.living.failing = {"pm list packages -d"}     # would read as "nothing disabled"
-    assert world.run() == 1
-    assert world.state()["living"] == {"findings": [BLOAT_ENABLED], "unreachable": 1}
-    assert len(world.messages) == 1
+def test_a_failing_probe_counts_as_unreachable_and_keeps_the_stored_findings(single_world):
+    single_world.living.enable("com.example.bloat")
+    single_world.run()
+    single_world.living.failing = {"pm list packages -d"}     # would read as "nothing disabled"
+    assert single_world.run() == 1
+    assert single_world.state()["living"] == {"findings": [BLOAT_ENABLED], "unreachable": 1}
+    assert len(single_world.messages) == 1
 
 
 def test_adb_binary_missing_makes_the_device_unreachable():
@@ -893,18 +890,17 @@ def test_devices_listing_failure_is_unreachable():
     assert not report.reachable and "adb devices failed" in report.detail
 
 
-def test_only_read_only_adb_commands_are_ever_run(world, capsys):
+def test_only_read_only_adb_commands_are_ever_run(single_world, capsys):
     """With drift in every category, every recorded adb call is connect, devices or an
     allowed read-only shell script."""
-    world.single()
-    world.living.enable("com.example.bloat")
-    world.living.installed.add("com.example.banned")
-    world.living.settings[("system", "nv_fan_mode")] = "quiet"
-    world.living.settings[("secure", "enabled_input_methods")] = "null"
-    world.living.disabled.add("com.example.voice")
-    assert world.run() == 1
-    assert world.adb.calls
-    for args, _timeout in world.adb.calls:
+    single_world.living.enable("com.example.bloat")
+    single_world.living.installed.add("com.example.banned")
+    single_world.living.settings[("system", "nv_fan_mode")] = "quiet"
+    single_world.living.settings[("secure", "enabled_input_methods")] = "null"
+    single_world.living.disabled.add("com.example.voice")
+    assert single_world.run() == 1
+    assert single_world.adb.calls
+    for args, _timeout in single_world.adb.calls:
         if args[0] in ("connect", "devices"):
             continue
         assert args[0] == "-s" and args[2] == "shell" and len(args) == 4
@@ -918,234 +914,219 @@ def test_only_read_only_adb_commands_are_ever_run(world, capsys):
 # The state machine, through main()
 # ===========================================================================
 
-def test_first_run_clean_device_says_nothing_but_records_itself(world):
-    world.single()
-    assert world.run() == 0
-    assert world.messages == []
-    assert world.state() == {"living": {"findings": [], "unreachable": 0}}
+def test_first_run_clean_device_says_nothing_but_records_itself(single_world):
+    assert single_world.run() == 0
+    assert single_world.messages == []
+    assert single_world.state() == {"living": {"findings": [], "unreachable": 0}}
 
 
-def test_first_run_with_findings_alerts_and_records_them(world):
-    world.single()
-    world.living.enable("com.example.bloat")
-    assert world.run() == 1
-    assert len(world.messages) == 1
-    assert "living" in world.messages[0] and BLOAT_ENABLED in world.messages[0]
-    assert world.state() == {"living": {"findings": [BLOAT_ENABLED], "unreachable": 0}}
+def test_first_run_with_findings_alerts_and_records_them(single_world):
+    single_world.living.enable("com.example.bloat")
+    assert single_world.run() == 1
+    assert len(single_world.messages) == 1
+    assert "living: 1 finding(s) vs the profile" in single_world.messages[0]
+    assert single_world.state() == {"living": {"findings": [BLOAT_ENABLED], "unreachable": 0}}
 
 
-def test_unchanged_findings_do_not_alert_again(world):
-    world.single()
-    world.living.enable("com.example.bloat")
-    world.run()
-    assert world.run() == 1          # still drifted, so the exit status says so
-    assert world.run() == 1
-    assert len(world.messages) == 1
+def test_unchanged_findings_do_not_alert_again(single_world):
+    single_world.living.enable("com.example.bloat")
+    single_world.run()
+    assert single_world.run() == 1          # still drifted, so the exit status says so
+    assert single_world.run() == 1
+    assert len(single_world.messages) == 1
 
 
-def test_a_new_finding_alerts_with_the_whole_current_list(world):
-    world.single()
-    world.living.enable("com.example.bloat")
-    world.run()
-    world.living.installed.add("com.example.banned")
-    world.run()
-    assert len(world.messages) == 2
-    assert BLOAT_ENABLED in world.messages[1] and BANNED_INSTALLED in world.messages[1]
-    assert "2 finding(s)" in world.messages[1]
-    assert world.state()["living"]["findings"] == sorted([BLOAT_ENABLED, BANNED_INSTALLED])
+def test_a_new_finding_alerts_with_the_new_count(single_world):
+    single_world.living.enable("com.example.bloat")
+    single_world.run()
+    single_world.living.installed.add("com.example.banned")
+    single_world.run()
+    assert len(single_world.messages) == 2
+    assert "living: 2 finding(s) vs the profile" in single_world.messages[1]
+    assert single_world.state()["living"]["findings"] == sorted([BLOAT_ENABLED, BANNED_INSTALLED])
 
 
-def test_a_resolved_finding_alerts_with_what_is_left(world):
-    world.single()
-    world.living.enable("com.example.bloat")
-    world.living.installed.add("com.example.banned")
-    world.run()
-    world.living.installed.discard("com.example.banned")
-    world.run()
-    assert len(world.messages) == 2
-    assert BLOAT_ENABLED in world.messages[1] and BANNED_INSTALLED not in world.messages[1]
+def test_a_resolved_finding_alerts_with_the_remaining_count(single_world):
+    single_world.living.enable("com.example.bloat")
+    single_world.living.installed.add("com.example.banned")
+    single_world.run()
+    single_world.living.installed.discard("com.example.banned")
+    single_world.run()
+    assert len(single_world.messages) == 2
+    assert "living: 1 finding(s) vs the profile" in single_world.messages[1]
 
 
-def test_everything_resolved_says_back_in_line_with_the_profile(world):
-    world.single()
-    world.living.enable("com.example.bloat")
-    world.run()
-    world.living.disabled.add("com.example.bloat")
-    assert world.run() == 0
-    assert len(world.messages) == 2
-    assert "living: back in line with the profile" in world.messages[1]
-    assert world.state()["living"]["findings"] == []
+def test_everything_resolved_says_back_in_line_with_the_profile(single_world):
+    single_world.living.enable("com.example.bloat")
+    single_world.run()
+    single_world.living.disabled.add("com.example.bloat")
+    assert single_world.run() == 0
+    assert len(single_world.messages) == 2
+    assert "living: back in line with the profile" in single_world.messages[1]
+    assert single_world.state()["living"]["findings"] == []
 
 
-def test_a_changed_finding_text_for_the_same_key_alerts(world):
-    world.single()
-    world.living.settings[("system", "nv_fan_mode")] = "quiet"
-    world.run()
-    world.living.settings[("system", "nv_fan_mode")] = "off"
-    world.run()
-    assert len(world.messages) == 2 and "got 'off'" in world.messages[1]
+def test_a_changed_finding_text_for_the_same_key_alerts(single_world):
+    single_world.living.settings[("system", "nv_fan_mode")] = "quiet"
+    single_world.run()
+    single_world.living.settings[("system", "nv_fan_mode")] = "off"
+    single_world.run()
+    assert len(single_world.messages) == 2
+    assert "got 'off'" in single_world.state()["living"]["findings"][0]
 
 
-def test_unauthorized_alerts_once_and_resolves(world):
-    world.single()
-    world.living.state = "unauthorized"
-    assert world.run() == 1
-    assert world.run() == 1
-    assert len(world.messages) == 1 and "unauthorized" in world.messages[0]
-    world.living.state = "device"
-    assert world.run() == 0
-    assert "back in line" in world.messages[-1]
+def test_unauthorized_alerts_once_and_resolves(single_world):
+    single_world.living.state = "unauthorized"
+    assert single_world.run() == 1
+    assert single_world.run() == 1
+    assert len(single_world.messages) == 1
+    assert "living: 1 finding(s) vs the profile" in single_world.messages[0]
+    single_world.living.state = "device"
+    assert single_world.run() == 0
+    assert "back in line" in single_world.messages[-1]
 
 
-def test_unreachable_alerts_on_the_third_daily_run_only(world):
-    world.single()
-    world.living.connect = "timeout"
+def test_unreachable_alerts_on_the_third_daily_run_only(single_world):
+    single_world.living.connect = "timeout"
     for count in (1, 2):
-        assert world.run() == 1
-        assert world.messages == []
-        assert world.state()["living"]["unreachable"] == count
-    assert world.run() == 1
-    assert len(world.messages) == 1
-    assert "living: unreachable for 3 consecutive daily runs" in world.messages[0]
-    assert world.state()["living"]["unreachable"] == 3
+        assert single_world.run() == 1
+        assert single_world.messages == []
+        assert single_world.state()["living"]["unreachable"] == count
+    assert single_world.run() == 1
+    assert len(single_world.messages) == 1
+    assert "living: unreachable for 3 consecutive daily runs" in single_world.messages[0]
+    assert single_world.state()["living"]["unreachable"] == 3
     for count in (4, 5):
-        assert world.run() == 1
-        assert len(world.messages) == 1
-        assert world.state()["living"]["unreachable"] == count
+        assert single_world.run() == 1
+        assert len(single_world.messages) == 1
+        assert single_world.state()["living"]["unreachable"] == count
 
 
-def test_recovery_after_an_unreachable_alert_alerts_once_and_resets_the_counter(world):
-    world.single()
-    world.living.connect = "timeout"
+def test_recovery_after_an_unreachable_alert_alerts_once_and_resets_the_counter(single_world):
+    single_world.living.connect = "timeout"
     for _ in range(4):
-        world.run()
-    world.living.connect = "ok"
-    assert world.run() == 0
-    assert len(world.messages) == 2
-    assert "living: reachable again" in world.messages[1]
-    assert world.state()["living"] == {"findings": [], "unreachable": 0}
-    assert world.run() == 0
-    assert len(world.messages) == 2
+        single_world.run()
+    single_world.living.connect = "ok"
+    assert single_world.run() == 0
+    assert len(single_world.messages) == 2
+    assert "living: reachable again" in single_world.messages[1]
+    assert single_world.state()["living"] == {"findings": [], "unreachable": 0}
+    assert single_world.run() == 0
+    assert len(single_world.messages) == 2
 
 
-def test_recovery_before_the_alert_threshold_is_silent(world):
-    world.single()
-    world.living.connect = "timeout"
-    world.run()
-    world.run()
-    world.living.connect = "ok"
-    assert world.run() == 0
-    assert world.messages == []
-    assert world.state()["living"]["unreachable"] == 0
+def test_recovery_before_the_alert_threshold_is_silent(single_world):
+    single_world.living.connect = "timeout"
+    single_world.run()
+    single_world.run()
+    single_world.living.connect = "ok"
+    assert single_world.run() == 0
+    assert single_world.messages == []
+    assert single_world.state()["living"]["unreachable"] == 0
 
 
-def test_unreachable_runs_leave_the_stored_findings_alone(world):
-    world.single()
-    world.living.enable("com.example.bloat")
-    world.run()
-    world.living.connect = "timeout"
+def test_unreachable_runs_leave_the_stored_findings_alone(single_world):
+    single_world.living.enable("com.example.bloat")
+    single_world.run()
+    single_world.living.connect = "timeout"
     for _ in range(3):
-        world.run()
-        assert world.state()["living"]["findings"] == [BLOAT_ENABLED]
-    world.living.connect = "ok"
-    world.run()
+        single_world.run()
+        assert single_world.state()["living"]["findings"] == [BLOAT_ENABLED]
+    single_world.living.connect = "ok"
+    single_world.run()
     # back with the SAME findings: only the recovery is news
-    assert len(world.messages) == 3
-    assert "reachable again" in world.messages[2]
-    assert BLOAT_ENABLED not in world.messages[2]
+    assert len(single_world.messages) == 3
+    assert "reachable again" in single_world.messages[2]
+    assert BLOAT_ENABLED not in single_world.messages[2]
 
 
-def test_recovery_with_changed_findings_reports_both(world):
-    world.single()
-    world.living.connect = "timeout"
+def test_recovery_with_changed_findings_reports_both(single_world):
+    single_world.living.connect = "timeout"
     for _ in range(3):
-        world.run()
-    world.living.connect = "ok"
-    world.living.installed.add("com.example.banned")
-    world.run()
-    assert "reachable again" in world.messages[1] and BANNED_INSTALLED in world.messages[1]
+        single_world.run()
+    single_world.living.connect = "ok"
+    single_world.living.installed.add("com.example.banned")
+    single_world.run()
+    assert "living: reachable again" in single_world.messages[1]
+    assert "living: 1 finding(s) vs the profile" in single_world.messages[1]
 
 
-def test_unreachable_first_run_then_reachable_with_findings_alerts_as_a_first_run(world):
-    world.single()
-    world.living.connect = "timeout"
-    world.run()
-    world.living.connect = "ok"
-    world.living.enable("com.example.bloat")
-    world.run()
-    assert len(world.messages) == 1 and BLOAT_ENABLED in world.messages[0]
+def test_unreachable_first_run_then_reachable_with_findings_alerts_as_a_first_run(single_world):
+    single_world.living.connect = "timeout"
+    single_world.run()
+    single_world.living.connect = "ok"
+    single_world.living.enable("com.example.bloat")
+    single_world.run()
+    assert len(single_world.messages) == 1
+    assert "living: 1 finding(s) vs the profile" in single_world.messages[0]
 
 
-def test_failed_send_keeps_the_old_state_and_the_next_run_retries(world):
-    world.single()
-    world.living.enable("com.example.bloat")
-    world.sender.ok = False
-    assert world.run() == 1
-    assert len(world.messages) == 1
-    assert not sc.STATE_FILE.exists() or "living" not in world.state()
-    world.sender.ok = True
-    world.run()
-    assert len(world.messages) == 2 and BLOAT_ENABLED in world.messages[1]
-    assert world.state()["living"]["findings"] == [BLOAT_ENABLED]
-    world.run()
-    assert len(world.messages) == 2
+def test_failed_send_keeps_the_old_state_and_the_next_run_retries(single_world):
+    single_world.living.enable("com.example.bloat")
+    single_world.sender.ok = False
+    assert single_world.run() == 1
+    assert len(single_world.messages) == 1
+    assert not sc.STATE_FILE.exists() or "living" not in single_world.state()
+    single_world.sender.ok = True
+    single_world.run()
+    assert len(single_world.messages) == 2
+    assert "living: 1 finding(s) vs the profile" in single_world.messages[1]
+    assert single_world.state()["living"]["findings"] == [BLOAT_ENABLED]
+    single_world.run()
+    assert len(single_world.messages) == 2
 
 
-def test_failed_send_leaves_an_existing_entry_as_it_was(world):
-    world.single()
-    world.living.enable("com.example.bloat")
-    world.run()
-    world.living.installed.add("com.example.banned")
-    world.sender.ok = False
-    world.run()
-    assert world.state()["living"]["findings"] == [BLOAT_ENABLED]
-    world.sender.ok = True
-    world.run()
-    assert world.state()["living"]["findings"] == sorted([BLOAT_ENABLED, BANNED_INSTALLED])
+def test_failed_send_leaves_an_existing_entry_as_it_was(single_world):
+    single_world.living.enable("com.example.bloat")
+    single_world.run()
+    single_world.living.installed.add("com.example.banned")
+    single_world.sender.ok = False
+    single_world.run()
+    assert single_world.state()["living"]["findings"] == [BLOAT_ENABLED]
+    single_world.sender.ok = True
+    single_world.run()
+    assert single_world.state()["living"]["findings"] == sorted([BLOAT_ENABLED, BANNED_INSTALLED])
 
 
-def test_failed_send_of_the_unreachable_alert_is_retried(world):
-    world.single()
-    world.living.connect = "timeout"
-    world.run()
-    world.run()
-    world.sender.ok = False
-    world.run()
-    assert world.state()["living"]["unreachable"] == 2     # not advanced to 3
-    world.sender.ok = True
-    world.run()
-    assert len(world.messages) == 2 and "unreachable for 3" in world.messages[1]
-    assert world.state()["living"]["unreachable"] == 3
+def test_failed_send_of_the_unreachable_alert_is_retried(single_world):
+    single_world.living.connect = "timeout"
+    single_world.run()
+    single_world.run()
+    single_world.sender.ok = False
+    single_world.run()
+    assert single_world.state()["living"]["unreachable"] == 2     # not advanced to 3
+    single_world.sender.ok = True
+    single_world.run()
+    assert len(single_world.messages) == 2 and "unreachable for 3" in single_world.messages[1]
+    assert single_world.state()["living"]["unreachable"] == 3
 
 
-def test_drift_fixed_before_its_alert_was_delivered_is_never_reported(world):
+def test_drift_fixed_before_its_alert_was_delivered_is_never_reported(single_world):
     """Alerts describe the CURRENT condition against the last DELIVERED state; no queue."""
-    world.single()
-    world.living.enable("com.example.bloat")
-    world.sender.ok = False
-    world.run()
-    assert len(world.messages) == 1                      # attempted, not delivered
-    world.living.disabled.add("com.example.bloat")       # fixed before the next run
-    world.sender.ok = True
-    assert world.run() == 0
-    assert len(world.messages) == 1                      # nothing about the cleared drift
-    assert world.state()["living"] == {"findings": [], "unreachable": 0}
+    single_world.living.enable("com.example.bloat")
+    single_world.sender.ok = False
+    single_world.run()
+    assert len(single_world.messages) == 1                      # attempted, not delivered
+    single_world.living.disabled.add("com.example.bloat")       # fixed before the next run
+    single_world.sender.ok = True
+    assert single_world.run() == 0
+    assert len(single_world.messages) == 1                      # nothing about the cleared drift
+    assert single_world.state()["living"] == {"findings": [], "unreachable": 0}
 
 
-def test_unreachable_that_recovers_before_its_alert_got_through_is_not_reported(world):
-    world.single()
-    world.living.connect = "timeout"
-    world.run()
-    world.run()
-    world.sender.ok = False
-    world.run()                                          # third run: the alert fails
-    assert len(world.messages) == 1
-    assert world.state()["living"]["unreachable"] == 2
-    world.living.connect = "ok"
-    world.sender.ok = True
-    assert world.run() == 0
-    assert len(world.messages) == 1                      # neither the outage nor the recovery
-    assert world.state()["living"]["unreachable"] == 0
+def test_unreachable_that_recovers_before_its_alert_got_through_is_not_reported(single_world):
+    single_world.living.connect = "timeout"
+    single_world.run()
+    single_world.run()
+    single_world.sender.ok = False
+    single_world.run()                                          # third run: the alert fails
+    assert len(single_world.messages) == 1
+    assert single_world.state()["living"]["unreachable"] == 2
+    single_world.living.connect = "ok"
+    single_world.sender.ok = True
+    assert single_world.run() == 0
+    assert len(single_world.messages) == 1                      # neither the outage nor the recovery
+    assert single_world.state()["living"]["unreachable"] == 0
 
 
 def test_a_device_that_needs_no_alert_advances_even_when_the_send_fails(world):
@@ -1159,11 +1140,10 @@ def test_a_device_that_needs_no_alert_advances_even_when_the_send_fails(world):
     assert "bedroom" not in state
 
 
-def test_missing_telegram_credentials_log_and_continue(world, monkeypatch, capsys):
-    world.single()
-    world.living.enable("com.example.bloat")
+def test_missing_telegram_credentials_log_and_continue(single_world, monkeypatch, capsys):
+    single_world.living.enable("com.example.bloat")
     monkeypatch.setattr(sc, "telegram_send", Mock(side_effect=AssertionError("must not send")))
-    assert sc.main([], adb=world.adb) == 1        # the real send_alert, no credentials anywhere
+    assert sc.main([], adb=single_world.adb) == 1        # the real send_alert, no credentials anywhere
     assert "notify skipped: no Telegram credentials" in capsys.readouterr().out
     assert not sc.STATE_FILE.exists()             # the alert was not delivered, so no state
 
@@ -1176,7 +1156,6 @@ def test_one_message_per_run_covers_every_device(world):
     message = world.messages[0]
     assert "2 device(s)" in message
     assert "living: 1 finding(s)" in message and "bedroom: 1 finding(s)" in message
-    assert BLOAT_ENABLED in message and BANNED_INSTALLED in message
 
 
 def test_a_clean_device_is_not_mentioned_next_to_a_drifted_one(world):
@@ -1196,15 +1175,14 @@ def test_telegram_message_has_no_addresses_and_no_hints_but_points_at_the_log(wo
     assert "var/log/shield-check.log" in message
 
 
-def test_exit_status_is_1_for_drift_and_for_unreachable_but_not_for_a_failed_send(world):
-    world.single()
-    assert world.run() == 0
-    world.living.connect = "timeout"
-    assert world.run() == 1
-    world.living.connect = "ok"
-    world.living.enable("com.example.bloat")
-    world.sender.ok = False
-    assert world.run() == 1
+def test_exit_status_is_1_for_drift_and_for_unreachable_but_not_for_a_failed_send(single_world):
+    assert single_world.run() == 0
+    single_world.living.connect = "timeout"
+    assert single_world.run() == 1
+    single_world.living.connect = "ok"
+    single_world.living.enable("com.example.bloat")
+    single_world.sender.ok = False
+    assert single_world.run() == 1
 
 
 # --- --device and --no-notify ------------------------------------------------
@@ -1224,16 +1202,15 @@ def test_device_flag_checks_only_that_device_and_keeps_the_others_state(world):
     assert len(world.messages) == 2 and "bedroom" not in world.messages[1]
 
 
-def test_device_flag_does_not_prune_other_entries_but_a_full_run_does(world):
-    world.single()
+def test_device_flag_does_not_prune_other_entries_but_a_full_run_does(single_world):
     sc.STATE_FILE.parent.mkdir(parents=True)
     sc.STATE_FILE.write_text(json.dumps({
         "retired": {"findings": [], "unreachable": 0},
         "living": {"findings": [], "unreachable": 0}}))
-    world.run("--device", "living")
-    assert "retired" in world.state()
-    world.run()
-    assert set(world.state()) == {"living"}
+    single_world.run("--device", "living")
+    assert "retired" in single_world.state()
+    single_world.run()
+    assert set(single_world.state()) == {"living"}
 
 
 def test_unknown_device_flag_exits_2(world, capsys):
@@ -1242,57 +1219,51 @@ def test_unknown_device_flag_exits_2(world, capsys):
     assert "kitchen" in capsys.readouterr().out
 
 
-def test_no_notify_prints_findings_and_hints_and_writes_nothing(world, capsys):
-    world.single()
-    world.living.enable("com.example.bloat")
-    assert world.run("--no-notify") == 1
+def test_no_notify_prints_findings_and_hints_and_writes_nothing(single_world, capsys):
+    single_world.living.enable("com.example.bloat")
+    assert single_world.run("--no-notify") == 1
     out = capsys.readouterr().out
     assert BLOAT_ENABLED in out
     assert f"HINT adb -s {LIVING} shell pm disable-user --user 0 com.example.bloat" in out
-    assert world.messages == []
+    assert single_world.messages == []
     assert not sc.STATE_FILE.exists()
 
 
-def test_no_notify_leaves_an_existing_state_file_byte_for_byte(world):
-    world.single()
+def test_no_notify_leaves_an_existing_state_file_byte_for_byte(single_world):
     sc.STATE_FILE.parent.mkdir(parents=True)
     sc.STATE_FILE.write_text('{"living": {"findings": [], "unreachable": 2}}')
-    world.living.enable("com.example.bloat")
-    world.run("--no-notify")
+    single_world.living.enable("com.example.bloat")
+    single_world.run("--no-notify")
     assert sc.STATE_FILE.read_text() == '{"living": {"findings": [], "unreachable": 2}}'
 
 
-def test_no_notify_does_not_need_the_run_lock(world):
-    world.single()
+def test_no_notify_does_not_need_the_run_lock(single_world):
     sc.LOCK_FILE.parent.mkdir(exist_ok=True)
     with open(sc.LOCK_FILE, "w") as held:
         fcntl.flock(held.fileno(), fcntl.LOCK_EX)
-        assert world.run("--no-notify") == 0
+        assert single_world.run("--no-notify") == 0
 
 
-def test_a_second_run_holding_the_lock_checks_nothing(world, capsys):
-    world.single()
+def test_a_second_run_holding_the_lock_checks_nothing(single_world, capsys):
     with open(sc.LOCK_FILE, "w") as held:
         fcntl.flock(held.fileno(), fcntl.LOCK_EX)
-        assert world.run() == sc.EXIT_BUSY
-    assert world.adb.calls == [] and world.messages == []
+        assert single_world.run() == sc.EXIT_BUSY
+    assert single_world.adb.calls == [] and single_world.messages == []
     assert "holds the lock" in capsys.readouterr().out
 
 
-def test_a_clean_report_logs_ok_and_prints_no_hint(world, capsys):
-    world.single()
-    world.run("--no-notify")
+def test_a_clean_report_logs_ok_and_prints_no_hint(single_world, capsys):
+    single_world.run("--no-notify")
     out = capsys.readouterr().out
     assert "[living] OK: matches the profile" in out and "HINT" not in out
 
 
-def test_hints_are_printed_once_per_distinct_command(world, capsys):
-    world.single()
-    world.living.settings[("secure", "enabled_input_methods")] = "other/.Ime"
+def test_hints_are_printed_once_per_distinct_command(single_world, capsys):
+    single_world.living.settings[("secure", "enabled_input_methods")] = "other/.Ime"
     profile = json.loads(sc.PROFILE_PATH.read_text())
     profile["component_lists"]["secure"]["enabled_input_methods"] = ["a.b/.One", "a.b/.Two"]
     sc.PROFILE_PATH.write_text(json.dumps(profile))
-    world.run("--no-notify")
+    single_world.run("--no-notify")
     out = capsys.readouterr().out
     assert out.count("missing a.b/") == 2
     assert out.count("HINT") == 1
@@ -1300,15 +1271,14 @@ def test_hints_are_printed_once_per_distinct_command(world, capsys):
 
 # --- state validation ----------------------------------------------------------
 
-def test_corrupt_state_is_logged_treated_as_empty_and_repaired(world, capsys):
-    world.single()
+def test_corrupt_state_is_logged_treated_as_empty_and_repaired(single_world, capsys):
     sc.STATE_FILE.parent.mkdir(parents=True)
     sc.STATE_FILE.write_text("{this is not json")
-    world.living.enable("com.example.bloat")
-    assert world.run() == 1
+    single_world.living.enable("com.example.bloat")
+    assert single_world.run() == 1
     assert "treating it as empty" in capsys.readouterr().out
-    assert len(world.messages) == 1               # first-run behaviour
-    assert world.state() == {"living": {"findings": [BLOAT_ENABLED], "unreachable": 0}}
+    assert len(single_world.messages) == 1               # first-run behaviour
+    assert single_world.state() == {"living": {"findings": [BLOAT_ENABLED], "unreachable": 0}}
 
 
 @pytest.mark.parametrize("content", [
@@ -1322,31 +1292,29 @@ def test_corrupt_state_is_logged_treated_as_empty_and_repaired(world, capsys):
     '{"living": {"findings": []}}',
     '{"Bad Name": {"findings": [], "unreachable": 0}}',
 ])
-def test_invalid_state_never_crashes_and_counts_as_no_state(world, content):
-    world.single()
+def test_invalid_state_never_crashes_and_counts_as_no_state(single_world, content):
     sc.STATE_FILE.parent.mkdir(parents=True)
     sc.STATE_FILE.write_text(content)
-    world.living.enable("com.example.bloat")
-    assert world.run() == 1
-    assert len(world.messages) == 1 and BLOAT_ENABLED in world.messages[0]
-    assert world.state()["living"]["findings"] == [BLOAT_ENABLED]
+    single_world.living.enable("com.example.bloat")
+    assert single_world.run() == 1
+    assert len(single_world.messages) == 1
+    assert "living: 1 finding(s) vs the profile" in single_world.messages[0]
+    assert single_world.state()["living"]["findings"] == [BLOAT_ENABLED]
 
 
-def test_valid_entries_survive_next_to_an_invalid_one(world):
-    world.single()
+def test_valid_entries_survive_next_to_an_invalid_one(single_world):
     sc.STATE_FILE.parent.mkdir(parents=True)
     sc.STATE_FILE.write_text(json.dumps({
         "living": {"findings": [BLOAT_ENABLED], "unreachable": 0}, "bedroom": 7}))
-    world.living.enable("com.example.bloat")
-    world.run()
-    assert world.messages == []                   # living's stored findings still count
+    single_world.living.enable("com.example.bloat")
+    single_world.run()
+    assert single_world.messages == []                   # living's stored findings still count
 
 
-def test_an_unwritable_state_directory_is_logged_not_fatal(world, monkeypatch, capsys):
-    world.single()
-    world.living.enable("com.example.bloat")
+def test_an_unwritable_state_directory_is_logged_not_fatal(single_world, monkeypatch, capsys):
+    single_world.living.enable("com.example.bloat")
     monkeypatch.setattr(sc, "save_state", Mock(side_effect=PermissionError("read-only")))
-    assert world.run() == 1
+    assert single_world.run() == 1
     assert "could not write" in capsys.readouterr().out
 
 
@@ -1354,69 +1322,37 @@ def test_an_unwritable_state_directory_is_logged_not_fatal(world, monkeypatch, c
 # The Telegram message and sender
 # ===========================================================================
 
-def _long(n, tag="finding"):
-    return [f"  {tag} number {i} " + "x" * 90 for i in range(n)]
+def test_message_is_a_summary_with_a_header_a_line_per_alert_and_the_log_pointer():
+    message = sc.build_message({
+        "living": ["500 finding(s) vs the profile"],
+        "bedroom": ["unreachable for 3 consecutive daily runs"],
+        "den": ["reachable again", "2 finding(s) vs the profile"],
+        "attic": ["back in line with the profile"]})
+    assert message.splitlines() == [
+        "Shield check: 4 device(s) changed",
+        "living: 500 finding(s) vs the profile",
+        "bedroom: unreachable for 3 consecutive daily runs",
+        "den: reachable again",
+        "den: 2 finding(s) vs the profile",
+        "attic: back in line with the profile",
+        "",
+        sc.LOG_POINTER]
 
 
-def test_message_is_bounded_and_says_how_much_was_cut():
-    message = sc.build_message({"living": ["500 finding(s) vs the profile"] + _long(500)})
-    assert len(message) <= sc.MAX_MESSAGE_CHARS
-    assert "living: 500 finding(s) vs the profile" in message
-    assert re.search(r"^  \.\.\.and [0-9]+ more \(see the log\)$", message, re.M)
-    assert message.endswith(sc.LOG_POINTER)
-
-
-def test_short_message_is_complete():
-    message = sc.build_message({"living": ["back in line with the profile"],
-                                "bedroom": ["unreachable for 3 consecutive daily runs"]})
-    assert message.splitlines()[0] == "Shield check: 2 device(s) changed"
-    assert "living: back in line with the profile" in message
-    assert "bedroom: unreachable for 3 consecutive daily runs" in message
-    assert "more (see the log)" not in message
-
-
-def test_a_long_list_cannot_push_another_device_out_of_the_message():
-    alerts = {
-        "living": ["500 finding(s) vs the profile"] + _long(500),
-        "bedroom": ["5 finding(s) vs the profile"] + [f"  small {i}" for i in range(5)],
-        "den": ["unreachable for 3 consecutive daily runs"],
-        "attic": ["reachable again", "2 finding(s) vs the profile", "  one", "  two"],
-    }
-    message = sc.build_message(alerts)
-    assert len(message) <= sc.MAX_MESSAGE_CHARS
-    for header in ("living: 500 finding(s) vs the profile", "bedroom: 5 finding(s) vs the profile",
-                   "den: unreachable for 3 consecutive daily runs", "attic: reachable again",
-                   "attic: 2 finding(s) vs the profile"):
-        assert header in message
-    # the short lists keep every line; only the long one lost some
-    assert "  small 4" in message and "  two" in message
-    assert message.count("more (see the log)") == 1
-
-
-def test_every_device_with_a_long_list_keeps_its_header_and_a_share_of_the_room():
-    alerts = {name: ["300 finding(s) vs the profile"] + _long(300, name)
-              for name in ("living", "bedroom", "den")}
-    message = sc.build_message(alerts)
-    assert len(message) <= sc.MAX_MESSAGE_CHARS
-    for name in alerts:
-        assert f"{name}: 300 finding(s) vs the profile" in message
-        assert f"  {name} number 0 " in message          # each got some detail lines
-    assert message.count("more (see the log)") == 3
-
-
-def test_header_lines_are_kept_even_when_the_budget_is_tiny(world, monkeypatch):
-    """Both devices' state advances once their alert is sent, so both must be named in it."""
-    monkeypatch.setattr(sc, "MAX_MESSAGE_CHARS", 420)
+def test_message_names_counts_but_no_finding_text_and_the_log_has_every_finding(world, capsys):
     world.living.enable("com.example.bloat")
     world.living.installed.add("com.example.banned")
     world.living.settings[("system", "nv_fan_mode")] = "quiet"
     world.bedroom.installed.add("com.example.banned")
     assert world.run() == 1
     message = world.messages[0]
-    assert len(message) <= 420
     assert "living: 3 finding(s) vs the profile" in message
     assert "bedroom: 1 finding(s) vs the profile" in message
-    assert "more (see the log)" in message
+    assert not [t for t in (BLOAT_ENABLED, BANNED_INSTALLED, FAN_QUIET) if t in message]
+    out = capsys.readouterr().out
+    for text in (BLOAT_ENABLED, BANNED_INSTALLED, FAN_QUIET):
+        assert f"[living]   {text}" in out
+    assert f"[bedroom]   {BANNED_INSTALLED}" in out
     assert set(world.state()) == {"living", "bedroom"}
 
 
@@ -1487,11 +1423,10 @@ def test_adb_runner_turns_a_timeout_or_a_missing_binary_into_adb_error(monkeypat
 
 
 @pytest.mark.parametrize("env, expected", [(None, "adb"), ("/opt/adb", "/opt/adb")])
-def test_adb_binary_comes_from_the_adb_env_var(world, monkeypatch, env, expected):
-    world.single()
+def test_adb_binary_comes_from_the_adb_env_var(single_world, monkeypatch, env, expected):
     if env:
         monkeypatch.setenv("ADB", env)
-    made = Mock(return_value=world.adb)
+    made = Mock(return_value=single_world.adb)
     monkeypatch.setattr(sc, "make_adb_runner", made)
     assert sc.main(["--no-notify"]) == 0
     made.assert_called_once_with(expected)
