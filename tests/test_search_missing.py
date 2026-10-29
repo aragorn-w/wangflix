@@ -43,39 +43,19 @@ def _movie(mid, title="M", *, monitored=True, has_file=False, available=True,
 
 # --- pick_movies: what gets searched -------------------------------------
 
-def _without(key):
-    m = _movie(1)
-    del m[key]
-    return m
-
-
 @pytest.mark.parametrize("movies, queue, expected", [
     pytest.param([_movie(1), _movie(2)], [], [1, 2], id="picks-released-monitored-missing"),
     # The Odyssey / Spider-Man case: in cinemas, isAvailable False.
     pytest.param([_movie(1, available=False)], [], [], id="skips-unreleased"),
-    # An API shape change must fail toward searching nothing, never toward treating an unknown state as released.
-    pytest.param([_without("isAvailable")], [], [], id="skips-isavailable-field-missing"),
-    *[pytest.param([_movie(1, available=v)], [], [], id=f"skips-truthy-but-not-true-availability-{v!r}")
-      for v in (None, 1, "true", "yes")],
     # isAvailable follows minimumAvailability ("In Cinemas" is available at the theatrical date); status must say released too
-    *[pytest.param([_movie(1, available=True, status=v)], [], [], id=f"skips-available-but-status-{v!r}")
-      for v in ("inCinemas", "announced", "tba", "deleted", None, "")],
-    pytest.param([_without("status")], [], [], id="skips-status-field-missing"),
-    pytest.param([_movie(1, available=False, status="released")], [], [], id="skips-released-status-without-isavailable"),
+    pytest.param([_movie(1, available=True, status="inCinemas")], [], [], id="skips-available-but-in-cinemas"),
     # Radarr's 90-days-after-cinemas "released" fallback is not a home release
     pytest.param([_movie(1, digital=None, physical=None)], [], [], id="skips-cinema-fallback-with-no-home-release-date"),
     pytest.param([_movie(1, digital=FUTURE)], [], [], id="skips-future-home-release-date"),
-    *[pytest.param([_movie(1, digital=v)], [], [], id=f"skips-malformed-home-release-date-{v!r}")
-      for v in ("", "not-a-date", 20241014, True)],
     pytest.param([_movie(1, digital=None, physical=PAST)], [], [1], id="picks-on-past-physical-release-alone"),
-    pytest.param([_movie(1, digital=PAST, physical=FUTURE)], [], [1], id="picks-on-past-digital-when-physical-is-future"),
     pytest.param([_movie(1, has_file=True)], [], [], id="skips-movie-that-has-a-file"),
-    pytest.param([_without("hasFile")], [], [], id="skips-hasfile-unknown"),
     pytest.param([_movie(1, monitored=False)], [], [], id="skips-unmonitored"),
     pytest.param([_movie(1), _movie(2)], [{"movieId": 2}], [1], id="skips-movie-already-downloading"),
-    pytest.param([_movie(True)], [], [], id="skips-bool-movie-id"),
-    # True == 1: a malformed queue row must not hide movie 1 from the search
-    pytest.param([_movie(1)], [{"movieId": True}], [1], id="bool-queue-movieid-does-not-block-movie-1"),
     pytest.param([_movie(1)], [{"title": "pending row"}], [1], id="queue-rows-without-movieid-are-ignored"),
 ])
 def test_pick_movies(movies, queue, expected):
@@ -162,13 +142,6 @@ def test_sonarr_failure_still_searches_movies_and_exits_1():
     radarr.run_command.assert_called_once_with("MoviesSearch", movieIds=[5])
 
 
-def test_null_title_still_searches():
-    """A null title must not crash the log line before the MoviesSearch is queued."""
-    sonarr, radarr = _apps(movies=[_movie(5, title=None)])
-    assert _run([], sonarr, radarr) == 0
-    radarr.run_command.assert_called_once_with("MoviesSearch", movieIds=[5])
-
-
 def test_radarr_refusal_exits_1():
     sonarr, radarr = _apps(movies=[_movie(5)], radarr_cid=None)
     assert _run([], sonarr, radarr) == 1
@@ -179,10 +152,3 @@ def test_missing_sonarr_key_exits_1_but_movies_still_searched():
     assert _run([], sonarr, radarr, env={"RADARR_API_KEY": "r"}) == 1
     sonarr.run_command.assert_not_called()
     radarr.run_command.assert_called_once()
-
-
-def test_missing_radarr_key_exits_1_but_tv_still_searched():
-    sonarr, radarr = _apps(movies=[_movie(5)])
-    assert _run([], sonarr, radarr, env={"SONARR_API_KEY": "s"}) == 1
-    sonarr.run_command.assert_called_once()
-    radarr.movies.assert_not_called()

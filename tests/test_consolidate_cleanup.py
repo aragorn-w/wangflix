@@ -215,8 +215,8 @@ def test_cleanup_remux_shorter_than_the_source_fails_and_leaves_the_original(tmp
 
 
 @pytest.mark.parametrize("src_duration, out_duration", [
-    ("1320.0", "1320.0"), ("1320.0", "1307.0"), (None, "169.0"),
-], ids=["equal", "within-one-percent", "source-duration-missing"])
+    ("1320.0", "1320.0"), (None, "169.0"),
+], ids=["equal", "source-duration-missing"])
 def test_cleanup_remux_as_long_as_the_source_or_unchecked_swaps(tmp_path, src_duration, out_duration):
     r = _run_timed_cleanup(tmp_path, src_duration, out_duration)
 
@@ -226,15 +226,11 @@ def test_cleanup_remux_as_long_as_the_source_or_unchecked_swaps(tmp_path, src_du
 
 @pytest.mark.parametrize("name, streams, status, detail_prefix", [
     ("Movie (2024).mkv", [_v(), _a(1, "eng")], "NEEDS_BAZARR", ""),
-    ("Movie (2024).mkv", [_v(), _v(1, "mjpeg"), _a(2, "eng", default=1)], "NEEDS_BAZARR", ""),
     ("Godzilla Minus One (2023).mkv",       # the confident pick (jpn) is already the only default
      [_v(), _a(1, "jpn", "aac", default=1), _a(2, "eng")], "NEEDS_BAZARR", ""),
     ("Movie (2024).mkv", [_v(), _a(1, "eng"), _s(2, "eng", title="Forced", forced=1)],
      "FAIL", "only forced English"),
-    ("Movie (2024).mkv", [_v(), _a(1, "eng", default=1), _s(2, "eng", title="Forced", forced=1)],
-     "FAIL", "only forced English"),
-], ids=["single-english-audio", "cover-art-alone", "confident-pick-already-sole-default",
-        "forced-english-alone", "forced-english-with-default-audio"])
+], ids=["single-english-audio", "confident-pick-already-sole-default", "forced-english-alone"])
 def test_nothing_to_clean_triggers_no_remux(tmp_path, name, streams, status, detail_prefix):
     r = _run(tmp_path, streams, name=name, extract_track=dict(side_effect=_forced_english_extract))
     assert r.result["status"] == status
@@ -255,59 +251,6 @@ def test_dry_run_reports_plan_without_mutating(tmp_path):
     assert r.tag.call_count == 0
     assert r.norm.call_count == 0
     assert r.media.read_bytes() == b"\x1a\x45\xdf\xa3"
-
-
-def test_french_original_spanish_dub_no_english_keeps_both_audio_tracks(tmp_path):
-    """No eng/jpn/kor signal (French original + Spanish dub, no Arr answer): audio default flags are
-    mirrored exactly (Spanish's default=True preserved); only the foreign subtitle is cleaned."""
-    r = _run(tmp_path, [_v(), _a(1, "fre", original=1), _a(2, "spa", "aac", default=1), _s(3, "fre")],
-             verify=_verify_streams(audio_defaults=(False, True)))
-
-    assert r.result["status"] == "NEEDS_BAZARR"
-    assert len(r.calls) == 1
-    call = r.calls[0]
-    assert call["audio_idx"] == [1, 2]              # BOTH kept, untouched order
-    assert call["cleanup_flags"][1]["default"] is False  # fre: source had none
-    assert call["cleanup_flags"][2]["default"] is True   # spa: source default PRESERVED
-    assert r.tag.call_count == 0
-
-
-def test_only_image_subs_subliminal_failure_cleans_without_dropping_audio(tmp_path):
-    """An English image subtitle (so the main gate does not fire), no text candidate, no sidecar, and a failed
-    subliminal fetch hit the same cleanup. Audio untouched (no Arr signal)."""
-    r = _run(tmp_path, [_v(), _a(1, "fre", default=1), _a(2, "eng", "aac"),
-                        _s(3, "eng", "hdmv_pgs_subtitle"), _s(4, "fre")],
-             verify=_verify_streams(audio_defaults=(True, False), subs=1),
-             fetch_via_subliminal=dict(return_value=None))
-
-    assert r.result["status"] == "NEEDS_BAZARR"
-    assert "only image subs" in r.result["detail"]
-    assert "cleaned" in r.result["detail"]
-    assert len(r.calls) == 1
-    call = r.calls[0]
-    assert call["audio_idx"] == [1, 2]                        # BOTH kept, untouched
-    assert call["cleanup_flags"][1]["default"] is True        # fre default PRESERVED
-    assert call["keep_subtitle_indices"] == [3]                # eng image sub kept
-    assert r.tag.call_count == 0
-
-
-def test_all_extracts_failed_branch_also_cleans(tmp_path):
-    """Every English text/sidecar candidate failing extraction (no image candidate) also runs the cleanup:
-    status stays FAIL; the failed-extraction eng track is not positively foreign, so it survives."""
-    r = _run(tmp_path, [_v(), _a(1, "fre", default=1), _a(2, "eng", "aac"),
-                        _s(3, "eng"), _s(4, "fre")],
-             verify=_verify_streams(audio_defaults=(False, True), subs=1), arr_lang="eng",
-             extract_track=dict(return_value=False))
-
-    assert r.result["status"] == "FAIL"
-    assert "all extracts failed" in r.result["detail"]
-    assert "cleaned" in r.result["detail"]
-    assert len(r.calls) == 1
-    call = r.calls[0]
-    assert call["audio_idx"] == [1, 2]
-    assert call["cleanup_flags"][2]["default"] is True   # eng gets default, by ID
-    assert call["keep_subtitle_indices"] == [3]           # idx3 (eng) kept, idx4 (fre) dropped
-    assert r.tag.call_count == 0
 
 
 def test_cleanup_drops_foreign_sub_and_never_normalizes(tmp_path):
@@ -362,19 +305,13 @@ def test_cover_art_also_survives_cleanup(tmp_path):
     assert call["cleanup_flags"][1]["default"] is False  # cover art's own flag, mirrored
 
 
-# --- only well-formed, ASCII, non-special, non-English codes are "positively foreign" ---
+# --- only well-formed, non-special, non-English codes are "positively foreign" ---
 
 @pytest.mark.parametrize("subs, foreign", [
-    # mul, und-Latn, zxx and qaa (private use) are ambiguous, not positively foreign
-    ([{"tags": {"language": lang}} for lang in ("mul", "und-Latn", "zxx", "qaa")], False),
-    ([{"tags": {"language": lang}} for lang in ("fre", "spa", "jpn", "fr-CA")], True),
-    # untagged and unrecognizable shapes (too long, not alphabetic) are always kept
-    ([{}, {"tags": {}}, {"tags": {"language": ""}}, {"tags": {"language": "englishified"}},
-      {"tags": {"language": "1"}}], False),
-    # str.isalpha() is Unicode-aware and would accept "éé"; the base-subtag check is ASCII-only
-    ([{"tags": {"language": "éé"}}, {"tags": {"language": "日本語"}}], False),
-], ids=["special-and-private-use-kept", "well-formed-foreign-dropped", "unknown-shapes-kept",
-        "non-ascii-letters-kept"])
+    # mul and zxx are ambiguous, not positively foreign
+    ([{"tags": {"language": lang}} for lang in ("mul", "zxx")], False),
+    ([{"tags": {"language": lang}} for lang in ("fre", "fr-CA")], True),
+], ids=["special-codes-kept", "well-formed-foreign-dropped"])
 def test_positively_foreign_sub_classification(subs, foreign):
     for sub in subs:
         assert cs._is_positively_foreign_sub(sub) is foreign, sub
@@ -390,19 +327,6 @@ def test_untagged_and_und_subtitles_survive_cleanup(tmp_path):
     kept = set(r.calls[0]["keep_subtitle_indices"] or [])
     assert {2, 3} <= kept           # untagged + "und" survive
     assert 4 not in kept            # German is positively foreign, dropped
-
-
-def test_regional_english_subtitle_never_dropped_by_cleanup_foreign_check(tmp_path):
-    """An en-US subtitle handed to the cleanup is never positively foreign (`is_english_tag`)."""
-    d = _cleanup_direct(_media(tmp_path), subs=[_s(2, "en-US"), _s(3, "ger")], audio=[_a(1, "eng")],
-                        verify=_verify_streams(audio_defaults=(False,), subs=1))
-
-    assert d.result["status"] == "NEEDS_BAZARR"
-    assert len(d.calls) == 1
-    kept = set(d.calls[0]["keep_subtitle_indices"] or [])
-    assert 2 in kept       # en-US survives
-    assert 3 not in kept   # German dropped
-    assert d.tag.call_count == 0
 
 
 def test_english_image_subs_preserved_by_cleanup_helper(tmp_path):

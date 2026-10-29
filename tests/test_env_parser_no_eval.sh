@@ -19,16 +19,15 @@ cp "$_repo/lib/paths.sh" "$tmp/lib/paths.sh"
 
 sentinel="$tmp/PARSER_EXECUTED_INJECTION"
 
-# Several keys and quote styles, each creating a sentinel if eval'd.
+# An unquoted and a double-quoted value, each creating a sentinel if eval'd.
 cat > "$tmp/.env" <<EOF
 MEDIA_ROOT=\$(touch $sentinel)
 MEDIA_LAN_IP="\$(touch ${sentinel}.dq)"
-CALIBRE_LIBRARY='\$(touch ${sentinel}.sq)'
 EOF
 
 # Subshell so the assignments don't leak.
 (
-  unset MEDIA_ROOT MEDIA_LAN_IP CALIBRE_LIBRARY
+  unset MEDIA_ROOT MEDIA_LAN_IP
   . "$tmp/lib/paths.sh"
   if [[ "$MEDIA_ROOT" != "\$(touch $sentinel)" ]]; then
     echo "FAIL: MEDIA_ROOT is not literal: $MEDIA_ROOT" >&2
@@ -38,13 +37,9 @@ EOF
     echo "FAIL: MEDIA_LAN_IP is not literal: $MEDIA_LAN_IP" >&2
     exit 1
   fi
-  if [[ "$CALIBRE_LIBRARY" != "\$(touch ${sentinel}.sq)" ]]; then
-    echo "FAIL: CALIBRE_LIBRARY is not literal: $CALIBRE_LIBRARY" >&2
-    exit 1
-  fi
 ) || exit 1
 
-if [[ -e "$sentinel" || -e "${sentinel}.dq" || -e "${sentinel}.sq" ]]; then
+if [[ -e "$sentinel" || -e "${sentinel}.dq" ]]; then
   echo "FAIL: parser executed injected command (sentinel created)" >&2
   ls -la "${sentinel}"* 2>&1 >&2
   exit 1

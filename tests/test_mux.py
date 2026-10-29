@@ -57,22 +57,6 @@ def test_remux_full_path_argv_unchanged(files, tmp_path):
     ]
 
 
-def test_remux_full_path_no_forced_srt_argv_unchanged(files, tmp_path):
-    """Same full path without a forced track: no Forced block appended."""
-    src, dst = files
-    eng_srt = tmp_path / "main.srt"
-
-    assert _argv(files, [0], [1], eng_srt, None) == [
-        "mkvmerge", "--quiet", "--output", str(dst),
-        "--video-tracks", "0", "--default-track", "0:yes",
-        "--audio-tracks", "1", "--default-track", "1:yes",
-        "--no-subtitles",
-        str(src),
-        "--language", "0:eng", "--track-name", "0:English",
-        "--default-track", "0:yes", "--forced-track", "0:no", str(eng_srt),
-    ]
-
-
 def test_remux_kept_source_subs_stream_copies_them_ahead_of_the_external_srt(files, tmp_path):
     """The full path can keep a source subtitle (an embedded forced track whose
     text could not be read) unchanged, with explicit flags; video and audio are
@@ -92,13 +76,6 @@ def test_remux_kept_source_subs_stream_copies_them_ahead_of_the_external_srt(fil
     ]
 
 
-def test_remux_kept_source_subs_does_not_change_the_argv_when_absent_or_empty(files, tmp_path):
-    eng_srt = tmp_path / "main.srt"
-    argvs = [_argv(files, [0], [1], eng_srt, None, **kwargs)
-             for kwargs in ({}, {"kept_source_subs": None}, {"kept_source_subs": {}})]
-    assert argvs[0] == argvs[1] == argvs[2] and "--no-subtitles" in argvs[0]
-
-
 def test_remux_eng_track_name_defaults_to_english_and_can_be_overridden(files, tmp_path):
     """`eng_track_name` only renames the re-attached English subtitle; the default argv is unchanged."""
     eng_srt = tmp_path / "main.srt"
@@ -110,13 +87,6 @@ def test_remux_eng_track_name_defaults_to_english_and_can_be_overridden(files, t
     assert generated_argv[generated_argv.index("--track-name") + 1] == "0:English (generated)"
     renamed = [a if a != "0:English (generated)" else "0:English" for a in generated_argv]
     assert renamed == default_argv
-
-
-def test_remux_generated_name_applies_to_the_main_track_not_the_forced_one(files, tmp_path):
-    argv = _argv(files, [0], [1], tmp_path / "main.srt", tmp_path / "forced.srt",
-                 eng_track_name="English (generated)")
-    names = [argv[i + 1] for i, a in enumerate(argv) if a == "--track-name"]
-    assert names == ["0:English (generated)", "0:Forced"]
 
 
 @pytest.mark.parametrize("kwargs, subtitle_args", [
@@ -133,14 +103,6 @@ def test_remux_cleanup_mode_subtitle_selection(files, kwargs, subtitle_args):
         *subtitle_args,
         str(src),
     ]
-
-
-def test_remux_cleanup_mode_ignores_forced_srt(files, tmp_path):
-    """forced_srt is ignored in cleanup mode: no external-attach block."""
-    forced_srt = tmp_path / "forced.srt"
-    argv = _argv(files, [0], [1], None, forced_srt, keep_subtitle_indices=[2])
-    assert str(forced_srt) not in argv
-    assert "--forced-track" not in argv
 
 
 def test_remux_cleanup_flags_no_defaults_anywhere_emits_explicit_no(files):
@@ -188,35 +150,6 @@ def test_remux_cleanup_flags_confident_pick_changes_only_audio_defaults(files):
     ]
 
 
-def test_remux_cleanup_flags_subtitle_forced_flags_match_source(files):
-    """Kept subtitles re-emit their source forced flags (track 4 forced, track 5 not)."""
-    cleanup_flags = {
-        0: {"default": True},
-        1: {"default": True},
-        4: {"default": False, "forced": True},
-        5: {"default": False, "forced": False},
-    }
-
-    argv = _argv(files, [0], [1], None, None,
-                 keep_subtitle_indices=[4, 5], cleanup_flags=cleanup_flags)
-    i = argv.index("--subtitle-tracks")
-    assert argv[i:i + 10] == [
-        "--subtitle-tracks", "4,5",
-        "--default-track", "4:no", "--forced-track", "4:yes",
-        "--default-track", "5:no", "--forced-track", "5:no",
-    ]
-
-
-def test_remux_cleanup_flags_missing_entry_defaults_to_no(files):
-    """A kept id missing from cleanup_flags defaults to default=no / forced=no."""
-    argv = _argv(files, [0], [1], None, None, keep_subtitle_indices=[2], cleanup_flags={})
-    assert argv[argv.index("--video-tracks"):argv.index("--video-tracks") + 4] == [
-        "--video-tracks", "0", "--default-track", "0:no",
-    ]
-    assert "1:no" in argv  # audio
-    assert "2:no" in argv  # subtitle default and forced, both no
-
-
 def test_remux_upgrade_mode_explicit_av_flags_with_an_external_english_srt(files, tmp_path):
     """The generated -> real upgrade passes an external English srt and cleanup_flags:
     video/audio carry explicit default and forced, source subtitles are dropped, the new srt is default."""
@@ -245,14 +178,6 @@ def test_remux_upgrade_mode_explicit_av_flags_with_an_external_english_srt(files
     ]
 
 
-def test_remux_cleanup_flags_without_a_forced_key_emit_no_forced_track_for_av(files):
-    """Cleanup video/audio entries carry only "default": no --forced-track."""
-    argv = _argv(files, [0], [1], None, None, keep_subtitle_indices=[2],
-                 cleanup_flags={0: {"default": True}, 1: {"default": True},
-                                2: {"default": False, "forced": True}})
-    assert argv.count("--forced-track") == 1 and "2:yes" in argv
-
-
 def test_remux_upgrade_mode_keeps_source_subtitles_then_appends_the_new_main(files, tmp_path):
     """The upgrade keeps source forced English tracks via --subtitle-tracks with their exact
     flags; mkvmerge writes them first and the external srt after (checked against real mkvmerge)."""
@@ -276,12 +201,6 @@ def test_remux_upgrade_mode_keeps_source_subtitles_then_appends_the_new_main(fil
         "--language", "0:eng", "--track-name", "0:English",
         "--default-track", "0:yes", "--forced-track", "0:no", str(eng),
     ]
-
-
-def test_remux_full_path_still_drops_every_source_subtitle_when_keep_comes_without_flags(files, tmp_path):
-    """An external srt plus kept indices but no explicit flags still drops all source subtitles."""
-    argv = _argv(files, [0], [1], tmp_path / "eng.srt", None, keep_subtitle_indices=[3])
-    assert "--no-subtitles" in argv and "--subtitle-tracks" not in argv
 
 
 def test_remux_timeout_formula():

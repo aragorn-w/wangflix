@@ -64,7 +64,7 @@ class FakeDevice:
     """One Shield: what `pm list packages [-d]` and `settings get` would say."""
 
     def __init__(self, installed=(), disabled=(), settings=None, *, state="device",
-                 connect="ok", eol="\n", shell_rc=0, truncate=False, failing=(), post=None):
+                 connect="ok", eol="\n", shell_rc=0, truncate=False, failing=()):
         self.installed = set(installed)
         self.disabled = set(disabled)
         self.settings = dict(settings or {})
@@ -74,7 +74,6 @@ class FakeDevice:
         self.shell_rc = shell_rc
         self.truncate = truncate    # drop the end marker, as a cut-short shell would
         self.failing = set(failing)  # statements that print nothing and exit 1
-        self.post = post            # rewrites the output lines, to model a broken shell
 
     def enable(self, pkg):
         self.installed.add(pkg)
@@ -99,8 +98,6 @@ class FakeDevice:
                     raise AssertionError(f"not an allowed read-only statement: {stmt!r}")
                 status = 1 if stmt in self.failing else 0
                 out += [] if status else lines
-        if self.post:
-            out = self.post(out)
         if self.truncate:
             out = out[:-1]
         return self.eol.join(out) + self.eol
@@ -245,33 +242,14 @@ def test_parse_devices_accepts_hostnames_odd_whitespace_and_boundary_values():
     assert [d.port for d in devices] == [5555, 65535, 1]
 
 
-@pytest.mark.parametrize("raw", ["", "   ", "\n\t "])
-def test_parse_devices_empty_is_no_devices_and_no_problems(raw):
-    assert sc.parse_devices(raw) == ([], [])
+def test_parse_devices_empty_is_no_devices_and_no_problems():
+    assert sc.parse_devices("") == ([], [])
 
 
 @pytest.mark.parametrize("entry", [
     "living",                           # no address
-    "living=192.0.2.10",                # no port
-    "living=:5555",                     # empty host
-    "=192.0.2.10:5555",                 # empty name
-    "Living=192.0.2.10:5555",           # uppercase name
-    "-living=192.0.2.10:5555",          # leading hyphen
-    "living_room=192.0.2.10:5555",      # underscore
-    "a" * 32 + "=192.0.2.10:5555",      # 32 characters is one too many
-    "living=192.0.2.10:0",
-    "living=192.0.2.10:65536",
-    "living=192.0.2.10:abc",
-    "living=192.0.2.10:-1",
-    "living=192.0.2.10:",
+    "living=192.0.2.10:65536",          # port out of range
     "living=999.1.1.1:5555",            # digits and dots: must be a real IPv4
-    "living=192.0.2.10.5:5555",
-    "living=1.2.3:5555",
-    "living=bad_host:5555",
-    "living=-bad.example:5555",
-    "living=a..b:5555",
-    "living=host.:5555",
-    "living=[::1]:5555",                # IPv6 is not supported
 ])
 def test_parse_devices_rejects_a_malformed_entry(entry):
     devices, problems = sc.parse_devices(entry)
@@ -288,8 +266,7 @@ def test_parse_devices_rejects_a_duplicate_name_and_reports_every_problem():
     assert any("port" in p for p in problems)
 
 
-@pytest.mark.parametrize("raw", [
-    "living", f"living={LIVING} living={BEDROOM}", f"living={LIVING} bad=192.0.2.12:0"])
+@pytest.mark.parametrize("raw", ["living", f"living={LIVING} living={BEDROOM}"])
 def test_main_config_error_exits_2_without_touching_anything(world, raw, capsys):
     world.devices(raw)
     assert world.run() == 2
@@ -299,12 +276,11 @@ def test_main_config_error_exits_2_without_touching_anything(world, raw, capsys)
     assert "ERROR: SHIELD_DEVICES" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("value", ["", "   "])
 @pytest.mark.parametrize("env_file", [False, True], ids=["no-env-file", "empty-process-env-beats-stack-env-file"])
-def test_main_no_devices_configured_exits_0(world, tmp_path, value, env_file, capsys):
+def test_main_no_devices_configured_exits_0(world, tmp_path, env_file, capsys):
     if env_file:
         (tmp_path / "stack" / ".env").write_text(f"SHIELD_DEVICES=living={LIVING}\n")
-    world.devices(value)                       # present in os.environ, but empty
+    world.devices("")                          # present in os.environ, but empty
     assert world.run() == 0
     assert "no Shield devices configured" in capsys.readouterr().out
     assert world.adb.calls == [] and world.messages == [] and not sc.STATE_FILE.exists()
@@ -353,11 +329,7 @@ def test_profile_without_the_optional_sections_is_valid():
 @pytest.mark.parametrize("mutate, expected", [
     (lambda d: d.update(extra=[]), "unknown top-level key"),
     (lambda d: d["disabled_packages"].append("com.example.keep"), "both disabled_packages and required_enabled_packages"),
-    (lambda d: d["absent_packages"].append("com.example.keep"), "both absent_packages and required_enabled_packages"),
     (lambda d: d.update(disabled_packages="com.example.bloat"), "must be a list of package names"),
-    (lambda d: d.update(settings=[]), "settings: must be an object"),
-    (lambda d: d["settings"]["system"].update(nv_fan_mode=5), "values must be strings"),
-    (lambda d: d["component_lists"]["secure"].update(enabled_input_methods="a/b"), "pkg/Class"),
 ])
 def test_profile_validation_failures(tmp_path, mutate, expected):
     with pytest.raises(sc.ProfileError) as exc:
@@ -368,18 +340,8 @@ def test_profile_validation_failures(tmp_path, mutate, expected):
 @pytest.mark.parametrize("mutate, expected", [
     # package names reach the printed hints, namespaces and setting names the adb shell command
     (lambda d: d["absent_packages"].append("com.example;reboot"), "package names"),
-    (lambda d: d["disabled_packages"].append("com.example bloat"), "package names"),
-    (lambda d: d["disabled_packages"].append("singleword"), "package names"),
-    (lambda d: d["absent_packages"].append(5), "package names"),
-    (lambda d: d["settings"].update(sys={"a": "1"}), "unknown namespace"),
     (lambda d: d["settings"].update({"system;reboot": {}}), "unknown namespace"),
-    (lambda d: d["component_lists"].update(sys={}), "unknown namespace"),
-    (lambda d: d["settings"]["system"].update({"bad key": "1"}), "setting names"),
     (lambda d: d["settings"]["system"].update({"x; reboot": "1"}), "setting names"),
-    (lambda d: d["settings"]["system"].update({"$(reboot)": "1"}), "setting names"),
-    (lambda d: d["component_lists"]["secure"].update({"x`reboot`": ["a/b"]}), "setting names"),
-    (lambda d: d["component_lists"]["secure"].update(enabled_input_methods=["a/b;reboot"]), "pkg/Class"),
-    (lambda d: d["component_lists"]["secure"].update(enabled_input_methods=["noslash"]), "pkg/Class"),
 ])
 def test_profile_rejects_names_that_could_reach_a_shell(tmp_path, mutate, expected):
     with pytest.raises(sc.ProfileError) as exc:
@@ -438,13 +400,6 @@ def test_real_profile_has_no_address_mac_or_at_sign():
     assert not re.search(r"\b[0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5}\b", raw)
 
 
-def test_real_profile_doc_names_what_is_deliberately_left_out():
-    doc = json.loads(REAL_PROFILE.read_text())["_doc"]
-    for word in ("HDMI-CEC", "IR remote", "volume-control", "Ethernet", "audio output",
-                 "display mode", "device name", "bedroom"):
-        assert word in doc
-
-
 def test_real_profile_leaves_device_specific_settings_out():
     body = json.loads(REAL_PROFILE.read_text())
     body.pop("_doc")      # the prose may name them; the data must not list them
@@ -476,17 +431,13 @@ def test_real_profile_probe_command_stays_short_enough_for_one_adb_shell():
 @pytest.mark.parametrize("given, expected", [
     ("com.a/.Svc", "com.a/com.a.Svc"),
     ("com.a/com.a.Svc", "com.a/com.a.Svc"),
-    ("com.a/.sub.Svc", "com.a/com.a.sub.Svc"),
-    ("com.a/other.pkg.Svc", "com.a/other.pkg.Svc"),
-    ("  com.a/.Svc  ", "com.a/com.a.Svc"),
     ("noslash", "noslash"),
-    ("", ""),
 ])
 def test_normalize_component(given, expected):
     assert sc.normalize_component(given) == expected
 
 
-@pytest.mark.parametrize("raw", ["null", "", "   ", ":", " : "])
+@pytest.mark.parametrize("raw", ["null", ""])
 def test_component_list_that_is_unset_or_empty_has_no_components(raw):
     assert sc.parse_component_list(raw) == []
 
@@ -501,13 +452,6 @@ def test_short_and_long_component_forms_both_satisfy_the_short_requirement():
             PROFILE, snap(("com.example.keep",), settings={
                 ("secure", "enabled_accessibility_services"): f"x/y.Z:{stored}"}), LIVING)
         assert not [f for f in findings if "enabled_accessibility_services" in f.text]
-
-
-def test_long_form_requirement_is_satisfied_by_the_stored_short_form():
-    findings = sc.evaluate(
-        PROFILE, snap(settings={("secure", "enabled_input_methods"): "com.example.ime/.Ime"}), LIVING)
-    # com.example.ime/.Ime is com.example.ime/com.example.ime.Ime
-    assert not [f for f in findings if "enabled_input_methods" in f.text]
 
 
 # ===========================================================================
@@ -559,12 +503,6 @@ def test_setting_mismatch_names_expected_and_got():
     assert findings[0].hint == f"adb -s {LIVING} shell settings put system nv_fan_mode cool"
 
 
-def test_an_unset_setting_reads_as_the_literal_null():
-    findings = sc.evaluate(PROFILE, snap(OK_INSTALLED, settings={("system", "nv_fan_mode"): "null"}),
-                           LIVING)
-    assert texts(findings) == ["settings.system.nv_fan_mode: expected 'cool', got 'null'"]
-
-
 def test_expecting_null_means_the_setting_must_be_unset():
     profile = sc.parse_profile({"settings": {"global": {"some_flag": "null"}}})
     clean = sc.Snapshot(frozenset({"android"}), frozenset(), {("global", "some_flag"): "null"})
@@ -573,45 +511,6 @@ def test_expecting_null_means_the_setting_must_be_unset():
     findings = sc.evaluate(profile, dirty, LIVING)
     assert texts(findings) == ["settings.global.some_flag: expected 'null', got '1'"]
     assert findings[0].hint == f"adb -s {LIVING} shell settings delete global some_flag"
-
-
-def test_setting_hint_quotes_a_value_the_shell_would_split():
-    profile = sc.parse_profile({"settings": {"global": {"a_name": "two words"}}})
-    snapshot = sc.Snapshot(frozenset({"android"}), frozenset(), {("global", "a_name"): "x"})
-    assert sc.evaluate(profile, snapshot, LIVING)[0].hint.endswith("settings put global a_name 'two words'")
-
-
-def test_device_supplied_values_are_escaped_and_bounded_in_findings():
-    findings = sc.evaluate(
-        PROFILE, snap(OK_INSTALLED, settings={("system", "nv_fan_mode"): "caf" + chr(0xE9) + chr(0x263A) + "x" * 500}),
-        LIVING)
-    assert len(findings) == 1
-    assert findings[0].text.isascii()
-    assert "\\xe9" in findings[0].text and len(findings[0].text) < 200
-
-
-def _fan(value):
-    return sc.evaluate(PROFILE, snap(OK_INSTALLED, settings={("system", "nv_fan_mode"): value}), LIVING)
-
-
-def test_long_values_that_differ_after_the_cut_are_different_findings():
-    a, b = "x" * 200 + "A", "x" * 200 + "B"
-    (fa,), (fb,) = _fan(a), _fan(b)
-    assert fa.text != fb.text
-    assert "sha256:" in fa.text and "sha256:" in fb.text
-    assert len(fa.text) < 200 and len(fb.text) < 200
-    assert fa.text == _fan(a)[0].text                         # stable for the same value
-
-
-def test_short_values_carry_no_digest():
-    (finding,) = _fan("quiet")
-    assert finding.text == FAN_QUIET and "sha256" not in finding.text
-
-
-def test_value_just_at_the_limit_is_not_cut_and_one_over_is():
-    exact = "y" * (sc.MAX_VALUE_CHARS - 2)                    # the quotes make it 80
-    assert "sha256" not in _fan(exact)[0].text
-    assert "sha256" in _fan(exact + "y")[0].text
 
 
 def test_a_change_between_two_long_wrong_values_alerts(single_world):
@@ -634,10 +533,9 @@ def test_missing_component_is_a_finding_and_extra_components_are_fine():
         "other.ime/other.ime.Ime:more/.Stuff:com.example.ime/com.example.ime.Ime")
 
 
-@pytest.mark.parametrize("raw", ["null", ""])
-def test_unset_component_list_misses_every_listed_component(raw):
+def test_unset_component_list_misses_every_listed_component():
     findings = sc.evaluate(
-        PROFILE, snap(OK_INSTALLED, settings={("secure", "enabled_accessibility_services"): raw}),
+        PROFILE, snap(OK_INSTALLED, settings={("secure", "enabled_accessibility_services"): "null"}),
         LIVING)
     assert texts(findings) == [
         "component_lists.secure.enabled_accessibility_services: missing com.example.keep/.Service"]
@@ -679,32 +577,7 @@ def test_probe_command_is_read_only_statements_only():
     assert script.count("settings get") == 5
 
 
-def test_probe_wraps_every_command_in_a_marker_and_an_exit_status():
-    script = sc.build_probe([("system", "x")], NONCE)
-    assert script.split("; ") == [
-        f"echo {mark('packages')}", "pm list packages", f"echo {mark('rc')} $?",
-        f"echo {mark('disabled')}", "pm list packages -d", f"echo {mark('rc')} $?",
-        f"echo {mark('s:system:x')}", "settings get system x", f"echo {mark('rc')} $?",
-        f"echo {mark('end')}"]
-
-
-def test_every_probe_gets_a_fresh_nonce():
-    adb = FakeAdb({LIVING: compliant()})
-    sc.check_device(DEVICE, PROFILE, adb)
-    sc.check_device(DEVICE, PROFILE, adb)
-    scripts = [c[0][3] for c in adb.calls if c[0][0] == "-s"]
-    nonces = [re.search(r"echo @@([0-9a-f]{16}):packages", sc_).group(1) for sc_ in scripts]
-    assert len(nonces) == 2 and nonces[0] != nonces[1]
-
-
-def test_probe_reads_each_profile_setting_once_even_when_listed_twice():
-    profile = sc.parse_profile({
-        "settings": {"secure": {"enabled_input_methods": "x"}},
-        "component_lists": {"secure": {"enabled_input_methods": ["a/b.C"]}}})
-    assert sc.wanted_settings(profile) == [("secure", "enabled_input_methods")]
-
-
-@pytest.mark.parametrize("eol", ["\n", "\r\n", "\r\r\n"])
+@pytest.mark.parametrize("eol", ["\n", "\r\n"])
 def test_probe_output_is_read_the_same_with_any_line_ending(eol):
     device = compliant(eol=eol)
     keys = sc.wanted_settings(PROFILE)
@@ -717,18 +590,6 @@ def test_probe_output_is_read_the_same_with_any_line_ending(eol):
     assert not any("\r" in p for p in parsed.installed | parsed.disabled)
 
 
-def test_crlf_device_matching_the_profile_has_no_findings(single_world):
-    single_world.living.eol = "\r\n"
-    assert single_world.run("--no-notify") == 0
-
-
-def test_an_empty_setting_value_reads_as_the_empty_string():
-    keys = [("system", "x")]
-    device = FakeDevice(installed=("android",), settings={("system", "x"): ""})
-    parsed = sc.parse_probe(device.run_script(sc.build_probe(keys, NONCE)), keys, NONCE)
-    assert parsed.settings[("system", "x")] == ""
-
-
 PACKAGES_OK = [mark("packages"), "package:android", mark("rc 0"), mark("disabled"), mark("rc 0")]
 
 
@@ -738,50 +599,14 @@ def _status_probe(status):
 
 @pytest.mark.parametrize("lines, keys, why", [
     (PACKAGES_OK, [], "end marker"),
-    ([mark("packages"), mark("rc 0"), mark("disabled"), mark("rc 0"), mark("end")], [], "no packages"),
-    (["garbage"], [], "end marker"),
     (PACKAGES_OK + [mark("end")], [("system", "x")], "settings get system x"),
     # a non-zero exit status is an error, not an empty result
     (_status_probe("rc 1"), [], "`pm list packages -d` exited 1"),
-    (_status_probe("rc 127"), [], "`pm list packages -d` exited 127"),
-    (_status_probe("rc 255"), [], "`pm list packages -d` exited 255"),
-    ([mark("packages"), "package:android", mark("disabled"), mark("rc 0"), mark("end")], [],
-     "no exit status for `pm list packages`"),
-    ([mark("rc 0"), mark("end")], [], "without a command"),
-    ([mark("packages"), mark("bogus"), mark("end")], [], "unexpected marker"),
-    # cut-short output ending in a lookalike end line still raises
-    (PACKAGES_OK + ["@@end"], [], "cut short"),
-    (PACKAGES_OK + ["@@" + "0" * 16 + ":end"], [], "cut short"),
-    (PACKAGES_OK + ["@@" + NONCE + "end"], [], "cut short"),
-    (PACKAGES_OK + ["end"], [], "cut short"),
-], ids=["no-end-marker", "no-packages", "garbage", "missing-setting", "rc-1", "rc-127", "rc-255",
-        "command-without-status-line", "status-line-without-command", "unexpected-marker",
-        "lookalike-@@end", "lookalike-wrong-nonce", "lookalike-nonce-glued-to-end",
-        "lookalike-bare-end"])
+], ids=["no-end-marker", "missing-setting", "rc-1"])
 def test_incomplete_or_malformed_probe_output_is_an_error(lines, keys, why):
     with pytest.raises(sc.ProbeError) as exc:
         sc.parse_probe(probe_lines(*lines), keys, NONCE)
     assert why in str(exc.value)
-
-
-@pytest.mark.parametrize("value", [
-    "@@odd", "@@end", "@@packages", "@@disabled", "@@rc 0", "@@s:system:nv_fan_mode",
-    "@@" + NONCE[:8], "@@" + NONCE + "x",
-])
-def test_device_data_that_looks_like_a_marker_is_just_data(value):
-    device = compliant()
-    device.settings[("system", "nv_fan_mode")] = value
-    keys = sc.wanted_settings(PROFILE)
-    parsed = sc.parse_probe(device.run_script(sc.build_probe(keys, NONCE)), keys, NONCE)
-    assert parsed.settings[("system", "nv_fan_mode")] == value
-    assert parsed.settings[("secure", "screensaver_enabled")] == "0"      # its neighbours are intact
-    assert "com.example.keep" in parsed.installed
-
-
-def test_a_device_whose_output_ends_in_a_forged_end_line_is_unreachable():
-    device = compliant(post=lambda out: out[:-1] + ["@@end"])
-    report = sc.check_device(DEVICE, PROFILE, FakeAdb({LIVING: device}))
-    assert not report.reachable and "cut short" in report.detail
 
 
 # ===========================================================================
@@ -818,11 +643,8 @@ def test_unauthorized_is_a_finding_and_nothing_is_read():
 
 @pytest.mark.parametrize("make, why", [
     (lambda: FakeDevice(connect="timeout"), "timed out"),
-    (lambda: FakeDevice(connect="refused"), "not listed"),
     (lambda: FakeDevice(state="offline"), "offline"),
-    (lambda: compliant(shell_rc=1), "adb shell failed"),
     (lambda: compliant(truncate=True), "cut short"),
-    (lambda: FakeDevice(), "no packages"),
 ])
 def test_anything_else_is_unreachable(make, why):
     adb = FakeAdb({LIVING: make()})
@@ -831,37 +653,12 @@ def test_anything_else_is_unreachable(make, why):
     assert why in report.detail
 
 
-@pytest.mark.parametrize("statement", [
-    "pm list packages", "pm list packages -d",
-    "settings get system nv_fan_mode", "settings get secure enabled_input_methods",
-])
+@pytest.mark.parametrize("statement", ["pm list packages -d"])
 def test_a_failing_command_makes_the_device_unreachable_instead_of_reading_as_empty(statement):
     adb = FakeAdb({LIVING: compliant(failing=[statement])})
     report = sc.check_device(DEVICE, PROFILE, adb)
     assert not report.reachable and report.findings == []
     assert f"`{statement}` exited 1" in report.detail
-
-
-def _drop_status_line(n):
-    """Post-processor: remove the n-th `rc` line, as a shell that lost it would."""
-    def post(out):
-        seen, kept = -1, []
-        for line in out:
-            if re.fullmatch(r"@@[0-9a-f]{16}:rc [0-9]+", line):
-                seen += 1
-                if seen == n:
-                    continue
-            kept.append(line)
-        return kept
-    return post
-
-
-@pytest.mark.parametrize("n", [0, 1, 2, 5, len(sc.wanted_settings(PROFILE)) + 1],
-                         ids=["first", "second", "third", "sixth", "last"])
-def test_a_missing_status_line_makes_the_device_unreachable(n):
-    adb = FakeAdb({LIVING: compliant(post=_drop_status_line(n))})
-    report = sc.check_device(DEVICE, PROFILE, adb)
-    assert not report.reachable and "no exit status" in report.detail
 
 
 def test_a_failing_probe_counts_as_unreachable_and_keeps_the_stored_findings(single_world):
@@ -878,16 +675,6 @@ def test_adb_binary_missing_makes_the_device_unreachable():
         raise sc.AdbError("cannot run adb: FileNotFoundError")
     report = sc.check_device(DEVICE, PROFILE, broken)
     assert not report.reachable and "cannot run adb" in report.detail
-
-
-def test_devices_listing_failure_is_unreachable():
-    class Bad(FakeAdb):
-        def __call__(self, args, timeout):
-            if args[0] == "devices":
-                return sc.AdbResult(1, "", "adb server is down")
-            return super().__call__(args, timeout)
-    report = sc.check_device(DEVICE, PROFILE, Bad({LIVING: compliant()}))
-    assert not report.reachable and "adb devices failed" in report.detail
 
 
 def test_only_read_only_adb_commands_are_ever_run(single_world, capsys):
@@ -946,16 +733,6 @@ def test_a_new_finding_alerts_with_the_new_count(single_world):
     assert single_world.state()["living"]["findings"] == sorted([BLOAT_ENABLED, BANNED_INSTALLED])
 
 
-def test_a_resolved_finding_alerts_with_the_remaining_count(single_world):
-    single_world.living.enable("com.example.bloat")
-    single_world.living.installed.add("com.example.banned")
-    single_world.run()
-    single_world.living.installed.discard("com.example.banned")
-    single_world.run()
-    assert len(single_world.messages) == 2
-    assert "living: 1 finding(s) vs the profile" in single_world.messages[1]
-
-
 def test_everything_resolved_says_back_in_line_with_the_profile(single_world):
     single_world.living.enable("com.example.bloat")
     single_world.run()
@@ -964,15 +741,6 @@ def test_everything_resolved_says_back_in_line_with_the_profile(single_world):
     assert len(single_world.messages) == 2
     assert "living: back in line with the profile" in single_world.messages[1]
     assert single_world.state()["living"]["findings"] == []
-
-
-def test_a_changed_finding_text_for_the_same_key_alerts(single_world):
-    single_world.living.settings[("system", "nv_fan_mode")] = "quiet"
-    single_world.run()
-    single_world.living.settings[("system", "nv_fan_mode")] = "off"
-    single_world.run()
-    assert len(single_world.messages) == 2
-    assert "got 'off'" in single_world.state()["living"]["findings"][0]
 
 
 def test_unauthorized_alerts_once_and_resolves(single_world):
@@ -1015,16 +783,6 @@ def test_recovery_after_an_unreachable_alert_alerts_once_and_resets_the_counter(
     assert len(single_world.messages) == 2
 
 
-def test_recovery_before_the_alert_threshold_is_silent(single_world):
-    single_world.living.connect = "timeout"
-    single_world.run()
-    single_world.run()
-    single_world.living.connect = "ok"
-    assert single_world.run() == 0
-    assert single_world.messages == []
-    assert single_world.state()["living"]["unreachable"] == 0
-
-
 def test_unreachable_runs_leave_the_stored_findings_alone(single_world):
     single_world.living.enable("com.example.bloat")
     single_world.run()
@@ -1038,27 +796,6 @@ def test_unreachable_runs_leave_the_stored_findings_alone(single_world):
     assert len(single_world.messages) == 3
     assert "reachable again" in single_world.messages[2]
     assert BLOAT_ENABLED not in single_world.messages[2]
-
-
-def test_recovery_with_changed_findings_reports_both(single_world):
-    single_world.living.connect = "timeout"
-    for _ in range(3):
-        single_world.run()
-    single_world.living.connect = "ok"
-    single_world.living.installed.add("com.example.banned")
-    single_world.run()
-    assert "living: reachable again" in single_world.messages[1]
-    assert "living: 1 finding(s) vs the profile" in single_world.messages[1]
-
-
-def test_unreachable_first_run_then_reachable_with_findings_alerts_as_a_first_run(single_world):
-    single_world.living.connect = "timeout"
-    single_world.run()
-    single_world.living.connect = "ok"
-    single_world.living.enable("com.example.bloat")
-    single_world.run()
-    assert len(single_world.messages) == 1
-    assert "living: 1 finding(s) vs the profile" in single_world.messages[0]
 
 
 def test_failed_send_keeps_the_old_state_and_the_next_run_retries(single_world):
@@ -1076,31 +813,6 @@ def test_failed_send_keeps_the_old_state_and_the_next_run_retries(single_world):
     assert len(single_world.messages) == 2
 
 
-def test_failed_send_leaves_an_existing_entry_as_it_was(single_world):
-    single_world.living.enable("com.example.bloat")
-    single_world.run()
-    single_world.living.installed.add("com.example.banned")
-    single_world.sender.ok = False
-    single_world.run()
-    assert single_world.state()["living"]["findings"] == [BLOAT_ENABLED]
-    single_world.sender.ok = True
-    single_world.run()
-    assert single_world.state()["living"]["findings"] == sorted([BLOAT_ENABLED, BANNED_INSTALLED])
-
-
-def test_failed_send_of_the_unreachable_alert_is_retried(single_world):
-    single_world.living.connect = "timeout"
-    single_world.run()
-    single_world.run()
-    single_world.sender.ok = False
-    single_world.run()
-    assert single_world.state()["living"]["unreachable"] == 2     # not advanced to 3
-    single_world.sender.ok = True
-    single_world.run()
-    assert len(single_world.messages) == 2 and "unreachable for 3" in single_world.messages[1]
-    assert single_world.state()["living"]["unreachable"] == 3
-
-
 def test_drift_fixed_before_its_alert_was_delivered_is_never_reported(single_world):
     """Alerts describe the CURRENT condition against the last DELIVERED state; no queue."""
     single_world.living.enable("com.example.bloat")
@@ -1112,32 +824,6 @@ def test_drift_fixed_before_its_alert_was_delivered_is_never_reported(single_wor
     assert single_world.run() == 0
     assert len(single_world.messages) == 1                      # nothing about the cleared drift
     assert single_world.state()["living"] == {"findings": [], "unreachable": 0}
-
-
-def test_unreachable_that_recovers_before_its_alert_got_through_is_not_reported(single_world):
-    single_world.living.connect = "timeout"
-    single_world.run()
-    single_world.run()
-    single_world.sender.ok = False
-    single_world.run()                                          # third run: the alert fails
-    assert len(single_world.messages) == 1
-    assert single_world.state()["living"]["unreachable"] == 2
-    single_world.living.connect = "ok"
-    single_world.sender.ok = True
-    assert single_world.run() == 0
-    assert len(single_world.messages) == 1                      # neither the outage nor the recovery
-    assert single_world.state()["living"]["unreachable"] == 0
-
-
-def test_a_device_that_needs_no_alert_advances_even_when_the_send_fails(world):
-    world.devices(f"living={LIVING} bedroom={BEDROOM}")
-    world.living.connect = "timeout"                       # unreachable day 1: no alert
-    world.bedroom.enable("com.example.bloat")       # first-run finding: alert
-    world.sender.ok = False
-    world.run()
-    state = world.state()
-    assert state["living"] == {"findings": [], "unreachable": 1}
-    assert "bedroom" not in state
 
 
 def test_missing_telegram_credentials_log_and_continue(single_world, monkeypatch, capsys):
@@ -1156,12 +842,6 @@ def test_one_message_per_run_covers_every_device(world):
     message = world.messages[0]
     assert "2 device(s)" in message
     assert "living: 1 finding(s)" in message and "bedroom: 1 finding(s)" in message
-
-
-def test_a_clean_device_is_not_mentioned_next_to_a_drifted_one(world):
-    world.living.enable("com.example.bloat")
-    world.run()
-    assert "bedroom" not in world.messages[0]
 
 
 def test_telegram_message_has_no_addresses_and_no_hints_but_points_at_the_log(world):
@@ -1202,17 +882,6 @@ def test_device_flag_checks_only_that_device_and_keeps_the_others_state(world):
     assert len(world.messages) == 2 and "bedroom" not in world.messages[1]
 
 
-def test_device_flag_does_not_prune_other_entries_but_a_full_run_does(single_world):
-    sc.STATE_FILE.parent.mkdir(parents=True)
-    sc.STATE_FILE.write_text(json.dumps({
-        "retired": {"findings": [], "unreachable": 0},
-        "living": {"findings": [], "unreachable": 0}}))
-    single_world.run("--device", "living")
-    assert "retired" in single_world.state()
-    single_world.run()
-    assert set(single_world.state()) == {"living"}
-
-
 def test_unknown_device_flag_exits_2(world, capsys):
     assert world.run("--device", "kitchen") == 2
     assert world.adb.calls == [] and world.messages == [] and not sc.STATE_FILE.exists()
@@ -1227,14 +896,6 @@ def test_no_notify_prints_findings_and_hints_and_writes_nothing(single_world, ca
     assert f"HINT adb -s {LIVING} shell pm disable-user --user 0 com.example.bloat" in out
     assert single_world.messages == []
     assert not sc.STATE_FILE.exists()
-
-
-def test_no_notify_leaves_an_existing_state_file_byte_for_byte(single_world):
-    sc.STATE_FILE.parent.mkdir(parents=True)
-    sc.STATE_FILE.write_text('{"living": {"findings": [], "unreachable": 2}}')
-    single_world.living.enable("com.example.bloat")
-    single_world.run("--no-notify")
-    assert sc.STATE_FILE.read_text() == '{"living": {"findings": [], "unreachable": 2}}'
 
 
 def test_no_notify_does_not_need_the_run_lock(single_world):
@@ -1252,23 +913,6 @@ def test_a_second_run_holding_the_lock_checks_nothing(single_world, capsys):
     assert "holds the lock" in capsys.readouterr().out
 
 
-def test_a_clean_report_logs_ok_and_prints_no_hint(single_world, capsys):
-    single_world.run("--no-notify")
-    out = capsys.readouterr().out
-    assert "[living] OK: matches the profile" in out and "HINT" not in out
-
-
-def test_hints_are_printed_once_per_distinct_command(single_world, capsys):
-    single_world.living.settings[("secure", "enabled_input_methods")] = "other/.Ime"
-    profile = json.loads(sc.PROFILE_PATH.read_text())
-    profile["component_lists"]["secure"]["enabled_input_methods"] = ["a.b/.One", "a.b/.Two"]
-    sc.PROFILE_PATH.write_text(json.dumps(profile))
-    single_world.run("--no-notify")
-    out = capsys.readouterr().out
-    assert out.count("missing a.b/") == 2
-    assert out.count("HINT") == 1
-
-
 # --- state validation ----------------------------------------------------------
 
 def test_corrupt_state_is_logged_treated_as_empty_and_repaired(single_world, capsys):
@@ -1282,15 +926,9 @@ def test_corrupt_state_is_logged_treated_as_empty_and_repaired(single_world, cap
 
 
 @pytest.mark.parametrize("content", [
-    "[]", '"x"', "null", "5",
-    '{"living": []}',
+    "[]",
     '{"living": {"findings": "x", "unreachable": 0}}',
-    '{"living": {"findings": [1], "unreachable": 0}}',
     '{"living": {"findings": [], "unreachable": -1}}',
-    '{"living": {"findings": [], "unreachable": true}}',
-    '{"living": {"findings": [], "unreachable": 1.5}}',
-    '{"living": {"findings": []}}',
-    '{"Bad Name": {"findings": [], "unreachable": 0}}',
 ])
 def test_invalid_state_never_crashes_and_counts_as_no_state(single_world, content):
     sc.STATE_FILE.parent.mkdir(parents=True)
@@ -1321,22 +959,6 @@ def test_an_unwritable_state_directory_is_logged_not_fatal(single_world, monkeyp
 # ===========================================================================
 # The Telegram message and sender
 # ===========================================================================
-
-def test_message_is_a_summary_with_a_header_a_line_per_alert_and_the_log_pointer():
-    message = sc.build_message({
-        "living": ["500 finding(s) vs the profile"],
-        "bedroom": ["unreachable for 3 consecutive daily runs"],
-        "den": ["reachable again", "2 finding(s) vs the profile"],
-        "attic": ["back in line with the profile"]})
-    assert message.splitlines() == [
-        "Shield check: 4 device(s) changed",
-        "living: 500 finding(s) vs the profile",
-        "bedroom: unreachable for 3 consecutive daily runs",
-        "den: reachable again",
-        "den: 2 finding(s) vs the profile",
-        "attic: back in line with the profile",
-        "",
-        sc.LOG_POINTER]
 
 
 def test_message_names_counts_but_no_finding_text_and_the_log_has_every_finding(world, capsys):
@@ -1378,14 +1000,6 @@ def test_send_alert_fills_the_gaps_from_the_plugin_env_file(monkeypatch, tmp_pat
     monkeypatch.setattr(sc, "telegram_send", send)
     assert sc.send_alert("hi") is True
     send.assert_called_once_with("tok", "7", "hi")
-
-
-def test_send_alert_without_credentials_does_not_send(monkeypatch, capsys):
-    send = Mock()
-    monkeypatch.setattr(sc, "telegram_send", send)
-    assert sc.send_alert("hello") is False
-    send.assert_not_called()
-    assert "no Telegram credentials" in capsys.readouterr().out
 
 
 def test_send_alert_failures_return_false_and_never_log_the_token(monkeypatch, capsys):

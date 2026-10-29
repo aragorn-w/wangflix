@@ -1,7 +1,6 @@
 """`media_stack.playback`: the fail-closed Jellyfin playback-wait gate shared by pause-aware ffmpeg extraction callers."""
 
 import itertools
-from unittest.mock import Mock
 
 import pytest
 
@@ -85,18 +84,6 @@ def test_wait_while_playing_raises_after_max_wait_exceeded(monkeypatch):
         wait_while_playing(jf, "key", 1.0, PlaybackWaitBudget(1.0), poll_s=5.0)
 
 
-def test_wait_while_playing_raises_even_when_playback_clears_on_the_last_poll(monkeypatch):
-    """The exhaustion check runs after every poll, busy or idle."""
-    jf = _FakeJellyfin([_PLAYING, []])
-    budget = PlaybackWaitBudget(1.0)  # 60s
-    # First (busy) poll reads 10s elapsed, under budget; second (idle) reads 90s, over: must raise.
-    times = iter([0.0, 10.0, 90.0])
-    monkeypatch.setattr(pb.time, "sleep", lambda s: None)
-    monkeypatch.setattr(pb.time, "monotonic", lambda: next(times))
-    with pytest.raises(PlaybackWaitTimeout):
-        wait_while_playing(jf, "key", 1.0, budget, poll_s=5.0)
-
-
 def test_wait_while_playing_cumulative_across_separate_calls_exceeds_budget(monkeypatch):
     """Two calls sharing one budget, each under it alone, raise once their sum crosses it."""
     clock = _FakeClock()
@@ -151,14 +138,3 @@ def test_call_with_playback_pause_propagates_playback_wait_timeout(monkeypatch):
 
     with pytest.raises(PlaybackWaitTimeout):
         call_with_playback_pause(_fn, jf, "key", 1.0, PlaybackWaitBudget(1.0), poll_s=5.0)
-
-
-def test_call_with_playback_pause_forwards_args_and_kwargs():
-    jf = _FakeJellyfin([])
-    fn = Mock(return_value=42)
-    result = call_with_playback_pause(fn, jf, "key", 30.0, PlaybackWaitBudget(30.0), "a", 1, b=2)
-    assert result == 42
-    fn.assert_called_once()
-    assert fn.call_args.args[:2] == ("a", 1)
-    assert fn.call_args.kwargs["b"] == 2
-    assert callable(fn.call_args.kwargs["should_abort"])

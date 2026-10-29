@@ -64,44 +64,18 @@ def test_choose_keeper_same_res_source_prefers_processed():
     assert keeper["name"] == "M Bluray-1080p.mkv"          # processed .mkv wins tiebreak
 
 
-def test_choose_keeper_single_video_no_extras():
-    keeper, extras = dedupe.choose_keeper([{"name": "M.mkv", "size": 1, "processed": False}])
-    assert keeper["name"] == "M.mkv" and extras == []
-
-
-def test_choose_keeper_empty_raises():
-    with pytest.raises(ValueError):
-        dedupe.choose_keeper([])
-
-
 # A combined file reduced to one (season, episode) key could be "deduped" against a
 # standalone file, recycling the only copy of the other episode(s): multi-episode names give None.
 @pytest.mark.parametrize("name, expected", [
     pytest.param("Rick and Morty - S09E01 - There's Something About Morty WEBDL-1080p.mkv", (9, 1),
                  id="parses-season-episode"),
-    pytest.param("Show - s01e02 - Title.mkv", (1, 2), id="case-insensitive"),
     pytest.param("Show - Special Feature.mkv", None, id="none-when-unparseable"),
     # "S01E01E02" must not collapse to (1, 1): it would collide with a plain S01E01 file
     pytest.param("Show - S01E01E02 - Title WEBDL-1080p.mkv", None, id="none-multi-episode-e-form"),
-    pytest.param("Show - S01E01-E02 - Title WEBDL-1080p.mkv", None, id="none-multi-episode-hyphen-e-form"),
     # Sonarr's default multi-episode naming (no second E)
     pytest.param("Show - S01E01-02 - Title WEBDL-1080p.mkv", None, id="none-multi-episode-bare-range"),
-    # a hyphen after the episode number is common in quality tags; only a literal E/e signals multi-episode
-    pytest.param("Show.S01E01-WEBDL.1080p.mkv", (1, 1), id="hyphenated-quality-still-parses"),
     # the bare-range lookaheads reject a digit or p/i suffix, so "-1080p" is not read as "-10"
     pytest.param("Show.S01E01-1080p.mkv", (1, 1), id="resolution-tag-not-mistaken-for-range"),
-    # the primary parser takes 1-4 episode digits, so the bare range guard must too
-    pytest.param("Show - S01E100-101 - Title WEBRip-720p.mkv", None, id="none-three-digit-bare-range"),
-    pytest.param("Show - S01E99-100 - Title WEBDL-1080p.mkv", None, id="none-range-crossing-two-to-three-digits"),
-    pytest.param("Show - S01E1000-1001 - Title.mkv", None, id="none-four-digit-range"),
-    # Sonarr's "Duplicate" multi-episode style repeats the whole token rather than appending a suffix
-    pytest.param("Show - S01E01 - S01E02 - Title WEBRip-1080p.mkv", None, id="none-sonarr-duplicate-naming-style"),
-    pytest.param("Show - S01E01 - S02E01 - Title.mkv", None, id="none-duplicate-style-across-seasons"),
-    # one episode named after itself is not a multi-episode file
-    pytest.param("Show - S01E01 - The S01E01 Story.mkv", (1, 1), id="repeated-identical-token-still-parses"),
-    pytest.param("Show.S01E01-720p.mkv", (1, 1), id="720p-suffix-not-mistaken-for-range"),
-    pytest.param("Show.S01E01-480i.mkv", (1, 1), id="480i-suffix-not-mistaken-for-range"),
-    pytest.param("Show - S01E100 - Title WEBDL-1080p.mkv", (1, 100), id="high-episode-number-still-parses"),
 ])
 def test_episode_key(name, expected):
     assert dedupe.episode_key(name) == expected

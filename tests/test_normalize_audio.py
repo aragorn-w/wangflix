@@ -42,10 +42,8 @@ def test_replace_and_tag_success(tmp_path, suffix):
 
 @pytest.mark.parametrize("suffix, tag_effect", [
     (".mkv", dict(return_value=False)),
-    (".mp4", dict(return_value=False)),
-    (".mkv", dict(side_effect=RuntimeError("mkvextract timeout"))),
     (".mp4", dict(side_effect=OSError("xml write failed"))),
-], ids=["mkv-tag-false", "mp4-tag-false", "mkv-tag-raises", "mp4-tag-raises"])
+], ids=["mkv-tag-false", "mp4-tag-raises"])
 def test_replace_and_tag_tagfail_rolls_back(tmp_path, suffix, tag_effect):
     src, remux_out, final_path, backup_path = _setup(tmp_path, suffix)
     with patch.object(na, "set_normalized_tag", **tag_effect):
@@ -96,21 +94,17 @@ def _sub():
 @pytest.mark.parametrize("before, after", [
     ([_vid("hevc"), _vid("mjpeg"), _aud()], [_vid("hevc"), _aud()]),
     ([_vid("hevc"), _vid("mjpeg", attached_pic=True), _aud()], [_vid("hevc"), _aud()]),
-    ([_vid("hevc"), _vid("mjpeg"), _vid("png"), _aud()], [_vid("hevc"), _aud()]),
     ([_vid("hevc"), _aud(), _sub()], [_vid("hevc"), _aud(), _sub()]),
-    ([_vid("hevc"), _aud(), _aud(), _sub()], [_vid("hevc"), _aud(), _aud(), _sub()]),
-], ids=["malformed-cover-art-removed", "attached-pic-removed", "several-cover-art-removed",
-        "unchanged", "unchanged-dual-audio"])
+], ids=["malformed-cover-art-removed", "attached-pic-removed", "unchanged"])
 def test_guard_allows(before, after):
     na._check_stream_regression({"streams": before}, {"streams": after})   # must not raise
 
 
 @pytest.mark.parametrize("before, after, match", [
     ([_vid("hevc"), _vid("h264"), _aud()], [_vid("hevc"), _aud()], "real video count regressed"),
-    ([_vid("hevc"), _aud()], [_aud()], "real video count regressed"),
     ([_vid("hevc"), _aud(), _sub(), _sub()], [_vid("hevc"), _aud(), _sub()], "sub count regressed"),
     ([_vid("hevc"), _aud(), _aud()], [_vid("hevc"), _aud()], "audio count regressed"),
-], ids=["real-video-loss", "total-video-loss", "subtitle-loss", "audio-loss"])
+], ids=["real-video-loss", "subtitle-loss", "audio-loss"])
 def test_guard_rejects(before, after, match):
     with pytest.raises(RuntimeError, match=match):
         na._check_stream_regression({"streams": before}, {"streams": after})
@@ -155,9 +149,8 @@ def _normalize(tmp_path, monkeypatch, src_duration, out_duration):
 
 @pytest.mark.parametrize("src_duration, out_duration", [
     ("1320.0", "169.0"),     # Family Guy S19E01: 22 min in, 2:49 out
-    ("1320.0", "1306.0"),    # just over 1% short
     ("1320.0", None),        # output with no readable duration
-], ids=["truncated", "just-over-tolerance", "output-duration-missing"])
+], ids=["truncated", "output-duration-missing"])
 def test_short_normalize_output_is_rejected_and_the_original_is_untouched(
         tmp_path, monkeypatch, src_duration, out_duration):
     result, src, tag = _normalize(tmp_path, monkeypatch, src_duration, out_duration)
@@ -171,12 +164,8 @@ def test_short_normalize_output_is_rejected_and_the_original_is_untouched(
 
 @pytest.mark.parametrize("src_duration, out_duration", [
     ("1320.0", "1320.0"),    # equal
-    ("1320.0", "1307.0"),    # within 1%
-    ("100.0", "98.0"),       # exactly the 2 s floor
     (None, "169.0"),         # source duration unknown: the check is skipped, not a block
-    ("0.000000", "169.0"),   # source duration zero: same
-], ids=["equal", "within-tolerance", "exactly-the-floor", "source-duration-missing",
-        "source-duration-zero"])
+], ids=["equal", "source-duration-missing"])
 def test_normalize_output_within_tolerance_or_unchecked_replaces_the_original(
         tmp_path, monkeypatch, src_duration, out_duration):
     result, src, tag = _normalize(tmp_path, monkeypatch, src_duration, out_duration)

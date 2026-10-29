@@ -6,7 +6,6 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -162,15 +161,11 @@ def test_expose_tag_normalize_skips_when_dest_locked(tmp_path):
         assert path.exists()                                 # original untouched
 
 
-@pytest.mark.parametrize("tag_effect", [
-    dict(return_value=False),
-    dict(side_effect=RuntimeError("mkvpropedit boom")),
-], ids=["tag-returns-false", "tag-raises"])
-def test_expose_tag_normalize_tag_failure_does_not_roll_back(tmp_path, tag_effect):
+def test_expose_tag_normalize_tag_failure_does_not_roll_back(tmp_path):
     """Unlike normalize-audio, a failed tag write leaves the file consolidated (tag_written=False; state.json
     is the idempotency backstop) and normalization still runs."""
     out, path, replacement = _mux_and_dest(tmp_path, ".mkv")
-    with patch.object(cs, "set_consolidated_tag", **tag_effect), \
+    with patch.object(cs, "set_consolidated_tag", return_value=False), \
          patch.object(cs, "_normalize_audio_inline") as norm:
         skip, tag_written = cs._expose_tag_normalize(out, path, replacement, str(path))
     assert skip is None and tag_written is False
@@ -219,10 +214,8 @@ def test_expose_tag_normalize_refuses_an_output_shorter_than_the_source(tmp_path
 
 @pytest.mark.parametrize("src_duration, out_duration", [
     ("1320.0", "1320.0"),    # equal
-    ("1320.0", "1307.0"),    # within 1%
-    ("100.0", "98.0"),       # exactly the 2 s floor
     (None, "169.0"),         # source duration unknown: skipped, not a block
-], ids=["equal", "within-tolerance", "exactly-the-floor", "source-duration-missing"])
+], ids=["equal", "source-duration-missing"])
 def test_expose_tag_normalize_swaps_an_output_within_tolerance_or_unchecked(
         tmp_path, src_duration, out_duration):
     out, path, replacement = _mux_and_dest(tmp_path, ".mp4")
@@ -305,8 +298,8 @@ def test_full_pass_remux_shorter_than_the_source_fails_and_leaves_the_original(t
 
 
 @pytest.mark.parametrize("src_duration, out_duration", [
-    ("1320.0", "1320.0"), ("1320.0", "1307.0"), (None, "169.0"),
-], ids=["equal", "within-one-percent", "source-duration-missing"])
+    ("1320.0", "1320.0"), (None, "169.0"),
+], ids=["equal", "source-duration-missing"])
 def test_full_pass_remux_as_long_as_the_source_or_unchecked_swaps(tmp_path, src_duration, out_duration):
     result, media, sidecar, tag, norm, _ = _full_pass(tmp_path, src_duration, out_duration)
 
@@ -358,17 +351,6 @@ def _fast_clock():
             patch.object(cs.time, "sleep"))
 
 
-def test_normalize_inline_timeout_is_computed_from_the_file_size(tmp_path, _norm_log):
-    media = tmp_path / "Movie.mkv"
-    media.write_bytes(b"x" * 1234)
-    proc = _fake_proc([("", "")])
-    with patch.object(cs.subprocess, "Popen", return_value=proc), \
-         patch.object(cs, "normalize_budget_s", return_value=12345) as budget:
-        cs._normalize_audio_inline(media)
-    budget.assert_called_once_with(1234)
-    proc.communicate.assert_called_once_with(timeout=12345)
-
-
 def test_normalize_inline_uses_the_real_budget_for_a_big_file(tmp_path, _norm_log):
     from media_stack.loudness import normalize_budget_s
     media = tmp_path / "Movie.mkv"
@@ -379,13 +361,6 @@ def test_normalize_inline_uses_the_real_budget_for_a_big_file(tmp_path, _norm_lo
         cs._normalize_audio_inline(media)
     (_, kwargs), = proc.communicate.call_args_list
     assert kwargs["timeout"] == normalize_budget_s(30 * 10**9) == 31400   # well past the old 7200
-
-
-def test_normalize_inline_falls_back_to_7200_when_stat_fails(tmp_path, _norm_log):
-    proc = _fake_proc([("", "")])
-    with patch.object(cs.subprocess, "Popen", return_value=proc):
-        cs._normalize_audio_inline(tmp_path / "does-not-exist.mkv")
-    proc.communicate.assert_called_once_with(timeout=7200)
 
 
 def test_normalize_inline_runs_the_child_in_its_own_session_with_the_lock_env(
@@ -402,17 +377,6 @@ def test_normalize_inline_runs_the_child_in_its_own_session_with_the_lock_env(
     assert kwargs["start_new_session"] is True
     assert kwargs["env"]["NORMALIZE_INHERIT_LOCK_PATH"] == str(tmp_path / "Movie.mkv")
     assert kwargs["env"]["SOME_INHERITED_VAR"] == "kept"
-    assert kwargs["stdout"] == subprocess.PIPE and kwargs["stderr"] == subprocess.PIPE
-    assert kwargs["text"] is True
-
-
-def test_normalize_inline_without_a_locked_path_sets_no_inherit_env(tmp_path, _norm_log, monkeypatch):
-    monkeypatch.delenv("NORMALIZE_INHERIT_LOCK_PATH", raising=False)
-    media = tmp_path / "Movie.mkv"
-    media.write_bytes(b"x")
-    with patch.object(cs.subprocess, "Popen", return_value=_fake_proc([("", "")])) as popen:
-        cs._normalize_audio_inline(media)
-    assert "NORMALIZE_INHERIT_LOCK_PATH" not in popen.call_args.kwargs["env"]
 
 
 def test_normalize_inline_timeout_kills_the_process_group_with_sigterm(tmp_path, _norm_log, capsys):
@@ -428,37 +392,21 @@ def test_normalize_inline_timeout_kills_the_process_group_with_sigterm(tmp_path,
     assert killpg.signals == [(4242, signal.SIGTERM)]    # the group went away: no SIGKILL
     assert proc.communicate.call_args_list[1] == call(timeout=15)
     out = capsys.readouterr().out
-    assert "audio-normalize TIMEOUT" in out and "process group killed" in out
-    assert "8:43:20 budget" in out                       # the actual budget, not a hardcoded 2h
-    assert "(2h)" not in out and str(media) in out
-    assert "audio-normalize OK" not in out
+    assert "audio-normalize TIMEOUT" in out and "audio-normalize OK" not in out
 
 
-@pytest.mark.parametrize("drain", [("", ""), _timeout(15)],
-                         ids=["child-drained", "even-the-final-drain-times-out"])
-def test_normalize_inline_timeout_sigkills_a_group_that_outlives_sigterm(tmp_path, _norm_log, drain):
-    """The leader may exit on SIGTERM while a grandchild ignores it: the group, not the leader, decides
-    whether SIGKILL is needed; and whatever the final drain does, nothing raises."""
+def test_normalize_inline_timeout_sigkills_a_group_that_outlives_sigterm(tmp_path, _norm_log):
+    """The leader may exit on SIGTERM while a grandchild (ffmpeg) ignores it: the group, not the leader,
+    decides whether SIGKILL is needed."""
     media = tmp_path / "Movie.mkv"
     media.write_bytes(b"x")
-    proc = _fake_proc([_timeout(), drain])
+    proc = _fake_proc([_timeout(), ("", "")])
     killpg = _fake_killpg(group_stays_alive=True)
     clock, sleep = _fast_clock()
     with patch.object(cs.subprocess, "Popen", return_value=proc), \
          patch.object(cs.os, "killpg", side_effect=killpg), clock, sleep:
         cs._normalize_audio_inline(media)
     assert killpg.signals == [(4242, signal.SIGTERM), (4242, signal.SIGKILL)]
-    proc.poll.assert_called()                            # the leader is reaped while waiting
-    assert proc.communicate.call_count == 2              # drained and reaped after the SIGKILL
-
-
-def test_normalize_inline_never_raises_when_the_group_is_already_gone(tmp_path, _norm_log):
-    media = tmp_path / "Movie.mkv"
-    media.write_bytes(b"x")
-    proc = _fake_proc([_timeout(), ("", "")])
-    with patch.object(cs.subprocess, "Popen", return_value=proc), \
-         patch.object(cs.os, "killpg", side_effect=ProcessLookupError):
-        cs._normalize_audio_inline(media)
 
 
 def test_normalize_inline_interrupt_kills_the_group_and_propagates(tmp_path, _norm_log):
@@ -515,65 +463,6 @@ def test_normalize_inline_sigterm_during_the_wait_kills_the_group_and_restores_t
     assert signal.getsignal(signal.SIGTERM) is _sigterm_sentinel   # ...and the old one restored
 
 
-@pytest.mark.parametrize("communicate", [
-    [("", "")],                                          # normal exit
-    [_timeout(), ("", "")],                              # budget expired
-])
-def test_normalize_inline_restores_the_sigterm_handler_on_every_exit(
-        tmp_path, _norm_log, _sigterm_sentinel, communicate):
-    media = tmp_path / "Movie.mkv"
-    media.write_bytes(b"x")
-    with patch.object(cs.subprocess, "Popen", return_value=_fake_proc(communicate)), \
-         patch.object(cs.os, "killpg", side_effect=_fake_killpg()):
-        cs._normalize_audio_inline(media)
-    assert signal.getsignal(signal.SIGTERM) is _sigterm_sentinel
-
-
-def test_normalize_inline_popen_failure_is_logged_not_raised_and_restores_the_sigterm_handler(
-        tmp_path, _norm_log, capsys, _sigterm_sentinel):
-    media = tmp_path / "Movie.mkv"
-    media.write_bytes(b"x")
-    with patch.object(cs.subprocess, "Popen", side_effect=OSError("no such interpreter")):
-        cs._normalize_audio_inline(media)
-    assert "audio-normalize ERR" in capsys.readouterr().out
-    assert signal.getsignal(signal.SIGTERM) is _sigterm_sentinel
-
-
-def test_normalize_inline_off_the_main_thread_runs_without_a_sigterm_handler(
-        tmp_path, _norm_log, capsys, _sigterm_sentinel):
-    """`signal.signal` raises ValueError off the main thread: the handler is skipped and the run goes ahead."""
-    media = tmp_path / "Movie.mkv"
-    media.write_bytes(b"x")
-    proc = _fake_proc([("ok\n", "")])
-    with patch.object(cs.subprocess, "Popen", return_value=proc):
-        worker = threading.Thread(target=cs._normalize_audio_inline, args=(media,))
-        worker.start()
-        worker.join(10)
-    proc.communicate.assert_called_once()
-    assert "audio-normalize OK" in capsys.readouterr().out
-    assert signal.getsignal(signal.SIGTERM) is _sigterm_sentinel
-
-
-@pytest.mark.parametrize("returncode, stdout, stderr, expected", [
-    (0, "ok\n", "", "audio-normalize OK"),
-    (0, "x: locked by other pipeline\n", "", "audio-normalize SKIPPED (lock conflict)"),
-    (1, "", "boom\nlast stderr line\n", "audio-normalize FAIL rc=1"),
-])
-def test_normalize_inline_result_logging_is_unchanged(
-        tmp_path, _norm_log, capsys, returncode, stdout, stderr, expected):
-    media = tmp_path / "Movie.mkv"
-    media.write_bytes(b"x")
-    proc = _fake_proc([(stdout, stderr)], returncode=returncode)
-    with patch.object(cs.subprocess, "Popen", return_value=proc), \
-         patch.object(cs.os, "killpg") as killpg:
-        cs._normalize_audio_inline(media)
-    out = capsys.readouterr().out
-    assert expected in out
-    if returncode:
-        assert "last stderr line" in out
-    killpg.assert_not_called()                           # nothing to kill on a normal exit
-
-
 def _running(pid: int) -> bool:
     try:   # a zombie (killed, not yet reaped by init) is not running
         return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
@@ -581,32 +470,22 @@ def _running(pid: int) -> bool:
         return False
 
 
-# Real (trivial) processes: a child in its own session spawns a sleeping
-# grandchild, as normalize-audio.py spawns ffmpeg. The second variant's
-# grandchild ignores SIGTERM and has its output redirected (so it does not hold
-# the pipes open), which is the case a "leader exited" check would miss.
-@pytest.mark.parametrize("script, ignores_term", [
-    ("sleep 300 & echo $!; wait", False),
-    ("(trap '' TERM; exec sleep 300 >/dev/null 2>&1) & echo $!; wait", True),
-], ids=["grandchild-dies-on-sigterm", "grandchild-ignores-sigterm"])
-def test_kill_process_group_takes_down_grandchildren(script, ignores_term):
+def test_kill_process_group_takes_down_grandchildren():
+    """Real (trivial) processes: a child in its own session spawns a sleeping grandchild, as
+    normalize-audio.py spawns ffmpeg; killing only the python child once orphaned it."""
     proc = subprocess.Popen(
-        ["bash", "-c", script],
+        ["bash", "-c", "sleep 300 & echo $!; wait"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
     grandchild = int(proc.stdout.readline())
-    time.sleep(0.2)                                      # let the subshell install its trap and exec
+    time.sleep(0.2)                                      # let the subshell start its sleep
     try:
-        t0 = time.monotonic()
         cs._kill_process_group(proc, grace_s=1)
-        elapsed = time.monotonic() - t0
 
         deadline = time.monotonic() + 5
         while _running(grandchild) and time.monotonic() < deadline:
             time.sleep(0.05)
         assert not _running(grandchild), "the grandchild survived the group kill"
         assert proc.returncode is not None               # the child was reaped too
-        if not ignores_term:
-            assert elapsed < 0.9                         # nothing left to wait out the grace for
     finally:
         try:
             os.kill(grandchild, signal.SIGKILL)

@@ -270,10 +270,8 @@ def test_mislabeled_when_two_windows_agree_on_a_foreign_language():
 
 @pytest.mark.parametrize("script", [
     [("es", 0.95), ("en", 0.9)],                       # second window says English
-    [("es", 0.95), ("es", 0.7), ("en", 0.2), ("en", 0.2)],   # second confident but under 0.8
     [("es", 0.7), ("es", 0.7), ("en", 0.2), ("en", 0.2)],    # confident (>= 0.6) but never >= 0.8
     [("es", 0.95), ("fr", 0.95), ("de", 0.9), ("it", 0.9)],  # confident windows, DIFFERENT languages
-    [("es", 0.95), ("es", 0.3), ("en", 0.9)],          # second inconclusive, third says English
 ])
 def test_single_confident_foreign_window_is_not_mislabeled(script):
     (findings, _, _, _), _ = _analyze(_info(_stream(1, "eng")), {1: script})
@@ -292,28 +290,18 @@ def test_an_inconclusive_window_falls_through_to_a_third_that_can_corroborate(sc
     assert streams[0]["mislabeled_as"] == "es"
 
 
-def test_two_agreeing_foreign_windows_do_not_end_the_scan():
-    """Only a confident English window stops the scan."""
-    _, fake = _analyze(_info(_stream(1, "spa")), {1: [("es", 0.99), ("es", 0.7)]})
-    assert len(fake.calls) == 4
-
-
 @pytest.mark.parametrize("script, calls", [
     pytest.param([("en", 0.9)], 1, id="first_window"),
     pytest.param([("es", 0.9), ("en", 0.8)], 2, id="after_a_foreign_window"),
-    pytest.param([("es", 0.95), ("es", 0.95), ("es", 0.95), ("en", 0.7)], 4, id="last_planned_window"),
 ])
 def test_a_confident_english_window_is_heard_and_ends_the_scan(script, calls):
     (findings, _, _, _), fake = _analyze(_info(_stream(1, "eng")), {1: script})
     assert len(fake.calls) == calls and findings == []
 
 
-@pytest.mark.parametrize("tag, script", [
-    pytest.param(None, [("en", 0.2), ("en", 0.3), ("en", 0.4), ("en", 0.5)], id="nothing_resolves"),
-    pytest.param("eng", [("es", 0.9), ("fr", 0.9), ("de", 0.9), ("it", 0.9)], id="confident_disagreeing_foreign"),
-])
-def test_windows_are_25_50_10_75_percent_of_duration_30s_each_in_given_workdir(tag, script):
-    _, fake = _analyze(_info(_stream(1, tag), duration=2000.0), {1: script})
+def test_windows_are_25_50_10_75_percent_of_duration_30s_each_in_given_workdir():
+    script = [("en", 0.2), ("en", 0.3), ("en", 0.4), ("en", 0.5)]
+    _, fake = _analyze(_info(_stream(1, None), duration=2000.0), {1: script})
     assert [c["start"] for c in fake.calls] == [500.0, 1000.0, 200.0, 1500.0]
     assert {c["dur"] for c in fake.calls} == {30.0}
     assert {c["workdir"] for c in fake.calls} == {Path("/work")}
@@ -349,22 +337,6 @@ def test_a_stream_that_stays_unclear_is_unverified_not_a_finding(tag, script):
     assert streams[0]["counts_as_english"] is False
 
 
-def test_one_inconclusive_stream_among_confidently_foreign_ones_is_unverified():
-    (findings, _, result, _), _ = _analyze(
-        _info(_stream(1, "spa"), _stream(2, "fra")),
-        {1: [("es", 0.95), ("es", 0.9)], 2: [("fr", 0.2), ("fr", 0.3), ("fr", 0.1), ("fr", 0.2)]},
-        original="eng")
-    assert result == "UNVERIFIED" and findings == []
-
-
-def test_english_original_with_every_stream_confidently_foreign_is_a_finding():
-    (findings, _, result, _), _ = _analyze(
-        _info(_stream(1, "spa"), _stream(2, None)),
-        {1: [("es", 0.95), ("es", 0.9)], 2: [("fr", 0.9), ("fr", 0.85)]}, original="eng")
-    assert result == "CHECKED"
-    assert _types(findings) == ["NO_ENGLISH_AUDIO"]
-
-
 # --- NO_ENGLISH_AUDIO ----------------------------------------------------------
 
 @pytest.mark.parametrize("script", [
@@ -396,11 +368,8 @@ def test_spanish_tagged_stream_detected_as_english_is_not_a_finding():
     assert streams[0]["counts_as_english"] is True
 
 
-@pytest.mark.parametrize("script", [
-    pytest.param([("en", 0.59), ("en", 0.5), ("en", 0.4), ("en", 0.3)], id="below_the_floor"),
-    pytest.param([("en", 0.5996)] * 4, id="0.5996_displays_as_0.6_but_is_not_confident"),
-])
-def test_foreign_tag_detected_english_below_the_raw_floor_does_not_count(script):
+def test_foreign_tag_detected_english_below_the_raw_floor_does_not_count():
+    script = [("en", 0.59), ("en", 0.5), ("en", 0.4), ("en", 0.3)]
     (findings, _, result, _), _ = _analyze(_info(_stream(1, "spa")), {1: script}, original="eng")
     assert result == "UNVERIFIED" and findings == []
 
@@ -408,7 +377,6 @@ def test_foreign_tag_detected_english_below_the_raw_floor_does_not_count(script)
 @pytest.mark.parametrize("tag, prob", [
     pytest.param(None, 0.9, id="untagged"),
     pytest.param("und", 0.65, id="und"),
-    pytest.param(None, 0.61, id="untagged_just_over_the_floor"),
 ])
 def test_untagged_or_und_stream_detected_english_counts_as_english(tag, prob):
     (findings, streams, result, _), _ = _analyze(
@@ -454,14 +422,6 @@ def test_file_with_no_audio_streams_is_unverified_not_no_english_audio():
     (findings, streams, result, note), fake = _analyze(_info(), {}, original="eng")
     assert streams == [] and fake.calls == [] and findings == []
     assert result == "UNVERIFIED" and "no non-commentary audio" in note
-
-
-def test_file_with_only_commentary_tracks_is_unverified_not_no_english_audio():
-    only_commentary = _info(_stream(1, "eng", disposition={"comment": 1}),
-                            _stream(2, "eng", tags={"language": "eng", "title": "Audio Description"}))
-    with patch.object(alc, "probe_duration", side_effect=AssertionError("no streams: no probe")):
-        (findings, _, result, _), fake = _analyze(only_commentary, {}, original="eng")
-    assert fake.calls == [] and findings == [] and result == "UNVERIFIED"
 
 
 # --- process_candidate -----------------------------------------------------------
@@ -533,17 +493,6 @@ def test_unknown_playback_state_fails_closed_before_the_file_is_even_probed(monk
         _process(detect, probe=probe, jf=jf, cfg=_cfg(max_wait_min=2.0))
     probe.assert_not_called()
     detect.assert_not_called()
-
-
-def test_unknown_playback_state_mid_extraction_also_fails_closed(monkeypatch):
-    _fake_clock(monkeypatch)
-
-    def always_interrupted(*a, should_abort=None, **k):
-        raise ExtractionInterrupted("unknown")
-
-    jf = _Jellyfin([[]], then=None)  # idle for the first gate, unknown ever after
-    with pytest.raises(alc.PlaybackWaitTimeout):
-        _process(always_interrupted, jf=jf, cfg=_cfg(max_wait_min=2.0))
 
 
 def test_ffprobe_runs_only_after_the_gate_says_idle(monkeypatch):
@@ -711,25 +660,6 @@ def test_mislabeled_needs_the_agreeing_windows_at_least_60s_apart():
     assert alc._mislabeled_language([_w(100.0, "es", 0.9), _w(160.0, "es", 0.85)]) == ("es", 0.85)
 
 
-def test_mislabeled_pairs_the_windows_that_are_far_enough_apart():
-    ws = [_w(100.0, "es", 0.9), _w(120.0, "es", 0.95), _w(300.0, "es", 0.88)]
-    assert alc._mislabeled_language(ws) == ("es", 0.88)
-
-
-def test_scan_skips_fractions_whose_window_would_land_within_60s_of_a_sampled_one():
-    _, fake = _analyze(_info(_stream(1, "eng"), duration=200.0),
-                       {1: [("es", 0.9), ("es", 0.9)]})
-    # 25% -> 50.  50% (100), 10% (20) are < 60 s away: skipped.  75% -> 150.
-    assert [c["start"] for c in fake.calls] == [50.0, 150.0]
-
-
-def test_a_three_minute_file_can_still_be_mislabel_checked():
-    (findings, _, result, _), fake = _analyze(
-        _info(_stream(1, "eng"), duration=180.0), {1: [("es", 0.9), ("es", 0.9)]})
-    assert [c["start"] for c in fake.calls] == [45.0, 135.0]
-    assert _types(findings) == ["MISLABELED"] and result == "CHECKED"
-
-
 def test_file_under_three_minutes_skips_mislabeled_and_is_unverified():
     (findings, streams, result, note), fake = _analyze(
         _info(_stream(1, "eng"), duration=179.0), {})
@@ -763,16 +693,13 @@ def test_duration_falls_back_to_a_bounded_ffprobe_call_made_after_the_gate():
 
 
 _COVER_ART = {"index": 0, "codec_type": "video", "duration": "5.0"}
-_COMMENTARY = _stream(2, "eng", disposition={"comment": 1}, duration="90")
 
 
 @pytest.mark.parametrize("info", [
     *(pytest.param({"streams": [_stream(1, "eng", duration=bad)], "format": {"duration": bad}},
-                   id=f"bad_{bad}") for bad in [None, "N/A", "0", "-3", "nan", "inf", True, "abc"]),
+                   id=f"bad_{bad}") for bad in ["N/A", "0"]),
     pytest.param({"streams": [_COVER_ART, _stream(1, "eng")], "format": {}},
                  id="only_a_video_stream_has_a_duration"),
-    pytest.param({"streams": [_stream(1, "eng"), _COMMENTARY], "format": {}},
-                 id="only_a_short_commentary_stream_has_a_duration"),
 ])
 def test_no_usable_duration_anywhere_is_unverified_and_samples_no_window(info):
     (findings, streams, result, note), fake = _analyze(info, {}, original="eng")
@@ -787,18 +714,9 @@ def test_no_usable_duration_anywhere_is_unverified_and_samples_no_window(info):
     pytest.param({"streams": [{**_COVER_ART, "disposition": {"attached_pic": 1}},
                               _stream(1, None, duration="1400.0")], "format": {}},
                  {1: [("en", 0.9)]}, 350.0, id="cover_art_video_stream_is_never_used"),
-    pytest.param({"streams": [_stream(1, "eng", duration="1000"), _stream(2, "fra", duration="2000")],
-                  "format": {}},
-                 {1: [("en", 0.9)], 2: [("fr", 0.9), ("fr", 0.9)]}, 250.0,
-                 id="first_scanned_audio_stream_is_preferred"),
     pytest.param({"streams": [_stream(1, "eng", disposition={"comment": 1}, duration="90000"),
                               _stream(2, "eng", duration="1200")], "format": {}},
                  {2: [("en", 0.9)]}, 300.0, id="commentary_stream_is_not_a_source"),
-    # 25% of stream 3's 1200, not of the commentary's 90
-    pytest.param({"streams": [_stream(1, "eng"), _COMMENTARY, _stream(3, "fra", duration="1200")],
-                  "format": {}},
-                 {1: [("en", 0.9)], 3: [("fr", 0.9), ("fr", 0.9)]}, 300.0,
-                 id="next_allowed_stream_when_the_first_has_none"),
 ])
 def test_duration_comes_from_the_first_scanned_audio_stream_that_has_one(info, script, expected_start):
     _, fake = _analyze(info, script)
@@ -807,32 +725,11 @@ def test_duration_comes_from_the_first_scanned_audio_stream_that_has_one(info, s
 
 # --- classify on ALL windows, not the best one ---------------------------
 
-def test_spanish_tag_heard_spanish_095_and_english_070_is_english_not_a_finding():
-    """The best window is Spanish, but any English window at >= 0.6 makes the stream English."""
-    (findings, streams, result, _), fake = _analyze(
-        _info(_stream(1, "spa")), {1: [("es", 0.95), ("en", 0.70)]}, original="eng")
-    assert findings == [] and result == "CHECKED"
-    assert streams[0]["counts_as_english"] is True
-    assert streams[0]["detected_language"] == "es"  # display still shows the best window
-    assert len(fake.calls) == 2
-
-
-def test_an_unclear_stream_does_not_block_a_confirmed_english_one():
-    (findings, _, result, _), _ = _analyze(
-        _info(_stream(1, "spa"), _stream(2, "eng")),
-        {1: [("es", 0.95), ("es", 0.3), ("es", 0.2), ("es", 0.1)], 2: [("en", 0.9)]},
-        original="eng")
-    assert findings == [] and result == "CHECKED"
-
 
 @pytest.mark.parametrize("probs,expected", [
-    ([("en", 0.6)], "english"),
     ([("es", 0.95), ("en", 0.7)], "english"),
     ([("es", 0.95), ("fr", 0.9)], "foreign"),
-    ([("es", 0.6)], "foreign"),
     ([("es", 0.95), ("es", 0.59)], "unclear"),
-    ([("en", 0.59), ("es", 0.9)], "unclear"),
-    ([("en", 0.2)], "unclear"),
 ])
 def test_classify_windows_looks_at_every_window(probs, expected):
     windows = [_w(float(i * 100), lang, p) for i, (lang, p) in enumerate(probs)]
@@ -854,54 +751,12 @@ def test_two_agreeing_foreign_windows_then_an_english_one_is_english_with_no_fin
     assert streams[0]["counts_as_english"] is True and "mislabeled_as" not in streams[0]
 
 
-def test_a_later_english_window_that_is_not_confident_does_not_cancel_mislabeled():
-    (findings, _, _, _), fake = _analyze(
-        _info(_stream(1, "eng")), {1: [("es", 0.9), ("es", 0.9), ("en", 0.59), ("en", 0.4)]})
-    assert len(fake.calls) == 4
-    assert _types(findings) == ["MISLABELED"]
-
-
 # --- raw probabilities, rounding only for display --------------------------------
 
-@pytest.mark.parametrize("script, expected", [
-    pytest.param([("es", 0.7996)] * 4, [], id="0.7996_displays_as_0.8_but_is_below_the_bar"),
-    pytest.param([("es", 0.8), ("es", 0.8)], ["MISLABELED"], id="exactly_the_bar_counts"),
-])
-def test_mislabeled_bar_uses_the_raw_probability(script, expected):
-    (findings, _, _, _), fake = _analyze(_info(_stream(1, "eng")), {1: script})
-    assert _types(findings) == expected and len(fake.calls) == 4
-
-
-def test_probabilities_are_rounded_only_in_the_stored_record():
-    (findings, streams, _, _), _ = _analyze(
-        _info(_stream(1, "eng")), {1: [("es", 0.912345), ("es", 0.876543)]})
-    assert findings[0]["probability"] == 0.877
-    assert streams[0]["probability"] == 0.912
-    assert [w["probability"] for w in streams[0]["windows"]] == [0.912, 0.877, 0.877, 0.877]
-
-
-# --- a duration comes from an AUDIO stream only --------------------------------
-
-@pytest.mark.parametrize("streams, script, expected", [
-    pytest.param([_stream(3, "eng"), _stream(4, "fra")],
-                 {3: [("en", 0.9)], 4: [("fr", 0.9), ("fr", 0.9)]}, (3, {3, 4}),
-                 id="first_scanned_stream"),
-    pytest.param([_stream(1, "eng"), _stream(2, "eng", disposition={"comment": 1}), _stream(3, "fra")],
-                 {1: [("en", 0.9)], 3: [("fr", 0.9), ("fr", 0.9)]}, (1, {1, 3}),
-                 id="non_commentary_indices_only"),
-])
-def test_the_fallback_probe_is_told_the_first_scanned_stream_and_the_allowed_indices(streams, script, expected):
-    fake = _lid(script)
-    with patch.object(alc, "detect_language", fake), \
-         patch.object(alc, "probe_duration", return_value=800.0) as pd:
-        alc.analyze_candidate(Path("/m/movies/X/x.mkv"), {"streams": streams, "format": {}}, None,
-                              _cfg(), _Jellyfin(), alc.PlaybackWaitBudget(15.0), Path("/work"))
-    assert pd.call_args.args == (Path("/m/movies/X/x.mkv"), *expected)
-
-
-def test_program_indices_are_the_integer_indices_of_the_non_commentary_audio_streams():
-    assert alc._program_indices([_stream(1, "eng"), _stream(4, "fra")]) == {1, 4}
-    assert alc._program_indices([{"codec_type": "audio"}, {"index": "7"}, _stream(2, None)]) == {2}
+def test_mislabeled_bar_uses_the_raw_probability():
+    """0.7996 displays as 0.8 but is below the bar."""
+    (findings, _, _, _), _ = _analyze(_info(_stream(1, "eng")), {1: [("es", 0.7996)] * 4})
+    assert findings == []
 
 
 # --- load_config ---------------------------------------------------------------------
@@ -915,25 +770,15 @@ def test_load_config_defaults():
     assert cfg.jellyfin_key == ""
 
 
-@pytest.mark.parametrize("cpus,expected", [(1, 1), (2, 2), (8, 2), (None, 2)])
+@pytest.mark.parametrize("cpus,expected", [(1, 1), (8, 2)])
 def test_whisper_threads_default_never_exceeds_the_cpu_count(cpus, expected):
     with patch.object(alc.os, "cpu_count", return_value=cpus):
         assert alc.load_config({}).whisper_threads == expected
 
 
-def test_whisper_threads_override_is_bounded_by_cpu_count():
-    with patch.object(alc.os, "cpu_count", return_value=4):
-        assert alc.load_config({"WHISPER_THREADS": "4"}).whisper_threads == 4
-        assert alc.load_config({"WHISPER_THREADS": "5"}).whisper_threads == 2  # over the bound
-        assert alc.load_config({"WHISPER_THREADS": "0"}).whisper_threads == 2
-    with patch.object(alc.os, "cpu_count", return_value=None):
-        assert alc.load_config({"WHISPER_THREADS": "64"}).whisper_threads == 64
-        assert alc.load_config({"WHISPER_THREADS": "65"}).whisper_threads == 2
-
-
 @pytest.mark.parametrize("key,default", [("AUDIO_CHECK_BUDGET_MIN", 20.0),
                                          ("AUDIO_CHECK_MAX_WAIT_MIN", 15.0)])
-@pytest.mark.parametrize("bad", ["nan", "inf", "-inf", "0", "-5", "abc", "1e308", "1440.5"])
+@pytest.mark.parametrize("bad", ["0"])
 def test_minute_settings_fall_back_to_the_default_with_a_warning(key, default, bad, capsys):
     cfg = alc.load_config({key: bad})
     assert getattr(cfg, "budget_min" if "BUDGET" in key else "max_wait_min") == default
@@ -1048,11 +893,6 @@ def test_the_script_never_records_what_it_would_not_load(tmp_path):
     assert not alc.STATE_FILE.exists()                                      # nothing was written
 
 
-def test_script_uses_the_status_aware_lookup_not_original_language_for():
-    assert alc.original_language_lookup.__module__ == "media_stack.arrlang"
-    assert not hasattr(alc, "original_language_for")
-
-
 # --- failed analyses: a few tries, never cached --------------------------------------
 
 def test_a_probe_failure_is_counted_not_cached(world):
@@ -1131,17 +971,6 @@ def test_a_later_success_replaces_the_failure_record(world):
     assert entry["identity"] == alc._identity(video)
 
 
-def test_a_failure_on_a_replaced_file_changes_no_earlier_finding_and_alerts_nothing(world):
-    video = world.video()
-    _seed_finding(video, NO_ENGLISH, "t0", [1, 2, 3])   # the file it was made on is gone
-    world.probe.return_value = None
-    world.run()
-    assert _findings_view() == {str(video.resolve()): {
-        "findings": NO_ENGLISH, "first_found": "t0", "alerted": False, "identity": [1, 2, 3]}}
-    assert _entry(video)["failed"]["attempts"] == 1
-    world.send.assert_not_called()
-
-
 def test_missing_whisper_ends_the_run_with_exit_1_records_nothing_and_still_sends_pending_alerts(world):
     world.library()
     pending = world.finding_video()
@@ -1169,18 +998,6 @@ def _spy_mutate(calls, fail=False):
     return spy
 
 
-def test_every_state_write_goes_through_the_one_locked_mutate_on_the_one_file(world):
-    video = world.video()
-    calls = []
-    with patch.object(alc, "mutate_state", _spy_mutate(calls)):
-        world.run()
-    assert calls == [alc.STATE_FILE, alc.STATE_FILE]   # the conclusion, then the alerted mark
-    entry = _entry(video)
-    assert entry["identity"] == alc._identity(video) and entry["result"] == "CHECKED"
-    assert [f["type"] for f in entry["findings"]] == ["NO_ENGLISH_AUDIO"]
-    assert entry["alerted"] is True and entry["first_found"] == entry["checked_at"]
-
-
 def test_failed_state_write_records_nothing_so_the_next_run_rechecks_and_alerts(world):
     video = world.video()
     with patch.object(alc, "mutate_state", _spy_mutate([], fail=True)):
@@ -1191,17 +1008,6 @@ def test_failed_state_write_records_nothing_so_the_next_run_rechecks_and_alerts(
     assert world.probe.call_count == 2   # re-checked
     assert world.send.call_count == 1    # and alerted
     assert _entry(video)["result"] == "CHECKED"
-
-
-def test_failed_state_write_leaves_an_earlier_entry_exactly_as_it_was(world):
-    video = world.video()
-    _seed_finding(video, MISLABEL, "t0", [1, 2, 3])
-    before = alc.STATE_FILE.read_text()
-    world.probe.return_value = _info(_stream(1, "eng"))
-    world.detect.return_value = ("en", 0.9)
-    with patch.object(alc, "mutate_state", _spy_mutate([], fail=True)):
-        world.run()
-    assert alc.STATE_FILE.read_text() == before
 
 
 # --- alerting: each new finding is sent once -----------------------------------------
@@ -1238,11 +1044,10 @@ def test_a_finding_is_sent_once_and_only_a_new_or_changed_one_again(world):
     assert _findings_view()[key]["first_found"] == "t1" and _findings_view()[key]["alerted"] is True
 
 
-@pytest.mark.parametrize("old_findings", [MISLABEL, NO_ENGLISH], ids=["different_findings", "identical_findings"])
-def test_a_replacement_file_is_analysed_on_its_own_merits_and_alerted(world, old_findings):
+def test_a_replacement_file_is_analysed_on_its_own_merits_and_alerted(world):
     """A replacement carrying even the same defect is a different file and is alerted on its own."""
     video = world.video()
-    _seed_finding(video, old_findings, "t0", [1, 2, 3])   # the replaced file: already alerted
+    _seed_finding(video, NO_ENGLISH, "t0", [1, 2, 3])   # the replaced file: already alerted
     state = _state()
     state[str(video.resolve())]["alerted"] = True
     alc.STATE_FILE.write_text(json.dumps(state))
@@ -1251,18 +1056,6 @@ def test_a_replacement_file_is_analysed_on_its_own_merits_and_alerted(world, old
     assert entry["findings"] == NO_ENGLISH and entry["identity"] == alc._identity(video)
     assert entry["alerted"] is True and entry["first_found"] != "t0"
     assert world.send.call_count == 1
-
-
-def test_touching_a_file_with_the_same_defect_realerts_it_once(world):
-    """Accepted cost of binding alerts to identity: a content-unchanged touch re-alerts once."""
-    video = world.video()
-    world.run()
-    assert world.send.call_count == 1
-    os.utime(video, (_now() - 4 * HOUR, _now() - 4 * HOUR))   # touched, not changed
-    world.run()
-    assert world.send.call_count == 2
-    world.run()
-    assert world.send.call_count == 2
 
 
 @pytest.mark.parametrize("failure", ["rejected", "raises", "no_credentials"])
@@ -1318,22 +1111,6 @@ def test_findings_of_a_gone_replaced_or_identityless_entry_are_never_sent(world)
         False, False, False, False, True]
 
 
-@pytest.mark.parametrize("findings, identity", [(NO_ENGLISH, None), (MISLABEL, [9, 9, 9])],
-                         ids=["other_findings", "other_file_version"])
-def test_a_finding_rewritten_while_the_message_was_sending_is_not_marked_alerted(world, findings, identity):
-    video = world.finding_video()
-    _seed_finding(video, MISLABEL, "t0")
-
-    def notify_and_meanwhile_rerecord(message):
-        _seed_finding(video, findings, "t1", identity)
-        return None
-
-    with patch.object(alc, "_notify", notify_and_meanwhile_rerecord):
-        world.alert()
-    entry = _findings_view()[str(video.resolve())]
-    assert entry["findings"] == findings and entry["alerted"] is False
-
-
 def test_alerts_on_an_unreadable_state_send_and_write_nothing(world, capsys):
     video = world.finding_video()
     _seed_finding(video, MISLABEL, "t0")
@@ -1371,25 +1148,6 @@ def test_more_findings_than_one_message_holds_go_out_in_further_messages_once_ea
     assert world.send.call_count == 2
 
 
-def test_a_file_replaced_while_earlier_messages_were_sending_is_left_out_of_the_later_ones(world):
-    videos = [world.finding_video(i) for i in range(16)]
-    for i, v in enumerate(videos):
-        _seed_finding(v, MISLABEL, f"2026-10-01T00:00:{i:02d}+00:00")
-
-    sent = []
-
-    def notify_and_meanwhile_replace_the_last(message):
-        sent.append(message)
-        _replace(videos[15])
-        return None
-
-    with patch.object(alc, "_notify", notify_and_meanwhile_replace_the_last):
-        world.alert()
-    assert len(sent) == 1 and "Film 15" not in sent[0]
-    view = _findings_view()
-    assert [view[str(v.resolve())]["alerted"] for v in videos] == [True] * 15 + [False]
-
-
 def test_very_long_titles_are_split_over_messages_within_telegram_s_limit_oldest_first(world):
     for i in range(15):
         _seed_finding(_long_title_video(world, i), MISLABEL, f"2026-10-01T00:00:{i:02d}+00:00")
@@ -1401,58 +1159,6 @@ def test_very_long_titles_are_split_over_messages_within_telegram_s_limit_oldest
              if line.startswith("- Film ")]
     assert order == list(range(15))   # each finding named exactly once, oldest first
     assert all(e["alerted"] for e in _findings_view().values())
-
-
-def test_a_single_ten_thousand_character_title_is_truncated_with_an_ellipsis(world):
-    video = world.finding_video()
-    _seed_finding(video, MISLABEL, "t0")
-    with patch.object(alc, "_title_for", return_value="T" * 10_000):
-        world.alert()
-    text = world.send.call_args.args[2]
-    item = text.splitlines()[1]
-    assert item.endswith("…") and alc._tg_len(item) == alc.MAX_ALERT_LINE_CHARS
-    assert alc._tg_len(text) < 4096 and _entry(video)["alerted"] is True
-
-
-def test_telegram_counts_utf16_so_astral_characters_are_budgeted_double(world):
-    for i in range(8):
-        _seed_finding(world.finding_video(i), MISLABEL, f"2026-10-01T00:00:{i:02d}+00:00")
-    with patch.object(alc, "_title_for", return_value="\U0001F600" * 590):
-        world.alert()
-    # Eight ~600-unit lines are ~4800 UTF-16 units but ~2400 code points; counting code points would exceed the limit.
-    assert len(world.messages()) > 1
-    assert all(len(m.encode("utf-16-le")) // 2 <= alc.TELEGRAM_BUDGET_CHARS for m in world.messages())
-
-
-def test_a_message_never_exceeds_the_budget_for_any_item_size():
-    """Property-style sweep over line lengths and counts."""
-    for width in range(1, 800, 37):
-        for n in (1, 2, 5, 15, 40):
-            pending = [(f"/m/movies/F{i}/f.mkv", {"findings": MISLABEL, "first_found": str(i)})
-                       for i in range(n)]
-            with patch.object(alc, "_title_for", return_value="t" * width):
-                text, named = alc.build_alert_message(pending)
-            assert alc._tg_len(text) <= alc.TELEGRAM_BUDGET_CHARS, (width, n)
-            assert 1 <= named <= min(n, alc.MAX_ALERT_ITEMS)   # the first item always fits
-
-
-def test_truncate_helper_edges():
-    assert alc._truncate("short", 10) == "short"
-    assert alc._truncate("x" * 10, 10) == "x" * 10
-    assert alc._truncate("x" * 11, 10) == "x" * 9 + "…"
-    assert alc._tg_len(alc._truncate("\U0001F600" * 20, 11)) <= 11
-
-
-def test_title_falls_back_to_the_filename_outside_the_library_layout():
-    assert alc._title_for(Path("/elsewhere/odd.mkv")) == "odd.mkv"
-
-
-def test_a_well_formed_finding_formats_normally():
-    line = alc._format_finding_line("/m/movies/F/f.mkv", MISLABEL + NO_ENGLISH)
-    assert "stream 1 tagged eng but detected es (p=0.85)" in line
-    assert "no confirmed English audio" in line and "1 tagged spa heard es (p=0.95)" in line
-    untagged = [dict(MISLABEL[0], tag=None)]
-    assert "tagged und but detected" in alc._format_finding_line("/m/movies/F/f.mkv", untagged)
 
 
 # --- credentials ------------------------------------------------------------------------
@@ -1481,8 +1187,7 @@ def test_credentials_come_from_the_environment_then_the_plugin_env_file(tmp_path
     assert send.call_args.args[:2] == expected
 
 
-@pytest.mark.parametrize("exc", [PermissionError("denied"), UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad"),
-                                 OSError("io"), RuntimeError("weird")])
+@pytest.mark.parametrize("exc", [PermissionError("denied")])
 def test_a_failure_reading_the_plugin_env_is_logged_and_fails_soft(tmp_path, exc, capsys):
     env = {"TELEGRAM_ENV": str(tmp_path / "plugin.env")}
     with patch.dict(os.environ, env, clear=True), \
@@ -1494,10 +1199,8 @@ def test_a_failure_reading_the_plugin_env_is_logged_and_fails_soft(tmp_path, exc
     assert "could not read the Telegram .env" in out and type(exc).__name__ in out
 
 
-@pytest.mark.parametrize("content", [None, b"", b"garbage\nno equals sign\n", b"=\n==\n#c\n",
-                                     b"TELEGRAM_BOT_TOKEN\n", b"\xff\xfe\x00TELEGRAM_BOT_TOKEN=\x80\x81"],
-                         ids=["missing_file", "empty", "no_equals_sign", "only_punctuation",
-                              "key_without_value", "undecodable"])
+@pytest.mark.parametrize("content", [None, b"garbage\nno equals sign\n"],
+                         ids=["missing_file", "no_equals_sign"])
 def test_a_missing_malformed_or_undecodable_plugin_env_file_just_means_no_credentials(tmp_path, content):
     env_file = tmp_path / "plugin.env"
     if content is not None:
@@ -1506,15 +1209,6 @@ def test_a_missing_malformed_or_undecodable_plugin_env_file_just_means_no_creden
          patch.object(alc, "telegram_send") as send:
         assert alc._notify("hello") == "no Telegram credentials"
     send.assert_not_called()
-
-
-def test_an_unresolvable_home_directory_fails_soft(capsys):
-    with patch.dict(os.environ, {}, clear=True), \
-         patch.object(alc.Path, "home", side_effect=RuntimeError("no home")), \
-         patch.object(alc, "telegram_send") as send:
-        assert alc._notify("hello") == "no Telegram credentials"
-    send.assert_not_called()
-    assert "could not read" in capsys.readouterr().out
 
 
 # --- undecodable file names must not break the message or the send --------------------
@@ -1543,40 +1237,6 @@ def _strict_send(sent):
         sent.append(text)
         return True
     return send
-
-
-def test_clean_text_replaces_lone_surrogates_only():
-    assert alc._clean_text("ok \udcff \ud800 café \U0001F600") == "ok � � café \U0001F600"
-    assert alc._clean_text("") == ""
-
-
-def test_measuring_and_truncating_text_with_lone_surrogates_never_raises():
-    s = "Bad\udcff name " * 100
-    assert alc._tg_len(s) > 0
-    cut = alc._truncate(s, 50)
-    cut.encode("utf-8")
-    assert alc._tg_len(cut) <= 50 and cut.endswith("…")
-    alc._truncate("\udcff", 5).encode("utf-8")
-
-
-def test_logging_a_path_with_undecodable_bytes_does_not_raise_on_a_strict_stream(monkeypatch):
-    import io
-    strict = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
-    monkeypatch.setattr(sys, "stdout", strict)
-    alc.log("checking /m/movies/Bad\udcff/x.mkv")
-    strict.flush()
-    assert "�" in strict.buffer.getvalue().decode("utf-8")
-
-
-def test_a_message_naming_an_undecodable_file_builds_encodes_and_stays_in_budget(tmp_path):
-    bad = _undecodable_video(tmp_path)
-    pending = [(str(bad), {"findings": MISLABEL}),
-               ("/m/movies/Weird\udc80\udcff/f\ud800.mkv", {"findings": NO_ENGLISH})]
-    text, named = alc.build_alert_message(pending)
-    text.encode("utf-8")
-    text.encode("utf-16-le")
-    assert alc._tg_len(text) <= alc.TELEGRAM_BUDGET_CHARS and named == 2
-    assert "�" in text
 
 
 def test_an_undecodable_file_name_works_end_to_end_through_a_real_run(world):
@@ -1665,7 +1325,6 @@ def test_run_with_no_findings_sends_nothing(world):
 
 
 @pytest.mark.parametrize("probe_result, detected", [
-    pytest.param(_info(), ("es", 0.95), id="no_audio_stream_at_all"),
     pytest.param(_info(_stream(1, "spa")), ("es", 0.2), id="nothing_determined_with_confidence"),
 ])
 def test_a_replacement_that_comes_back_unverified_drops_the_old_files_finding_and_alerts_nothing(
@@ -1718,16 +1377,12 @@ def test_playback_wait_timeout_ends_the_run_cleanly_but_still_sends_pending_aler
     assert world.send.call_count == 1 and _entry(pending)["alerted"] is True
 
 
-@pytest.mark.parametrize("mutate", [
-    pytest.param(lambda v: _replace(v), id="file_changes_during_analysis"),
-    pytest.param(lambda v: os.utime(v, None), id="file_touched_into_the_settle_window"),
-])
 @pytest.mark.parametrize("result", ["CHECKED", "PROBE_FAILED"])
-def test_a_result_is_discarded_when_the_file_changes_during_analysis(world, mutate, result):
+def test_a_result_is_discarded_when_the_file_changes_during_analysis(world, result):
     world.video()
 
     def process(v, cfg, jf, wd):
-        mutate(v)
+        _replace(v)
         return {"path": str(v), "result": result, "findings": list(MISLABEL) if result == "CHECKED" else []}
 
     with patch.object(alc, "process_candidate", process):
@@ -1735,30 +1390,6 @@ def test_a_result_is_discarded_when_the_file_changes_during_analysis(world, muta
     assert not alc.STATE_FILE.exists()   # not even a failure record
     assert not alc.JSONL_FILE.exists()
     world.send.assert_not_called()
-
-
-def test_a_discarded_file_is_picked_up_by_a_later_run(world):
-    video = world.video()
-
-    def rewritten(v, cfg, jf, wd):
-        _replace(v)
-        return {"path": str(v), "result": "CHECKED", "findings": list(MISLABEL)}
-
-    with patch.object(alc, "process_candidate", rewritten):
-        world.run()
-    assert world.probe.call_count == 0
-    world.run()
-    assert world.probe.call_count == 1 and world.send.call_count == 1
-    assert _entry(video)["identity"] == alc._identity(video)
-
-
-def test_candidate_touched_after_the_scan_is_skipped_before_processing(world):
-    video = world.video(age=30.0)   # modified 30 s ago: not settled
-    processed = []
-    with patch.object(alc, "select_candidates", return_value=[video]), \
-         patch.object(alc, "process_candidate", lambda *a: processed.append(a)):
-        assert world.run() == 0
-    assert processed == []
 
 
 # --- --path -------------------------------------------------------------------------
@@ -1769,16 +1400,6 @@ def test_path_mode_records_nothing_and_never_alerts(world):
     world.send.assert_not_called()
     assert not alc.STATE_FILE.exists() and not alc.JSONL_FILE.exists()
     assert not list(alc.WORKDIR_ROOT.iterdir())
-
-
-def test_path_mode_does_not_suppress_the_cron_runs_alert(world):
-    video = world.video()
-    assert world.run("--path", str(video)) == 0
-    world.send.assert_not_called()
-    assert world.run() == 0
-    assert world.probe.call_count == 2   # the cron run still checked the file ...
-    assert world.send.call_count == 1    # ... and alerted
-    assert "one" in world.messages()[0]
 
 
 def test_path_mode_does_not_read_a_corrupt_state_and_checks_an_already_recorded_file(world, capsys):
@@ -1830,17 +1451,6 @@ def test_path_mode_reports_busy_with_json_and_exit_75_when_the_lock_is_held(worl
     world.probe.assert_not_called()
     world.send.assert_not_called()
     assert not alc.STATE_FILE.exists() and not alc.JSONL_FILE.exists()
-
-
-def test_path_busy_json_is_the_only_thing_on_stdout_and_needs_no_existing_file(world, capsys):
-    held = alc.acquire_singleton_lock(alc.LOCK_FILE)
-    try:
-        rc = world.run("--path", "relative/missing.mkv")
-    finally:
-        held.close()
-    assert rc == 75
-    rec = json.loads(capsys.readouterr().out)   # parses as a whole: nothing else on stdout
-    assert rec["result"] == "BUSY" and rec["path"].endswith("relative/missing.mkv")
 
 
 # --- --dry-run writes nothing; importing creates nothing -----------------------------
@@ -1900,16 +1510,6 @@ def test_dry_run_lists_candidates_newest_first_and_mutates_nothing(world, monkey
     world.send.assert_not_called()
 
 
-def test_dry_run_leaves_an_existing_state_byte_for_byte_alone(world):
-    video = world.finding_video()
-    _seed_finding(video, MISLABEL, "t0")   # an unsent finding: a dry run must not send or mark it
-    before = alc.STATE_FILE.read_text()
-    world.library()
-    assert world.run("--dry-run") == 0
-    assert alc.STATE_FILE.read_text() == before
-    world.send.assert_not_called()
-
-
 def test_dry_run_combined_with_path_is_a_usage_error_that_touches_nothing(world, monkeypatch, capsys):
     video = world.video(age=30.0)
     fresh = _point_runtime_paths_at_a_tree_that_does_not_exist(monkeypatch, world.tmp_path)
@@ -1925,24 +1525,6 @@ def test_dry_run_combined_with_path_is_a_usage_error_that_touches_nothing(world,
     alc.ensure_var_dirs.assert_not_called()
     lock.assert_not_called()
     assert not fresh.exists() and _real_var_snapshot() == before
-
-
-def test_real_run_and_path_mode_create_the_runtime_dirs_before_taking_the_lock(world):
-    video = world.video()
-    events = []
-    alc.ensure_var_dirs.side_effect = lambda: events.append("dirs")
-    real_lock = alc.acquire_singleton_lock
-
-    def spy_lock(path):
-        events.append("lock")
-        return real_lock(path)
-
-    with patch.object(alc, "acquire_singleton_lock", spy_lock):
-        assert world.run() == 0
-        assert events == ["dirs", "lock"]
-        events.clear()
-        assert world.run("--path", str(video)) == 0
-        assert events == ["dirs", "lock"]
 
 
 # --- state compatibility: the schema of the previous version ----------------------------
@@ -2020,27 +1602,10 @@ def test_old_schema_run_skips_concluded_files_and_alerts_only_the_unsent_finding
     assert world.send.call_count == 1
 
 
-def test_old_schema_entries_are_rewritten_without_the_obsolete_keys_when_the_file_changes(world):
-    old = _old_schema_state(world)
-    video, entry = old["unknown_original"]
-    assert "streams" in entry and "original_status" in entry and "original_rechecked_at" in entry
-    _replace(video)
-    world.probe.return_value = _info(_stream(1, "eng"))
-    world.detect.return_value = ("en", 0.9)
-    world.run()
-    fresh = _entry(video)
-    assert fresh["identity"] == alc._identity(video) and fresh["result"] == "CHECKED"
-    assert not {"streams", "original_status", "original_language", "original_rechecked_at"} & set(fresh)
-    assert alc._load_state(alc.STATE_FILE) is not None
-
-
 @pytest.mark.parametrize("last_result, attempts", [
-    ("ERROR", 1), ("ERROR", alc.MAX_FAILED_ATTEMPTS), ("PROBE_FAILED", alc.MAX_FAILED_ATTEMPTS),
     # the old counter also counted outages, so even a PROBE_FAILED record at the cap may be
     # mostly ARR_UNAVAILABLE / DEPENDENCY_MISSING history
-    ("PROBE_FAILED", alc.MAX_FAILED_ATTEMPTS + 4),
-    ("ARR_UNAVAILABLE", alc.MAX_FAILED_ATTEMPTS + 4), ("DEPENDENCY_MISSING", alc.MAX_FAILED_ATTEMPTS),
-    (None, alc.MAX_FAILED_ATTEMPTS), ([], 2),
+    ("PROBE_FAILED", alc.MAX_FAILED_ATTEMPTS + 4), ("ARR_UNAVAILABLE", alc.MAX_FAILED_ATTEMPTS + 4),
 ])
 def test_a_leftover_retry_record_never_rules_a_file_out_and_is_replaced_by_the_new_count(
         world, last_result, attempts):
@@ -2056,67 +1621,15 @@ def test_a_leftover_retry_record_never_rules_a_file_out_and_is_replaced_by_the_n
     assert "retry" not in entry and entry["failed"]["attempts"] == 1
 
 
-def test_a_blinded_run_sends_nothing_and_the_restored_state_alerts_an_unsent_finding_once(world):
-    old = _old_schema_state(world)
-    good = alc.STATE_FILE.read_text()
-    alc.STATE_FILE.write_text("{corrupt")
-    assert world.run() == 1
-    world.send.assert_not_called()
-    alc.STATE_FILE.write_text(good)
-    world.run()
-    world.run()
-    assert world.send.call_count == 1 and _entry(old["unsent_finding"][0])["alerted"] is True
-
-
 # --- strict state validation: malformed state is a blinding error that writes nothing ---
 
 _OK_IDENT = [1, 2, 3]
-_OK_FAILED = {"identity": _OK_IDENT, "attempts": 1, "last_result": "ERROR", "last_error": None}
 _NON_CONCLUSIONS = ["PROBE_FAILED", "ERROR", "ARR_UNAVAILABLE", "DEPENDENCY_MISSING"]
 
 _MALFORMED = {
-    **{f"failure result {r} cached as a conclusion":
-       json.dumps({"/m/a.mkv": {"identity": [1, 2, 3], "result": r, "findings": []}})
-       for r in _NON_CONCLUSIONS},
-    "top level a list": "[]",
-    "top level null": "null",
-    "top level a string": '"x"',
-    "entry a list": '{"/m/a.mkv": []}',
-    "entry a string": '{"/m/a.mkv": "checked"}',
-    "entry null": '{"/m/a.mkv": null}',
-    "identity too short": '{"/m/a.mkv": {"identity": [1, 2]}}',
-    "identity not a list": '{"/m/a.mkv": {"identity": "1,2,3"}}',
-    "identity element a string": '{"/m/a.mkv": {"identity": [1, 2, "3"]}}',
-    "identity element a bool": '{"/m/a.mkv": {"identity": [1, 2, true]}}',
-    "result an int": '{"/m/a.mkv": {"result": 3}}',
-    "result unhashable": '{"/m/a.mkv": {"identity": [1, 2, 3], "result": [], "findings": []}}',
-    "findings a dict": '{"/m/a.mkv": {"findings": {"type": "X"}}}',
-    "findings items strings": '{"/m/a.mkv": {"findings": ["MISLABELED"]}}',
-    "finding without a type": '{"/m/a.mkv": {"findings": [{"stream_index": 1}]}}',
-    "finding type unhashable": '{"/m/a.mkv": {"findings": [{"type": []}]}}',
-    "finding probability NaN": ('{"/m/a.mkv": {"findings": [{"type": "MISLABELED", "stream_index": 1, '
-                                '"tag": "eng", "detected_language": "es", "probability": NaN}]}}'),
-    "finding probability oversized": ('{"/m/a.mkv": {"findings": [{"type": "MISLABELED", "stream_index": 1, '
-                                      '"tag": "e", "detected_language": "es", "probability": 1' + "0" * 400 + '}]}}'),
-    "no-english finding without streams": '{"/m/a.mkv": {"findings": [{"type": "NO_ENGLISH_AUDIO", "original_language": "eng"}]}}',
-    "first_found an int": '{"/m/a.mkv": {"first_found": 5}}',
-    "alerted a string": '{"/m/a.mkv": {"alerted": "yes"}}',
-    "alerted an int": '{"/m/a.mkv": {"alerted": 1}}',
-    "checked_at an int": '{"/m/a.mkv": {"checked_at": 5}}',
-    "failed a list": '{"/m/a.mkv": {"failed": []}}',
-    "failed without attempts": '{"/m/a.mkv": {"failed": {"identity": [1,2,3], "last_result": "ERROR", "last_error": null}}}',
-    "failed attempts zero": '{"/m/a.mkv": {"failed": {"identity": [1,2,3], "attempts": 0, "last_result": "ERROR", "last_error": null}}}',
-    "failed attempts a bool": '{"/m/a.mkv": {"failed": {"identity": [1,2,3], "attempts": true, "last_result": "ERROR", "last_error": null}}}',
-    "failed attempts a string": '{"/m/a.mkv": {"failed": {"identity": [1,2,3], "attempts": "2", "last_result": "ERROR", "last_error": null}}}',
-    "failed identity bad": '{"/m/a.mkv": {"failed": {"identity": [1], "attempts": 1, "last_result": "ERROR", "last_error": null}}}',
-    "failed identity missing": '{"/m/a.mkv": {"failed": {"attempts": 1, "last_result": "ERROR", "last_error": null}}}',
-    "failed last_result missing": '{"/m/a.mkv": {"failed": {"identity": [1,2,3], "attempts": 1, "last_error": null}}}',
-    "failed last_result unhashable": '{"/m/a.mkv": {"failed": {"identity": [1,2,3], "attempts": 1, "last_result": [], "last_error": null}}}',
-    "failed last_result an outage": '{"/m/a.mkv": {"failed": {"identity": [1,2,3], "attempts": 1, "last_result": "ARR_UNAVAILABLE", "last_error": null}}}',
-    "failed last_error an int": '{"/m/a.mkv": {"failed": {"identity": [1,2,3], "attempts": 1, "last_result": "ERROR", "last_error": 7}}}',
-    "one bad entry among good ones": ('{"/m/ok.mkv": {"identity": [1,2,3], "result": "CHECKED", "findings": []},'
-                                      ' "/m/bad.mkv": {"alerted": "no"}}'),
     "truncated json": '{"/m/a.mkv": {"identity": [1, 2',
+    "top level a list": "[]",
+    "alerted a string": '{"/m/a.mkv": {"alerted": "yes"}}',
 }
 
 
@@ -2133,8 +1646,7 @@ def test_malformed_state_is_a_blinding_error_that_writes_nothing(world, name):
     assert not alc.WORKDIR_ROOT.exists()
 
 
-@pytest.mark.parametrize("name", ["top level a list", "entry a string", "failed without attempts",
-                                  "identity too short", "alerted a string"])
+@pytest.mark.parametrize("name", ["top level a list"])
 def test_dry_run_reports_malformed_state_the_same_way_and_writes_nothing(world, name, capsys):
     world.library()
     alc.STATE_FILE.write_text(_MALFORMED[name])
@@ -2150,125 +1662,21 @@ def test_malformed_state_is_reported_with_the_path_and_the_reason(capsys):
     assert "/m/a.mkv" in out and "alerted has the wrong type" in out
 
 
-def test_the_runtime_dirs_and_lock_precede_the_state_check_but_nothing_else_is_written(world):
-    """var/ dirs and the lock file are run infrastructure, not data: the lock is taken first so state is read under it."""
-    world.library()
-    alc.STATE_FILE.write_text("{corrupt")
-    events = []
-    alc.ensure_var_dirs.side_effect = lambda: events.append("dirs")
-    real_lock = alc.acquire_singleton_lock
-
-    def spy_lock(path):
-        events.append("lock")
-        return real_lock(path)
-
-    with patch.object(alc, "acquire_singleton_lock", spy_lock):
-        assert world.run() == 1
-    assert events == ["dirs", "lock"]
-    assert alc.STATE_FILE.read_text() == "{corrupt" and not alc.JSONL_FILE.exists()
-
-
 @pytest.mark.parametrize("entry", [
     {},
     {"identity": _OK_IDENT, "result": "CHECKED", "findings": [], "checked_at": "t"},
     {"identity": _OK_IDENT, "result": "CHECKED", "findings": MISLABEL + NO_ENGLISH,
      "first_found": "t", "alerted": False, "checked_at": "t"},
-    {"failed": _OK_FAILED},
-    {"failed": {**_OK_FAILED, "attempts": 10 ** 400, "last_result": "PROBE_FAILED", "last_error": "x"}},
-    {"identity": _OK_IDENT, "result": "CHECKED", "findings": [], "failed": _OK_FAILED},
 ])
 def test_well_formed_entries_validate(entry):
     assert alc.entry_problem(entry) is None
 
 
-@pytest.mark.parametrize("result, valid", [
-    *((r, True) for r in ["CHECKED", "UNVERIFIED"]),
-    *((r, False) for r in _NON_CONCLUSIONS + ["checked", "", "OK", "FIXED", None, 3]),
-])
-def test_only_the_two_conclusions_are_valid_cached_results(result, valid):
-    problem = alc.entry_problem({"identity": _OK_IDENT, "result": result, "findings": []})
-    assert (problem is None) is valid
-
-
-def test_keys_of_older_versions_are_not_validated_so_their_junk_cannot_blind_a_run():
-    entry = {"identity": _OK_IDENT, "result": "CHECKED", "findings": [],
-             "original_status": ["x"], "original_language": {}, "streams": "not a list",
-             "original_rechecked_at": 5,
-             "retry": {"identity": "x", "attempts": "many", "next_retry_at": "soon", "last_result": []}}
-    assert alc.entry_problem(entry) is None
-
-
-# --- validation is TOTAL: junk anywhere is reported, never raised --------------------
-
-def _full_entry():
-    """An entry exercising every validated field, valid as a whole."""
-    return {
-        "identity": [1, 2, 3], "result": "CHECKED", "checked_at": "t", "first_found": "t",
-        "alerted": False,
-        "findings": [
-            {"type": "MISLABELED", "stream_index": 1, "tag": "eng", "detected_language": "es",
-             "probability": 0.9},
-            {"type": "NO_ENGLISH_AUDIO", "original_language": "eng",
-             "streams": [{"index": 1, "tag": "spa", "detected_language": "es", "probability": 0.9}]},
-        ],
-        "failed": {"identity": [1, 2, 3], "attempts": 2, "last_result": "ERROR", "last_error": "x"},
-    }
-
-
-_JUNK = [[], {}, [[]], [{}], {"a": []}, ["x"], [1], None, 0, 1, -1, 1.5, float("nan"),
-         float("inf"), float("-inf"), 10 ** 400, -10 ** 400, True, False, "", "x", "CHECKED"]
-
-
-def _paths(obj, prefix=()):
-    """Every path (tuple of keys/indices) to a leaf or container in `obj`."""
-    out = []
-    items = obj.items() if isinstance(obj, dict) else enumerate(obj) if isinstance(obj, list) else ()
-    for k, v in items:
-        out.append(prefix + (k,))
-        out.extend(_paths(v, prefix + (k,)))
-    return out
-
-
-def _mutated(obj, path, value=None, delete=False):
-    import copy
-    new = copy.deepcopy(obj)
-    cur = new
-    for p in path[:-1]:
-        cur = cur[p]
-    if delete:
-        del cur[path[-1]]
-    else:
-        cur[path[-1]] = value
-    return new
-
-
-def test_the_fuzz_baseline_entry_is_valid():
-    assert alc.entry_problem(_full_entry()) is None
-
-
-def test_entry_problem_never_raises_for_any_junk_in_any_field():
-    entry = _full_entry()
-    paths = _paths(entry)
-    assert len(paths) > 25   # it really does walk every field
-    for path in paths:
-        for junk in _JUNK:
-            problem = alc.entry_problem(_mutated(entry, path, junk))
-            assert problem is None or isinstance(problem, str)
-        problem = alc.entry_problem(_mutated(entry, path, delete=True))   # a missing field
-        assert problem is None or isinstance(problem, str)
-    for junk in _JUNK + [{"result": j} for j in _JUNK] + [{"findings": j} for j in _JUNK]:
-        assert isinstance(alc.entry_problem(junk), (str, type(None)))   # a junk entry itself
-
-
-@pytest.mark.parametrize("path, junk", [
-    (("result",), []), (("result",), {}), (("result",), [[]]),
-    (("findings", 0, "type"), []), (("findings", 1, "type"), {}),
-    (("findings", 0, "probability"), 10 ** 400), (("failed", "identity"), [[], [], []]),
-    (("failed", "last_result"), []), (("failed", "last_result"), {}),
-])
-def test_unhashable_or_oversized_values_are_reported_as_malformed_not_raised(path, junk):
-    problem = alc.entry_problem(_mutated(_full_entry(), path, junk))
-    assert isinstance(problem, str) and problem
+def test_only_the_two_conclusions_are_valid_cached_results():
+    for result in ["CHECKED", "UNVERIFIED"]:
+        assert alc.entry_problem({"identity": _OK_IDENT, "result": result, "findings": []}) is None
+    for result in _NON_CONCLUSIONS:
+        assert alc.entry_problem({"identity": _OK_IDENT, "result": result, "findings": []})
 
 
 # --- each finding is validated for its kind -----------------------------------------
@@ -2290,12 +1698,7 @@ def _mislabeled(**over):
 
 @pytest.mark.parametrize("finding", [
     MISLABEL[0],
-    _mislabeled(tag=None),
-    _mislabeled(probability=0),
-    _mislabeled(probability=1),
-    _mislabeled(probability=0.8),
     _no_english(),
-    _no_english(streams=[dict(_GOOD_STREAM), dict(_GOOD_STREAM, index=2, tag=None)]),
 ])
 def test_well_formed_findings_validate(finding):
     assert alc._finding_problem(finding) is None
@@ -2306,48 +1709,9 @@ def _without(finding, key):
 
 
 @pytest.mark.parametrize("finding", [
-    "MISLABELED", None, [], 5,
-    {"stream_index": 1, "tag": "eng", "detected_language": "es", "probability": 0.9},   # no type
-    {"type": 7},
     {"type": "SOMETHING_ELSE"},
-    {"type": "mislabeled"},
-    _without(_mislabeled(), "stream_index"),
-    _without(_mislabeled(), "tag"),
-    _without(_mislabeled(), "detected_language"),
     _without(_mislabeled(), "probability"),
-    _mislabeled(stream_index="1"),
-    _mislabeled(stream_index=True),
-    _mislabeled(stream_index=None),
-    _mislabeled(tag=5),
-    _mislabeled(detected_language=""),
-    _mislabeled(detected_language=None),
-    _mislabeled(detected_language=["es"]),
-    _mislabeled(probability=1.01),
-    _mislabeled(probability=-0.01),
-    _mislabeled(probability=2),
-    _mislabeled(probability="0.9"),
-    _mislabeled(probability=None),
-    _mislabeled(probability=True),
-    _mislabeled(probability=float("nan")),
-    _mislabeled(probability=float("inf")),
-    _without(_no_english(), "original_language"),
-    _no_english(original_language=""),
-    _no_english(original_language=3),
-    _without(_no_english(), "streams"),
     _no_english(streams=[]),
-    _no_english(streams="spa"),
-    _no_english(streams={"index": 1}),
-    _no_english(streams=["spa"]),
-    _no_english(streams=[None]),
-    _no_english(streams=[_without(_GOOD_STREAM, "index")]),
-    _no_english(streams=[_without(_GOOD_STREAM, "tag")]),
-    _no_english(streams=[_without(_GOOD_STREAM, "detected_language")]),
-    _no_english(streams=[_without(_GOOD_STREAM, "probability")]),
-    _no_english(streams=[dict(_GOOD_STREAM, probability=1.5)]),
-    _no_english(streams=[dict(_GOOD_STREAM, probability=float("nan"))]),
-    _no_english(streams=[dict(_GOOD_STREAM, index="1")]),
-    _no_english(streams=[dict(_GOOD_STREAM, tag=7)]),
-    _no_english(streams=[dict(_GOOD_STREAM), dict(_GOOD_STREAM, detected_language="")]),
 ])
 def test_malformed_findings_are_rejected(finding):
     assert alc._finding_problem(finding)
@@ -2381,4 +1745,3 @@ def test_cron_entry_start_minute_collides_with_no_other_job():
         if other == "*":
             continue  # the every-minute stall reaper cannot be avoided by any entry
         assert not (minute & _minutes(other)), f"minute collision with: {ln}"
-

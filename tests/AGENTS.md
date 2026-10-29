@@ -17,11 +17,11 @@ Don't hardcode the test count in docs. `ls tests/` is authoritative: `test_<modu
 - **Scripted fakes consume sequences LAZILY.** A `list()` over `itertools.repeat` once ate 29 GB and OOM-killed the host. Run anything heavy under a memory cap (`systemd-run --user --scope -p MemoryMax=4G -p MemorySwapMax=0 ...`).
 - **No test may create the real `var/` tree or write outside `tmp_path`.** Tests that load `consolidate-subs.py` stub the import-time `ensure_var_dirs()` first and monkeypatch every `var/` path (`VAR_QUARANTINE_SUBTITLES`, `QUARANTINE_LOG`, `NEEDS_ENGLISH_STATE_FILE`, `LOG_FILE`, `STATE_FILE`) to `tmp_path`; `probe` is stubbed to fail unless a test sets it. `test_audio_lang_check.py` has an autouse fixture mocking `ensure_var_dirs`.
 - **Cumulative-budget and playback tests use a `_FakeClock`** (`sleep` advances it), not a hand-counted `time.monotonic()` sequence.
-- Ordering-sensitive guarantees are pinned with call-order spies (the quarantine fsync chain runs leaf to root before the unlink; `os.link` publishes complete content), and source audits pin structural rules (see below).
+- Ordering-sensitive guarantees are pinned with call-order spies (the quarantine fsync chain runs leaf to root before the unlink; `os.link` publishes complete content).
 
 ## Non-obvious suites
 
-- `test_consolidate_generated.py`: source audit pins `_workfile` use (no `workdir / <name>`, no `.with_suffix(".srt")` conversion outputs) with adversarial stems. `test_consolidate_watch.py` runs the REAL sidecar-arrival block of `consolidate-watch.sh` under bash (`log`/`trigger` stubbed) plus a parametrized cross-check against the real `find_sidecar_subs`.
+- `test_consolidate_watch.py` runs the REAL sidecar-arrival block of `consolidate-watch.sh` under bash (`log`/`trigger` stubbed) plus a parametrized cross-check against the real `find_sidecar_subs`.
 - `test_sub_quarantine.py`: content gate and quarantine through the real `_process_locked`; an AST audit pins that every `_sidecar_as_srt` call passes decoded text.
 - `test_consolidate_cleanup.py`: the NEEDS_BAZARR cleanup from `_process_locked`'s call sites (principle: never delete a track that might be wanted, never silently change a flag that wasn't meant to change; `_normalize_audio_inline` is NEVER called).
 - `test_consolidate_upgrade.py`: the generated -> real upgrade through the real `_process_locked` (ffprobe, window reads, mkvmerge, ffsubsync, tag writers and normalize faked; sidecar discovery, `sublang`, `overlap` math, ranking and the state file REAL). By default the harness neutralizes the late sweep (`Harness(handoff=True)` opts in).

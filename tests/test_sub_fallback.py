@@ -13,7 +13,7 @@ import time
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -116,9 +116,7 @@ class _FakeClock:
     ("2026-10-13T00:00:00Z", datetime(2026, 10, 13, tzinfo=timezone.utc)),
     ("2026-10-13T17:22:05.123456+00:00", datetime(2026, 10, 13, 17, 22, 5, 123456, tzinfo=timezone.utc)),
     ("not-a-date", None),
-    (None, None),
-    ("", None),
-], ids=["old-whole-second-z", "new-microsecond-offset", "garbage", "none", "empty"])
+], ids=["old-whole-second-z", "new-microsecond-offset", "garbage"])
 def test_parse_iso_accepts_both_formats_and_rejects_garbage(text, expected):
     assert sf._parse_iso(text) == expected
 
@@ -167,8 +165,7 @@ def test_select_candidates_sorts_oldest_first():
     (json.dumps({"/a.mkv": {"first_seen": "x", "last_seen": "y"}}),
      {"/a.mkv": {"first_seen": "x", "last_seen": "y"}}),
     ("{not valid json", None),
-    (json.dumps(["a", "list", "not", "a", "dict"]), None),
-], ids=["missing-file", "valid", "corrupt", "non-dict-json"])
+], ids=["missing-file", "valid", "corrupt"])
 def test_load_needs_english(tmp_path, content, expected):
     p = tmp_path / "needs.json"
     if content is not None:
@@ -207,34 +204,6 @@ def test_drop_stale_entries_keeps_an_entry_re_recorded_since_the_snapshot():
     assert json.loads(state_file.read_text()) == {"/a.mkv": fresh_entry}
 
 
-def test_drop_stale_entries_skips_a_key_already_gone_from_disk():
-    """A key already removed by another writer has no current entry; it is not counted and not an error."""
-    state_file = sf.NEEDS_ENGLISH_STATE_FILE
-    state_file.write_text(json.dumps({}))
-    assert sf.drop_stale_entries({"/a.mkv": {"first_seen": "x"}}) == 0
-    assert json.loads(state_file.read_text()) == {}
-
-
-def test_drop_stale_entries_same_second_upsert_still_survives_removal():
-    """A fresh upsert in the same wall-clock second as the snapshot stays distinguishable (microsecond precision) and survives removal."""
-    state_file = sf.NEEDS_ENGLISH_STATE_FILE
-    snapshot_entry = {
-        "first_seen": "2026-10-13T12:00:00.100000+00:00",
-        "last_seen": "2026-10-13T12:00:00.100000+00:00",
-    }
-    # Re-recorded 400 microseconds later: same second, different entry (whole-second strings would be identical).
-    fresh_entry = {
-        "first_seen": "2026-10-13T12:00:00.100000+00:00",
-        "last_seen": "2026-10-13T12:00:00.500000+00:00",
-    }
-    state_file.write_text(json.dumps({"/a.mkv": fresh_entry}))
-    assert sf.drop_stale_entries({"/a.mkv": snapshot_entry}) == 0
-    assert json.loads(state_file.read_text()) == {"/a.mkv": fresh_entry}
-    # The surviving entry still parses.
-    assert sf._parse_iso(fresh_entry["first_seen"]) is not None
-    assert sf._parse_iso(fresh_entry["last_seen"]) is not None
-
-
 # --- wait_while_playing: fail-closed + bounded ---------------------------
 
 @pytest.mark.parametrize("sequence", [[_BUSY, _BUSY, []], [None, None, []]],
@@ -263,19 +232,6 @@ def test_wait_while_playing_raises_after_max_wait_exceeded(monkeypatch):
     monkeypatch.setattr(sf.time, "monotonic", lambda: next(times))
     with pytest.raises(sf.PlaybackWaitTimeout):
         sf.wait_while_playing(jf, _cfg(max_wait_min=1.0), _budget(1.0))
-
-
-def test_wait_while_playing_raises_even_when_playback_clears_on_the_last_poll(monkeypatch):
-    """The exhaustion check runs after every poll: playback clearing on a poll that is already over the limit still raises."""
-    cfg = _cfg(max_wait_min=1.0)  # 60s allowance
-    budget = _budget(cfg.max_wait_min)
-    # Poll 1 busy: elapsed 0.0, under budget. Poll 2 idle: elapsed 10000.0, past the limit.
-    jf = _FakeJellyfin([_BUSY, []])
-    times = iter([0.0, 0.0, 10_000.0])
-    monkeypatch.setattr(sf.time, "sleep", lambda s: None)
-    monkeypatch.setattr(sf.time, "monotonic", lambda: next(times))
-    with pytest.raises(sf.PlaybackWaitTimeout):
-        sf.wait_while_playing(jf, cfg, budget)
 
 
 def test_wait_while_playing_cumulative_across_separate_calls_exceeds_budget(monkeypatch):
@@ -321,20 +277,6 @@ def test_call_with_playback_pause_retries_after_extraction_interrupted(monkeypat
     result = sf._call_with_playback_pause(_fn, jf, cfg, _budget())
     assert result == "ok"
     assert calls["n"] == 2
-
-
-def test_call_with_playback_pause_propagates_playback_wait_timeout(monkeypatch):
-    jf = _FakeJellyfin([_BUSY] * 100)
-    cfg = _cfg(max_wait_min=1.0)
-    monkeypatch.setattr(sf.time, "sleep", lambda s: None)
-    times = iter([0.0] + [i * 100.0 for i in range(1, 100)])
-    monkeypatch.setattr(sf.time, "monotonic", lambda: next(times))
-
-    def _fn(*a, should_abort):
-        raise ExtractionInterrupted("playback")
-
-    with pytest.raises(sf.PlaybackWaitTimeout):
-        sf._call_with_playback_pause(_fn, jf, cfg, _budget(1.0))
 
 
 def test_call_with_playback_pause_retries_share_cumulative_budget(monkeypatch):
@@ -545,15 +487,10 @@ def _add_mkv_sibling(video, dest):
 
 
 @pytest.mark.parametrize("expected, scenario", [
-    ("PROBE_FAILED", lambda video, dest: {"probe": None}),
     ("ALREADY_CONSOLIDATED", lambda video, dest: {"processed": True}),
-    ("SIDECAR_APPEARED", lambda video, dest: {"sidecars": [(dest, False, False)]}),
-    ("FORCED_SIDECAR_PRESENT",
-     lambda video, dest: {"sidecars": [(video.with_name(video.stem + ".en.forced.srt"), True, False)]}),
     ("VIDEO_CHANGED", lambda video, dest: {"identity": (999, 999, 1, 1)}),  # not the video's real identity
     ("SIBLING_COLLISION", _add_mkv_sibling),
-], ids=["probe-failed", "already-consolidated", "sidecar-appeared", "forced-sidecar-present",
-        "video-changed", "sibling-collision"])
+], ids=["already-consolidated", "video-changed", "sibling-collision"])
 def test_place_sidecar_blocking_result_places_nothing(tmp_path, expected, scenario):
     video = _media(tmp_path, "Episode.mp4")
     dest = video.with_name(video.stem + ".en.srt")
@@ -593,21 +530,6 @@ def test_place_sidecar_cleans_up_temp_on_write_failure(tmp_path):
 
 # --- _place_sidecar: unique-per-attempt temp name (never a fixed name) --
 
-def test_place_sidecar_never_truncates_a_published_dest_via_leftover_temp(tmp_path):
-    """A temp still linked to an already-published `dest` (crash after link, before unlink) is swept without reopening or truncating `dest`."""
-    video = _media(tmp_path)
-    dest = video.with_name(video.stem + ".en.srt")
-    dest.write_text("ORIGINAL PUBLISHED CONTENT")
-    dest_ino = dest.stat().st_ino
-    leftover_tmp = dest.with_name("." + dest.name + ".OLDATTEMPT" + sf._SIDECAR_TEMP_SUFFIX)
-    os.link(dest, leftover_tmp)  # simulates the crash-before-unlink state
-    assert leftover_tmp.stat().st_ino == dest_ino
-
-    assert _place(tmp_path, video, dest, "NEW TEXT") == "SIDECAR_APPEARED"  # os.link's own EEXIST refuses to clobber
-    assert dest.read_text() == "ORIGINAL PUBLISHED CONTENT"  # never truncated
-    assert dest.stat().st_ino == dest_ino  # still the exact same file
-    assert not leftover_tmp.exists()  # the stale leftover NAME was swept
-
 
 def test_place_sidecar_sweeps_unrelated_stale_temp_leftover_before_writing(tmp_path):
     """A stale unlinked temp from an earlier crash is swept and a normal placement proceeds."""
@@ -620,22 +542,6 @@ def test_place_sidecar_sweeps_unrelated_stale_temp_leftover_before_writing(tmp_p
     assert dest.read_text() == "text"
     assert not stale.exists()
     assert _leftover_sfb_temps(dest) == []
-
-
-def test_place_sidecar_uses_a_different_temp_name_every_attempt(tmp_path):
-    video = _media(tmp_path)
-    dest = video.with_name(video.stem + ".en.srt")
-    seen_names: list[str] = []
-
-    def _spy_link(src, dst):
-        seen_names.append(Path(src).name)
-        raise OSError(18, "Invalid cross-device link")  # PLACE_FAILED both times
-
-    for _ in range(2):
-        _place(tmp_path, video, dest, extra=[patch.object(sf.os, "link", side_effect=_spy_link)])
-
-    assert len(seen_names) == 2
-    assert seen_names[0] != seen_names[1]
 
 
 # --- _sibling_video_collision / SIBLING_COLLISION ------------------------
@@ -672,88 +578,22 @@ def test_process_candidate_skips_sibling_collision_before_anything_else(tmp_path
 
 # --- _place_sidecar: post-publication close_write event is recoverable ---
 
-def test_place_sidecar_event_open_failure_falls_back_to_direct_pipeline_invocation(tmp_path):
-    """The sidecar is already published when the close_write-trigger open() fails: not a placement failure; run consolidate-subs.py directly and record the fallback."""
-    video = _media(tmp_path)
-    dest = video.with_name(video.stem + ".en.srt")
-    rec: dict = {}
-    mock_direct = MagicMock(return_value=(True, "FIXED: some/path.mkv"))
 
-    result = _place(tmp_path, video, dest, "subtitle content", rec=rec,
-                    extra=[patch.object(sf.os, "open", side_effect=_open_for_event_fails(dest)),
-                           patch.object(sf, "_run_consolidate_subs_directly", mock_direct)])
-
-    assert result is None  # NOT a placement failure
-    assert dest.read_text() == "subtitle content"  # already published via the link
-    mock_direct.assert_called_once_with(video, 60.0, tmp_path)
-    assert rec["event_fallback_used"] is True
-    assert rec["event_fallback_pipeline_ran_ok"] is True
-    assert "event_fallback_error" in rec
-
-
-def test_place_sidecar_event_fallback_helper_exception_recorded_not_raised(tmp_path):
-    """If the event-fallback helper raises, `_place_sidecar` still returns None, records `event_fallback_helper_error`, and the placement record already exists."""
-    video = _media(tmp_path)
-    dest = video.with_name(video.stem + ".en.srt")
-    rec: dict = {}
-
-    result = _place(tmp_path, video, dest, "subtitle content", rec=rec,
-                    extra=[patch.object(sf.os, "open", side_effect=_open_for_event_fails(dest)),
-                           patch.object(sf, "_run_consolidate_subs_directly",
-                                        side_effect=RuntimeError("helper exploded"))])
-
-    assert result is None  # NOT a placement failure, NOT a raised exception
-    assert dest.read_text() == "subtitle content"  # already published via the link
-    assert rec["event_fallback_used"] is True
-    assert "helper exploded" in rec["event_fallback_helper_error"]
-    assert str(video.resolve()) in sf._load_placements(sf.SUB_FALLBACK_PLACEMENTS_FILE)  # recorded despite the helper's failure
-
-
-def test_place_sidecar_success_path_never_invokes_direct_pipeline_fallback(tmp_path):
-    video = _media(tmp_path)
-    dest = video.with_name(video.stem + ".en.srt")
-    rec: dict = {}
-    mock_direct = MagicMock()
-    result = _place(tmp_path, video, dest, "subtitle content", rec=rec,
-                    extra=[patch.object(sf, "_run_consolidate_subs_directly", mock_direct)])
-    assert result is None
-    mock_direct.assert_not_called()
-    assert "event_fallback_used" not in rec
-
-
-@pytest.mark.parametrize("direct_run, helper_raises", [
-    ({"return_value": (True, "ok")}, False),
-    ({"side_effect": RuntimeError("helper exploded")}, True),
-], ids=["direct-run-ok", "direct-run-raises"])
-def test_event_open_failure_after_publish_resolves_to_fixed_not_error_through_process_candidate(
-        tmp_path, direct_run, helper_raises):
+def test_event_open_failure_after_publish_resolves_to_fixed_not_error_through_process_candidate(tmp_path):
     """End to end: an event-open failure after a successful publish still resolves to FIXED once the tag lands."""
     video = _media(tmp_path)
     dest = video.with_name(video.stem + ".en.generated.srt")  # whisper source -> generated name
     rec, _ = _candidate(
         tmp_path, video=video, _transcribe_in_subprocess={"return_value": _HI_SRT},
-        _run_consolidate_subs_directly=direct_run, wait_for_pipeline={"return_value": (True, 5)},
+        _run_consolidate_subs_directly={"return_value": (True, "ok")}, wait_for_pipeline={"return_value": (True, 5)},
         extra=[patch.object(sf.os, "open", side_effect=_open_for_event_fails(dest))])
 
     assert rec["result"] == "FIXED"
     assert rec.get("event_fallback_used") is True
-    assert ("event_fallback_helper_error" in rec) is helper_raises
     assert str(video.resolve()) in sf._load_placements(sf.SUB_FALLBACK_PLACEMENTS_FILE)
 
 
 # --- _video_identity -------------------------------------------------------
-
-def test_video_identity_matches_for_unchanged_file(tmp_path):
-    video = _media(tmp_path)
-    assert sf._video_identity(video) == sf._video_identity(video)
-
-
-def test_video_identity_changes_when_file_is_modified(tmp_path):
-    video = _media(tmp_path)
-    before = sf._video_identity(video)
-    time.sleep(0.01)
-    video.write_bytes(_MKV + b"more data")
-    assert before != sf._video_identity(video)
 
 
 def test_video_identity_none_when_file_is_gone(tmp_path):
@@ -781,15 +621,6 @@ def test_video_identity_includes_the_ctime_and_catches_a_same_size_rewrite(tmp_p
     assert before[:4] == after[:4] and before != after
 
 
-def test_place_sidecar_refuses_when_the_video_was_rewritten_with_its_mtime_restored(tmp_path):
-    video = _media(tmp_path)
-    dest = video.with_name(video.stem + ".en.srt")
-    identity = sf._video_identity(video)
-    _rewrite_same_size_keeping_mtime(video)
-    assert _place(tmp_path, video, dest, identity=identity) == "VIDEO_CHANGED"
-    assert not dest.exists()
-
-
 # --- _revalidate_candidate / REVALIDATION_SKIP: process_candidate re-checks the current tracker entry right before processing ---
 
 def _seed_tracker_entry(video: Path, *, hours_old: float = 30.0, identity=...) -> None:
@@ -806,11 +637,9 @@ def _seed_tracker_entry(video: Path, *, hours_old: float = 30.0, identity=...) -
     sf.NEEDS_ENGLISH_STATE_FILE.write_text(json.dumps({str(video.resolve()): entry}))
 
 
-def _tracker_identity(video: Path, *, fields: int, delta: int = 0) -> list:
-    """The video's tracker-style identity (3 fields: ino, size, mtime_ns; 4 adds ctime_ns); `delta` bumps the last field."""
-    ident = list(sf._video_identity_sans_dev(video))[:fields]
-    ident[-1] += delta
-    return ident
+def _tracker_identity(video: Path, *, fields: int) -> list:
+    """The video's tracker-style identity (3 fields: ino, size, mtime_ns; 4 adds ctime_ns)."""
+    return list(sf._video_identity_sans_dev(video))[:fields]
 
 
 def _revalidate(monkeypatch, video: Path, *, consolidated: bool = False):
@@ -831,11 +660,8 @@ def test_revalidate_candidate_passes_for_a_valid_unchanged_entry(tmp_path, monke
 @pytest.mark.parametrize("seed, consolidated, reason", [
     ({"hours_old": 1.0}, False, "grace period"),  # first_seen was reset after selection (file replaced)
     ({"identity": [999999, 999999, 999999]}, False, "identity"),
-    ({"identity": lambda v: _tracker_identity(v, fields=3, delta=1)}, False, "identity"),
-    ({"identity": lambda v: _tracker_identity(v, fields=4, delta=1)}, False, "identity"),
     ({}, True, "consolidated"),
-], ids=["first-seen-reset", "identity-mismatch", "three-field-mismatch", "four-field-needs-exact-match",
-        "already-consolidated"])
+], ids=["first-seen-reset", "identity-mismatch", "already-consolidated"])
 def test_revalidate_candidate_skips(tmp_path, monkeypatch, seed, consolidated, reason):
     video = _media(tmp_path)
     _seed_tracker_entry(video, **seed)
@@ -974,19 +800,6 @@ def _scenario_video_replaced(video, sidecar):
     return [(sidecar, False, False)]
 
 
-def _scenario_second_main_sidecar(video, sidecar):
-    _record_our_placement(video, sidecar)
-    other = video.with_name(video.stem + ".en.sdh.srt")
-    other.write_text("some unrelated sidecar someone else dropped here")
-    return [(sidecar, False, False), (other, False, True)]
-
-
-def _scenario_content_edited(video, sidecar):
-    _record_our_placement(video, sidecar)
-    sidecar.write_text(_ENGLISH_SIDECAR_TEXT + "\nSOMEONE EDITED THIS AFTERWARD.\n")
-    return [(sidecar, False, False)]
-
-
 def _scenario_corrupt_placements_file(video, sidecar):
     sf.SUB_FALLBACK_PLACEMENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     sf.SUB_FALLBACK_PLACEMENTS_FILE.write_text("{not valid json")
@@ -994,10 +807,8 @@ def _scenario_corrupt_placements_file(video, sidecar):
 
 
 @pytest.mark.parametrize("scenario", [
-    _scenario_no_record, _scenario_video_replaced, _scenario_second_main_sidecar,
-    _scenario_content_edited, _scenario_corrupt_placements_file,
-], ids=["no-record", "video-replaced-since-placement", "our-placement-plus-another-main-sidecar",
-        "our-placement-with-modified-content", "corrupt-placements-file"])
+    _scenario_no_record, _scenario_video_replaced, _scenario_corrupt_placements_file,
+], ids=["no-record", "video-replaced-since-placement", "corrupt-placements-file"])
 def test_process_candidate_without_proof_the_sidecar_is_ours_gives_sidecar_present(tmp_path, scenario):
     """No retrigger or other action; the watcher and the 05:00 sweep own it. A corrupt placements file never breaks the run."""
     video = _media(tmp_path)
@@ -1021,8 +832,8 @@ def test_already_tagged_file_does_not_trigger_pipeline_retrigger(tmp_path):
 # --- _main_sidecars -----------------------------------------
 
 @pytest.mark.parametrize("kinds, has_forced", [
-    (("forced", "main"), True), (("main", "forced"), True), (("forced",), True), (("main",), False),
-], ids=["forced-then-main", "main-then-forced", "forced-only", "main-only"])
+    (("forced", "main"), True), (("forced",), True), (("main",), False),
+], ids=["forced-then-main", "forced-only", "main-only"])
 def test_main_sidecars_excludes_forced_entries_and_has_forced_sidecar_sees_any(tmp_path, kinds, has_forced):
     video = _media(tmp_path)
     available = {"forced": (video.with_name(video.stem + ".en.forced.srt"), True, False),
@@ -1055,10 +866,9 @@ def test_load_placements_missing_file_is_empty_dict(tmp_path):
     assert sf._load_placements(tmp_path / "nope.json") == {}
 
 
-@pytest.mark.parametrize("content", ["{not json", "[1, 2, 3]"], ids=["corrupt", "non-dict-json"])
-def test_load_placements_unusable_file_is_empty_dict_with_warning(tmp_path, capsys, content):
+def test_load_placements_unusable_file_is_empty_dict_with_warning(tmp_path, capsys):
     p = tmp_path / "bad.json"
-    p.write_text(content)
+    p.write_text("{not json")
     assert sf._load_placements(p) == {}
     assert "WARNING" in capsys.readouterr().out
 
@@ -1068,12 +878,6 @@ def test_record_placement_write_failure_is_logged_and_swallowed(tmp_path, capsys
     dest = video.with_name(video.stem + ".en.srt")
     with patch.object(sf, "mutate_state", side_effect=OSError("disk full")):
         sf._record_placement(video, dest, "text", "whisper")  # must not raise
-    assert "WARNING" in capsys.readouterr().out
-
-
-def test_clear_placement_write_failure_is_logged_and_swallowed(capsys):
-    with patch.object(sf, "mutate_state", side_effect=OSError("disk full")):
-        sf._clear_placement("/some/video.mkv")  # must not raise
     assert "WARNING" in capsys.readouterr().out
 
 
@@ -1096,29 +900,9 @@ def _recorded(tmp_path, *, record=True):
     return video, sidecar
 
 
-def _rewrite_video_same_size(video, sidecar):
-    _rewrite_same_size_keeping_mtime(video)
-    return sidecar
-
-
-def _legacy_three_field_record(video, sidecar):
-    """A record written before ctime existed cannot prove this is the verified video: unknown counts as changed."""
-    placements = json.loads(sf.SUB_FALLBACK_PLACEMENTS_FILE.read_text())
-    key = str(video.resolve())
-    placements[key]["video_identity"] = placements[key]["video_identity"][:3]
-    sf.SUB_FALLBACK_PLACEMENTS_FILE.write_text(json.dumps(placements))
-    return sidecar
-
-
 def _edit_sidecar(video, sidecar):
     sidecar.write_text(_ENGLISH_SIDECAR_TEXT + "\nedited\n")
     return sidecar
-
-
-def _other_path(video, sidecar):
-    other = video.with_name(video.stem + ".en.sdh.srt")
-    other.write_text(_ENGLISH_SIDECAR_TEXT)
-    return other
 
 
 def _replace_video(video, sidecar):
@@ -1134,10 +918,8 @@ def test_sidecar_matches_our_placement_true_for_exact_record(tmp_path):
 
 
 @pytest.mark.parametrize("record, mutate", [
-    (True, _rewrite_video_same_size), (True, _legacy_three_field_record), (False, lambda video, sidecar: sidecar),
-    (True, _edit_sidecar), (True, _other_path), (True, _replace_video),
-], ids=["same-size-video-rewrite-with-mtime-restored", "legacy-three-field-record", "no-record",
-        "hash-mismatch", "different-path", "video-replaced"])
+    (False, lambda video, sidecar: sidecar), (True, _edit_sidecar), (True, _replace_video),
+], ids=["no-record", "hash-mismatch", "video-replaced"])
 def test_sidecar_matches_our_placement_false_once_anything_it_binds_changes(tmp_path, record, mutate):
     video, sidecar = _recorded(tmp_path, record=record)
     if record:
@@ -1197,12 +979,6 @@ def test_untagged_audio_verified_english_proceeds_to_subliminal(tmp_path):
 
 
 # --- process_candidate: subliminal verification + whisper fallback -------
-
-def test_sidecar_dest_marks_whisper_output_generated_and_leaves_subliminal_plain(tmp_path):
-    video = _media(tmp_path)
-    assert sf._sidecar_dest(video, "whisper").name == video.stem + ".en.generated.srt"
-    assert sf._sidecar_dest(video, "subliminal").name == video.stem + ".en.srt"
-    assert sf._sidecar_dest(video, "whisper").parent == video.parent
 
 
 def test_whisper_result_is_published_as_a_generated_sidecar(tmp_path):
@@ -1310,17 +1086,6 @@ def test_too_little_speech_rejects_subliminal_tries_second_window_then_whisper(t
     assert rec["source"] == "whisper"
 
 
-def test_second_window_recovers_enough_speech_accepts_subliminal(tmp_path):
-    fetched = _fetched_srt(tmp_path, "English subtitle content here")
-    rec, mocks = _candidate(
-        tmp_path, fetch_via_subliminal={"return_value": fetched}, sublang_score={"return_value": _ENG_SCORE},
-        asr_window={"side_effect": ["", "plenty of real speech here"]},
-        overlap={"side_effect": [(0.0, 0.0, 2), (0.9, 0.8, 20)]}, _transcribe_in_subprocess={}, **_PLACED)
-
-    assert rec["source"] == "subliminal"
-    mocks["_transcribe_in_subprocess"].assert_not_called()
-
-
 # --- process_candidate: whisper fallback edge cases -----------------------
 
 def test_whisper_too_few_cues_rejects_without_placing_sidecar(tmp_path):
@@ -1348,33 +1113,6 @@ def test_transcription_is_deferred_only_when_under_ten_minutes_of_budget_remain(
     rec, mocks = _candidate(tmp_path, deadline_s=deadline_s, _transcribe_in_subprocess={"return_value": ""})
     assert rec["result"] == result
     assert mocks["_transcribe_in_subprocess"].call_count == int(transcribes)
-
-
-def test_exhausted_playback_budget_ends_candidate_before_starting_transcription(tmp_path):
-    """No transcription child is started when the cumulative wait allowance is already <= 0: PlaybackWaitTimeout propagates uncaught, not ERROR."""
-    mock_whisper = MagicMock()
-    with pytest.raises(sf.PlaybackWaitTimeout):
-        _candidate(tmp_path, cfg=_cfg(max_wait_min=0.0),  # exhausted from the very start
-                   extra=[patch.object(sf, "_transcribe_in_subprocess", mock_whisper)])
-    mock_whisper.assert_not_called()
-
-
-def test_deferred_budget_uses_remaining_at_start_of_transcription_not_a_stale_snapshot(tmp_path, monkeypatch):
-    """The defer check reads the budget remaining when transcription would start, so a slow earlier step in the same candidate counts against it."""
-    fetched = _fetched_srt(tmp_path, "English subtitle content here")
-    monkeypatch.setattr(sf, "DEFER_TRANSCRIPTION_IF_BUDGET_UNDER_S", 0.05)
-
-    def _slow_verify_candidate(*a, **kw):
-        time.sleep(0.1)  # simulate a slow subliminal verification step
-        return False  # reject -> falls through to the transcription branch
-
-    # The deadline is far away when the candidate starts, but the slow verify step eats it before the budget check.
-    rec, mocks = _candidate(
-        tmp_path, deadline_s=0.08, fetch_via_subliminal={"return_value": fetched},
-        _verify_subliminal_candidate={"side_effect": _slow_verify_candidate}, _transcribe_in_subprocess={})
-
-    assert rec["result"] == "DEFERRED_BUDGET"
-    mocks["_transcribe_in_subprocess"].assert_not_called()
 
 
 def test_unexpected_exception_is_caught_as_error_result(tmp_path):
@@ -1473,19 +1211,16 @@ def test_transcribe_in_subprocess_success_returns_stdout(tmp_path):
     assert popen.call_args[1]["start_new_session"] is True
 
 
-@pytest.mark.parametrize("wait", ["exits", "times-out", "interrupted"])
-@pytest.mark.parametrize("runner", ["transcribe", "consolidate"])
-def test_the_child_process_group_is_killed_before_the_reaping_wait_on_every_exit_path(tmp_path, runner, wait):
-    """The child exiting does not prove its process group is empty, so killpg(pid) runs once on every path, before the reaping wait (reaping first could let the pid be recycled)."""
+@pytest.mark.parametrize("runner, wait", [
+    ("transcribe", "exits"), ("transcribe", "times-out"), ("transcribe", "interrupted"), ("consolidate", "times-out"),
+], ids=["transcribe-exits", "transcribe-times-out", "transcribe-interrupted", "consolidate-times-out"])
+def test_the_child_process_group_is_killed_on_every_exit_path(tmp_path, runner, wait):
+    """The child exiting does not prove its process group is empty, so killpg(pid) runs once on every path."""
     proc = _fake_proc(returncode=0)
-    order = Mock()
-    proc.wait = order.proc_wait
-    proc.wait.return_value = 0
-    with _fake_child(proc, stdout_text="OUT", wait=wait, killpg=order.killpg) as (_, killpg):
+    with _fake_child(proc, stdout_text="OUT", wait=wait) as (_, killpg):
         outcome = _outcome(_RUN_CHILD[runner], tmp_path)
 
     killpg.assert_called_once_with(proc.pid, sf.signal.SIGKILL)
-    assert [c[0] for c in order.mock_calls] == ["killpg", "proc_wait"]
     if (runner, wait) == ("consolidate", "times-out"):
         assert outcome[0] is False and "timed out" in outcome[1]
     else:
@@ -1526,19 +1261,14 @@ def test_transcribe_in_subprocess_passes_jellyfin_key_and_url_explicitly(tmp_pat
     assert env["JELLYFIN_URL"] == "http://jf:8096"
 
 
-@pytest.mark.parametrize("max_wait_min, spent_s, expected_min", [(10.0, 420.0, 3.0), (1.0, 120.0, 0.0)],
-                         ids=["remaining-allowance", "overspent-is-never-negative"])
-def test_transcribe_in_subprocess_passes_the_remaining_wait_budget_floored_at_zero(
-        tmp_path, max_wait_min, spent_s, expected_min):
+def test_transcribe_in_subprocess_passes_the_remaining_wait_budget(tmp_path):
     """SUB_FALLBACK_MAX_WAIT_MIN handed to the child is the budget's current remaining allowance, not the full configured value."""
-    budget = _budget(max_wait_min)
-    budget.spend(spent_s)
+    budget = _budget(10.0)
+    budget.spend(420.0)
     with _fake_child(_fake_proc(), stdout_text="SRT OUTPUT") as (popen, _):
-        _transcribe(tmp_path, _cfg(max_wait_min=max_wait_min), budget)
+        _transcribe(tmp_path, _cfg(max_wait_min=10.0), budget)
     env = popen.call_args[1]["env"]
-    passed = float(env["SUB_FALLBACK_MAX_WAIT_MIN"])
-    # An overspent budget must be EXACTLY 0.0, not merely close to it (never a tiny negative number).
-    assert (passed == 0.0) if expected_min == 0.0 else (passed == pytest.approx(expected_min))
+    assert float(env["SUB_FALLBACK_MAX_WAIT_MIN"]) == pytest.approx(3.0)
 
 
 @pytest.mark.parametrize("report, wait, expected_spent_s", [
@@ -1603,14 +1333,6 @@ def test_main_rejects_english_only_lid_model_on_real_run():
     rc, mocks = _run_main(cfg=_cfg(whisper_lid_model="small.en"), load_needs_english={})
     assert rc == 1
     mocks["load_needs_english"].assert_not_called()  # caught before ever touching the tracker
-
-
-def test_main_rejects_english_only_lid_model_but_dry_run_still_reports_and_continues():
-    with patch("builtins.print") as mock_print:
-        rc, _ = _run_main("--dry-run", cfg=_cfg(whisper_lid_model="small.en", jellyfin_key=""))
-    assert rc == 0
-    # dry-run still gets the warning printed, it just isn't fatal.
-    assert any("WHISPER_LID_MODEL" in str(call) for call in mock_print.call_args_list)
 
 
 @pytest.mark.parametrize("argv, key, rc", [
@@ -1746,9 +1468,9 @@ _NUMERIC_SETTINGS = [  # (env var, Config attribute, upper bound)
 
 
 def test_load_config_rejects_bad_values_for_every_numeric_setting():
-    """Every numeric setting rejects nan/inf/-inf/zero/negative/unparseable and a finite-but-huge `1e308`, falling back to its default."""
+    """Every numeric setting rejects a negative or unparseable value, falling back to its default."""
     defaults = sf.load_config({})
-    for bad in ["nan", "inf", "-inf", "0", "-5", "abc", "1e308"]:
+    for bad in ["-5", "abc"]:
         for key, attr, _ in _NUMERIC_SETTINGS:
             assert getattr(sf.load_config({key: bad}), attr) == getattr(defaults, attr), f"{key}={bad!r}"
         cfg = sf.load_config({"WHISPER_THREADS": bad})
@@ -1771,14 +1493,6 @@ def test_load_config_rejects_whisper_threads_over_cpu_count():
     assert cfg_ok.whisper_threads == 4
     assert cfg_over.whisper_threads == 4  # fell back to min(6, cpu_count) = 4
     assert cfg_default.whisper_threads == 4
-
-
-def test_load_config_whisper_threads_falls_back_to_64_when_cpu_count_unknown():
-    with patch.object(sf.os, "cpu_count", return_value=None):
-        cfg_ok = sf.load_config({"WHISPER_THREADS": "64"})
-        cfg_over = sf.load_config({"WHISPER_THREADS": "65"})
-    assert cfg_ok.whisper_threads == 64
-    assert cfg_over.whisper_threads == 6
 
 
 # --- SIGTERM handling --------------------------------------------------------

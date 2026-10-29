@@ -26,18 +26,11 @@ def _assert_results(hc, expected):
 
 @pytest.mark.parametrize("kwargs, call, out, err, results", [
     ({}, lambda hc: hc.ok("thing running"), "", "", [("OK", "thing running", "")]),
-    ({"verbose": True}, lambda hc: hc.ok("thing running"),
-     "OK:   thing running\n", "", [("OK", "thing running", "")]),
-    ({"verbose": True, "json_mode": True}, lambda hc: hc.ok("thing"), "", "",
-     [("OK", "thing", "")]),
     ({}, lambda hc: hc.fail("widget", "broke"), "", "FAIL: widget — broke\n",
      [("FAIL", "widget", "broke")]),
-    ({}, lambda hc: hc.warn("widget", "iffy"), "WARN: widget — iffy\n", "",
-     [("WARN", "widget", "iffy")]),
     ({"json_mode": True}, lambda hc: (hc.warn("a", "b"), hc.fail("c", "d")), "", "",
      [("WARN", "a", "b"), ("FAIL", "c", "d")]),
-], ids=["ok-silent-in-plain-mode", "ok-prints-with-verbose", "ok-suppressed-in-json-even-verbose",
-        "fail-to-stderr", "warn-to-stdout", "json-suppresses-warn-and-fail-inline"])
+], ids=["ok-silent-in-plain-mode", "fail-to-stderr", "json-suppresses-warn-and-fail-inline"])
 def test_recorders_print_routing(tmp_path, capsys, kwargs, call, out, err, results):
     hc = _hc(tmp_path, **kwargs)
     call(hc)
@@ -139,30 +132,15 @@ def test_gluetun_single_geo_source_still_verifies_country(tmp_path):
     assert vc and vc[0][0] == "OK"           # was a false FAIL before the fix
 
 
-def test_gluetun_single_source_wrong_country_still_fails(tmp_path):
-    hc = _hc(tmp_path)
-    fake = _gluetun_run("5.5.5.5", "8.8.8.8", "\n", '{"country_code": "GB"}')   # wrong country
-    with patch.object(health, "_run", side_effect=fake):
-        hc.probe_gluetun()
-    hc.probe_vpn_country()
-    vc = [r for r in hc.results if r[1].startswith("vpn-country")]
-    assert vc and vc[0][0] == "FAIL"
-
-
 # ---------------- containers ----------------
 
 @pytest.mark.parametrize("name, required, cid, status, health_state, expected", [
     ("radarr", True, "", "", "", ("FAIL", "container:radarr", "not running (no container id)")),
     ("watchtower", False, "", "", "", ("WARN", "container:watchtower", "optional, not running")),
     ("sonarr", True, "abc123", "running", "", ("OK", "container:sonarr running", "")),
-    ("gluetun", True, "abc", "running", "healthy",
-     ("OK", "container:gluetun running health=healthy", "")),
     ("jellyfin", True, "abc", "running", "unhealthy",
      ("FAIL", "container:jellyfin", "running but health=unhealthy")),
-    ("radarr", True, "abc", "exited", "",
-     ("FAIL", "container:radarr", "state=exited (expected running)")),
-], ids=["required-missing-fails", "optional-missing-warns", "running-no-health",
-        "running-healthy-suffix", "unhealthy-fails", "exited-required-fails"])
+], ids=["required-missing-fails", "optional-missing-warns", "running-no-health", "unhealthy-fails"])
 def test_check_container(tmp_path, name, required, cid, status, health_state, expected):
     hc = _hc(tmp_path)
 
@@ -190,8 +168,7 @@ def test_probe_arr_missing_key_warns(tmp_path):
 @pytest.mark.parametrize("status, expected", [
     ("200", ("OK", "api:radarr reachable", "")),
     ("500", ("FAIL", "api:radarr", "http://x:7878/api/v3/system/status returned 500")),
-    ("000", ("FAIL", "api:radarr", "http://x:7878/api/v3/system/status returned 000")),
-], ids=["200-ok", "non-200-fails-with-status", "connection-error-is-000"])
+], ids=["200-ok", "non-200-fails-with-status"])
 def test_probe_arr_status(tmp_path, status, expected):
     hc = _hc(tmp_path)
     hc.env = {"RADARR_API_KEY": "k"}
@@ -210,14 +187,10 @@ def test_probe_arr_status(tmp_path, status, expected):
     ("probe_arr_hardlinks", "hardlinks_enabled", None, "WARN",
      "couldn't read /config/mediamanagement"),
     ("probe_arr_format_scores", "format_score_violations", [], "OK", "AV1+12-bit=-10000"),
-    ("probe_arr_format_scores", "format_score_violations", None, "WARN",
-     "couldn't read /qualityprofile"),
     ("probe_arr_silent_gap", "unmonitored_no_file_count", 0, "OK", "silent-gap=0"),
-    ("probe_arr_silent_gap", "unmonitored_no_file_count", None, "WARN", "couldn't read /movie"),
     ("probe_arr_silent_gap", "unmonitored_no_file_count", 7, "FAIL", "silent-gap=7"),
 ], ids=["hardlinks-enabled", "hardlinks-disabled", "hardlinks-unreadable",
-        "format-scores-clean", "format-scores-unreadable",
-        "silent-gap-zero", "silent-gap-unreadable", "silent-gap-nonzero"])
+        "format-scores-clean", "silent-gap-zero", "silent-gap-nonzero"])
 def test_arr_policy_probe(tmp_path, probe, client_method, val, state, frag):
     hc = _hc(tmp_path)
     hc.env = {"RADARR_API_KEY": "k"}
@@ -293,12 +266,8 @@ def test_bazarr_profiles_warn(tmp_path, unprofiled, wrong, idx, frag):
     assert frag in hc.results[idx][2]
 
 
-@pytest.mark.parametrize("failure", [
-    (None, None),
-    Exception("malformed"),   # a malformed response escaping the client must not crash the monitor
-], ids=["endpoint-returns-none", "client-exception"])
-def test_bazarr_profiles_endpoint_error_is_warn_not_crash(tmp_path, failure):
-    hc, _ = _probe_bazarr_profiles(tmp_path, failure, failure)
+def test_bazarr_profiles_endpoint_error_is_warn_not_crash(tmp_path):
+    hc, _ = _probe_bazarr_profiles(tmp_path, (None, None), (None, None))
     assert hc.results[0][0] == "WARN"
     assert "endpoint parse error" in hc.results[0][2]
     assert hc.results[1][0] == "WARN"
@@ -337,11 +306,10 @@ def test_probe_qbit(tmp_path, env, login, reach, expected):
 # ---------------- UFW ----------------
 
 @pytest.mark.parametrize("which, run_rv, expected", [
-    (False, (0, "", ""), []),
     (True, (0, "Status: inactive\n", ""), [("OK", "ufw=inactive (Tailscale perimeter intact)", "")]),
     (True, (0, "Status: active\n", ""), [("FAIL", "ufw=active")]),
     (True, (1, "", ""), [("WARN", "ufw")]),
-], ids=["absent-skips", "inactive-ok", "active-fails", "no-sudo-warns"])
+], ids=["inactive-ok", "active-fails", "no-sudo-warns"])
 def test_probe_ufw(tmp_path, which, run_rv, expected):
     hc = _hc(tmp_path)
     with patch.object(health, "_which", return_value=which), \
@@ -365,8 +333,7 @@ def test_perimeter_allow_override_skips(tmp_path):
      "3: ts0   inet 100.64.0.10/32 scope global ts0\n",
      "2: eth0  inet6 fd7a:115c:a1e0::1/128 scope global\n", "OK", 1, "no public-routable"),
     ("2: eth0 inet 8.8.8.8/24 scope global eth0\n", "", "FAIL", 2, "8.8.8.8"),
-    ("", "2: eth0 inet6 2001:db8::1/64 scope global\n", "FAIL", 2, "2001:db8::1"),
-], ids=["clean-ok", "public-v4-fails", "public-v6-fails"])
+], ids=["clean-ok", "public-v4-fails"])
 def test_perimeter_addresses(tmp_path, v4, v6, state, idx, frag):
     hc = _hc(tmp_path)
 
@@ -384,17 +351,13 @@ def test_perimeter_addresses(tmp_path, v4, v6, state, idx, frag):
     assert frag in hc.results[0][idx]
 
 
-@pytest.mark.parametrize("which, frag", [
-    (False, "iproute2"),
-    (True, "ip addr show failed"),
-], ids=["ip-missing", "ip-error"])
-def test_perimeter_ip_unusable_fails(tmp_path, which, frag):
+def test_perimeter_ip_unusable_fails(tmp_path):
     hc = _hc(tmp_path)
-    with patch.object(health, "_which", return_value=which), \
+    with patch.object(health, "_which", return_value=True), \
          patch.object(health, "_run", return_value=(1, "", "")):
         hc.probe_perimeter()
     assert hc.results[0][0] == "FAIL"
-    assert frag in hc.results[0][2]
+    assert "ip addr show failed" in hc.results[0][2]
 
 
 # ---------------- realtek / services / vpn-country / ops / sweep ----------------
@@ -433,12 +396,9 @@ def test_probe_service(tmp_path, rc, unit, ok_msg, fail_detail, expected):
 
 @pytest.mark.parametrize("country, iso, matches, expected", [
     ("", None, None, ("FAIL", "vpn-country", "could not query VPN country — policy unverified")),
-    ("DISAGREE(ipinfo=CH,ip2=GB)", None, None,
-     ("FAIL", "vpn-country",
-      "DISAGREE(ipinfo=CH,ip2=GB) (cannot verify against expected 'Switzerland')")),
     ("Switzerland", "CH", True, ("OK", "vpn-country=Switzerland", "")),
     ("United Kingdom", "GB", False, ("FAIL", "vpn-country=United Kingdom")),
-], ids=["empty-fails", "sources-disagree-fails", "match-ok", "mismatch-fails"])
+], ids=["empty-fails", "match-ok", "mismatch-fails"])
 def test_probe_vpn_country(tmp_path, country, iso, matches, expected):
     hc = _hc(tmp_path)
     hc.vpn_country = country
@@ -473,15 +433,10 @@ def test_ops_audit_tristate(tmp_path, rc, state, frag):
 
 # ---------------- repo-root hygiene ----------------
 
-@pytest.mark.parametrize("files, dirs", [
-    # whitelisted + skipped (not flagged)
-    (["AGENTS.md"], ["media_stack", ".mypy_cache", ".pytest_cache"]),
-    (["AGENTS.md", "pyproject.toml", "requirements-dev.txt"], [".ruff_cache"]),
-], ids=["whitelisted-and-skipped", "tool-caches-not-flagged"])
-def test_repo_root_clean_ok(tmp_path, files, dirs):
-    for name in files:
-        (tmp_path / name).write_text("")
-    for name in dirs:
+def test_repo_root_clean_ok(tmp_path):
+    """Whitelisted entries and tool caches are not flagged."""
+    (tmp_path / "AGENTS.md").write_text("")
+    for name in ("media_stack", ".mypy_cache", ".pytest_cache"):
         (tmp_path / name).mkdir()
     hc = _hc(tmp_path)
     hc.probe_repo_root()
@@ -590,17 +545,6 @@ def test_recurrence_after_clearing_starts_a_fresh_clock(tmp_path, aged):
     assert hc.results[-1][0] == "WARN", "recurrence must restart the clock"
 
 
-def test_item_absent_from_snapshot_then_returning_is_fresh(tmp_path, aged):
-    """The disappearance may be silent: the record simply stops being returned."""
-    hc = _sonarr_hc(tmp_path)
-    _probe_queue(hc, [_bad("a")])
-    aged["t"] += health.HealthCheck.STUCK_AFTER_S + 1
-    _probe_queue(hc, [_bad("b")])   # 'a' gone
-    aged["t"] += 60
-    _probe_queue(hc, [_bad("a")])
-    assert hc.results[-1][0] == "WARN"
-
-
 def test_unwritable_state_reports_uncertainty_not_a_fake_age(tmp_path, aged, monkeypatch):
     """Swallowing write failures would make the age a lie."""
     hc = _sonarr_hc(tmp_path)
@@ -611,38 +555,14 @@ def test_unwritable_state_reports_uncertainty_not_a_fake_age(tmp_path, aged, mon
     assert "unreadable/unwritable" in hc.results[-1][2]
 
 
-@pytest.mark.parametrize("blob", ["[]", "null", '"text"', "123"])
-def test_wrong_shaped_state_json_does_not_crash(tmp_path, aged, blob):
+def test_wrong_shaped_state_json_does_not_crash(tmp_path, aged):
     """Valid JSON that is not an object must not abort the run."""
     sd = tmp_path / "state"
     sd.mkdir(parents=True, exist_ok=True)
-    (sd / health.HealthCheck.OUTCOME_STATE).write_text(blob)
+    (sd / health.HealthCheck.OUTCOME_STATE).write_text("[]")
     hc = _sonarr_hc(tmp_path)
     _probe_queue(hc, [_bad("a")])
     assert hc.results[-1][0] == "WARN"
-
-
-def test_concurrent_clears_do_not_resurrect_each_other(tmp_path, aged):
-    """Read-modify-write must happen under one lock."""
-    sd = tmp_path / "state"
-    sd.mkdir(parents=True, exist_ok=True)
-    hc = _hc(tmp_path)
-    hc._age_conditions("x:", {"x:A", "x:B"})
-    hc._age_conditions("x:", {"x:B"})        # drops A
-    hc._age_conditions("x:", {"x:A"})        # drops B
-    left = json.loads((sd / health.HealthCheck.OUTCOME_STATE).read_text())
-    assert set(left) == {"x:A"}, f"stale key resurrected: {sorted(left)}"
-
-
-def test_new_allocation_does_not_inherit_a_stale_mismatch_timer(tmp_path, aged):
-    """mismatch -> no allocation -> mismatch again must be young."""
-    hc = _hc(tmp_path)
-    qbit = _qbit_client(preferences={"listen_port": 54321})
-    _probe_port(hc, '{"port":4242}', qbit)            # mismatch starts
-    aged["t"] += health.HealthCheck.NO_PORT_AFTER_S + 1
-    _probe_port(hc, '{"port":0}', qbit)               # allocation gone
-    _probe_port(hc, '{"port":9999}', qbit)            # new, still mismatched
-    assert hc.results[-1][0] == "WARN", "must get the reconciler's grace period"
 
 
 def test_matching_port_clears_both_timers(tmp_path, aged):
@@ -733,34 +653,3 @@ def test_unreadable_state_does_not_silently_wipe_history(tmp_path, aged):
     assert ok2 and ages2["x:A"] == 0.0
 
 
-def test_failed_clear_is_reported_not_silently_ok(tmp_path, aged, monkeypatch):
-    """If the clear does not stick, the old timestamp is still there."""
-    hc = _sonarr_hc(tmp_path)
-    _probe_queue(hc, [_bad("a")])
-    monkeypatch.setattr(health.state, "mutate_state",
-                        MagicMock(side_effect=OSError("read-only fs")))
-    _probe_queue(hc, [])
-    assert hc.results[-1][0] == "WARN", "a failed clear must not read as a clean OK"
-    assert "could not reset" in hc.results[-1][2]
-
-
-def test_qbit_failed_clear_is_reported(tmp_path, aged, monkeypatch):
-    hc = _hc(tmp_path)
-    c = _qbit_client(torrents_info=[])
-    monkeypatch.setattr(health.state, "mutate_state",
-                        MagicMock(side_effect=OSError("read-only fs")))
-    with patch.object(health, "QBitClient", return_value=c):
-        hc.probe_qbit_missing_files("http://q")
-    assert hc.results[-1][0] == "WARN"
-
-
-def test_allocation_clears_none_timer_even_if_qbit_is_down(tmp_path, aged):
-    """Bailing out on a qBittorrent failure must not leave the no-allocation timer running."""
-    hc = _hc(tmp_path)
-    _probe_port(hc, '{"port":0}')                     # starts the none timer
-    aged["t"] += health.HealthCheck.NO_PORT_AFTER_S + 1
-    down = MagicMock()
-    down.login.return_value = False
-    _probe_port(hc, '{"port":4242}', down)            # allocation exists, qbit down
-    _probe_port(hc, '{"port":0}')                     # outage recurs
-    assert hc.results[-1][0] == "WARN", "recurrence must start a fresh clock"

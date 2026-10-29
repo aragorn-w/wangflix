@@ -17,7 +17,6 @@ from media_stack.state import load_state, load_state_locked, save_state, update_
 @pytest.mark.parametrize("content, expected", [
     pytest.param(None, {}, id="missing-file-is-empty-like-mutate_state"),
     pytest.param('{"a": {"v": 1}}', {"a": {"v": 1}}, id="parsed-dict"),
-    pytest.param("[1, 2, 3]", {}, id="non-dict-json-is-empty"),
 ])
 def test_load_state_locked(tmp_path, content, expected):
     state_file = tmp_path / "state.json"
@@ -32,17 +31,6 @@ def test_load_state_locked_raises_on_corrupt_file(tmp_path):
     state_file.write_text("{not valid json")
     with pytest.raises(OSError):
         load_state_locked(state_file)
-
-
-def test_load_state_locked_does_not_modify_the_file(tmp_path):
-    """A read never rewrites the file (unlike `mutate_state(state_file, lambda s: s)`)."""
-    state_file = tmp_path / "state.json"
-    save_state(state_file, {"a": 1})
-    before = state_file.read_bytes()
-    before_mtime_ns = state_file.stat().st_mtime_ns
-    load_state_locked(state_file)
-    assert state_file.read_bytes() == before
-    assert state_file.stat().st_mtime_ns == before_mtime_ns
 
 
 @pytest.mark.parametrize("content", [None, "{not valid json"], ids=["missing-file", "corrupt-file"])

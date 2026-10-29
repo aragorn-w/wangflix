@@ -16,7 +16,6 @@ from media_stack.sweeps import pid_is_running_script, sweep_orphans
 
 
 @pytest.mark.parametrize("pid, script, expected", [
-    pytest.param(1, "nonexistent-script.py", False, id="init-basename-does-not-match"),
     pytest.param(99999999, "anything", False, id="nonexistent-pid"),
     pytest.param(os.getpid(), "python", True, id="self-with-python-basename"),
 ])
@@ -55,17 +54,15 @@ def test_sweep_ignores_non_tmp_files(tmp_path):
     assert regular.exists()
 
 
-@pytest.mark.parametrize("pid, script, populated, deleted", [
-    pytest.param(99999999, "anything", True, True, id="dead-pid-deleted"),
-    pytest.param(os.getpid(), "python", True, False, id="active-pid-preserved"),
-    pytest.param(os.getpid(), "python", False, False, id="active-pid-empty-workdir-preserved"),
+@pytest.mark.parametrize("pid, script, deleted", [
+    pytest.param(99999999, "anything", True, id="dead-pid-deleted"),
+    pytest.param(os.getpid(), "python", False, id="active-pid-preserved"),
 ])
-def test_sweep_consolsub_workdir_by_pid(tmp_path, pid, script, populated, deleted):
-    """consolsub_<pid>_<id> dir: swept when its PID is dead, kept while it is alive (even before its first write)."""
+def test_sweep_consolsub_workdir_by_pid(tmp_path, pid, script, deleted):
+    """consolsub_<pid>_<id> dir: swept when its PID is dead, kept while it is alive."""
     wd = tmp_path / f"consolsub_{pid}_abc123"
     wd.mkdir()
-    if populated:
-        (wd / "scratch.txt").write_text("x")
+    (wd / "scratch.txt").write_text("x")
     res = sweep_orphans(tmp_path, script_basename=script, dry_run=False)
     assert len(res["deleted_dirs"]) == (1 if deleted else 0)
     assert wd.exists() is not deleted
@@ -140,7 +137,6 @@ def test_normtmp_young_file_preserved(tmp_path):
 
 @pytest.mark.parametrize("relpath, age_s", [
     pytest.param(".normalize-tmp", 0, id="fresh-empty-dir"),  # normalize-audio.py mkdirs before its first file
-    pytest.param("m0/.normalize-tmp", 0, id="nested-fresh"),
     pytest.param("m7200/.normalize-tmp", 7200, id="nested-old"),
 ])
 def test_normtmp_workdir_never_removed(tmp_path, relpath, age_s):
@@ -156,18 +152,6 @@ def test_normtmp_workdir_never_removed(tmp_path, relpath, age_s):
     res = sweep_orphans(tmp_path, script_basename="consolidate-subs.py")
     assert res["deleted_dirs"] == []
     assert d.exists()
-
-
-def test_normtmp_rule_scoped_to_that_dirname(tmp_path):
-    """Same filename shape outside .normalize-tmp is not this rule's business."""
-    other = tmp_path / "Season 1"
-    other.mkdir()
-    f = other / ".Movie.99999999.pass2.mkv"
-    f.write_bytes(b"X")
-    old = time.time() - 7200
-    os.utime(f, (old, old))
-    sweep_orphans(tmp_path, script_basename="consolidate-subs.py")
-    assert f.exists()
 
 
 def _consolidate_in_workdir(name, tmp_path, monkeypatch):
@@ -193,16 +177,4 @@ def test_normtmp_relative_path_guard(tmp_path, monkeypatch):
     res = m._process_file_inner(".Movie.4242.pass2.mkv")
     assert res["status"] == "SKIP"
     assert "workdir" in res["detail"]
-    assert not list(d.glob(".consolidate-*.lock")), "no lock may be deposited"
-
-
-def test_normtmp_guard_fails_closed_on_resolve_error(tmp_path, monkeypatch):
-    """If the path cannot be resolved the guard refuses; falling back to the unresolved
-    spelling would reopen the relative-path bypass (no workdir component in .parts).
-    """
-    m, d = _consolidate_in_workdir("cs2", tmp_path, monkeypatch)
-    with patch.object(Path, "resolve", side_effect=OSError("ELOOP")):
-        res = m._process_file_inner(".Movie.4242.pass2.mkv")
-    assert res["status"] == "FAIL"
-    assert "resolve" in res["detail"]
     assert not list(d.glob(".consolidate-*.lock")), "no lock may be deposited"

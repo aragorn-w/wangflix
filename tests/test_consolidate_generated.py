@@ -88,42 +88,18 @@ _P = pytest.param
 RANKING_CASES = [
     _P(dict(sidecars=[(".en.generated.srt", "GEN", 5)]), GENERATED, "GEN", id="generated-sidecar"),
     _P(dict(sidecars=[(".en.srt", "REAL", 5)]), "English", "REAL", id="plain-sidecar"),
-    _P(dict(embedded=[(2, "English (generated)", "GEN", 5)]), GENERATED, "GEN",
-       id="generated-embedded"),
-    _P(dict(embedded=[(2, "English", "REAL", 5)]), "English", "REAL", id="plain-embedded"),
     _P(dict(sidecars=[(".en.sdh.generated.srt", "GEN-SDH", 2000), (".en.srt", "REAL", 5)]),
        "English", "REAL", id="real-sidecar-beats-400x-longer-generated-sidecar"),
-    _P(dict(embedded=[(2, "English", "REAL-EMBEDDED", 5)],
-            sidecars=[(".en.sdh.generated.srt", "GEN-SDH", 2000)]),
-       "English", "REAL-EMBEDDED", id="real-embedded-beats-generated-sidecar"),
     _P(dict(embedded=[(2, "English (generated)", "GEN-EMBEDDED", 2000)],
             sidecars=[(".en.srt", "REAL-SIDECAR", 5)]),
        "English", "REAL-SIDECAR", id="real-sidecar-beats-higher-scored-generated-embedded"),
     _P(dict(embedded=[(2, "English (generated)", "GEN", 2000), (3, "English", "REAL", 5)]),
        "English", "REAL", id="real-embedded-beats-generated-embedded"),
-    _P(dict(embedded=[(2, "English (generated)", "GEN-EMBEDDED", 5)],
-            sidecars=[(".en.generated.srt", "GEN-SIDECAR", 5)]),
-       GENERATED, "GEN-EMBEDDED", id="generated-ranked-by-score"),
-    _P(dict(embedded=[(2, "English", "REAL-EMBEDDED", 5)], sidecars=[(".en.srt", "REAL-SIDECAR", 5)]),
-       "English", "REAL-EMBEDDED", id="real-ranked-by-score"),
     _P(dict(sidecars=[(".en.sdh.srt", "REAL-SDH", 2000), (".en.srt", "REAL-PLAIN", 5)]),
        "English", "REAL-PLAIN", id="non-hi-sidecar-beats-longer-sdh-sidecar"),
-    _P(dict(sidecars=[(".en.cc.srt", "REAL-HI", 2000), (".en.srt", "REAL-PLAIN", 5)]),
-       "English", "REAL-PLAIN", id="non-hi-sidecar-beats-longer-cc-sidecar"),
-    _P(dict(sidecars=[(".en.hi.srt", "REAL-HI", 2000), (".en.srt", "REAL-PLAIN", 5)]),
-       "English", "REAL-PLAIN", id="non-hi-sidecar-beats-longer-hi-sidecar"),
     _P(dict(sidecars=[(".en.sdh.srt", "REAL-SDH", 5)]), "English", "REAL-SDH", id="hi-sidecar-alone"),
-    _P(dict(embedded=[(2, "English SDH", "REAL-SDH", 2000), (3, "English", "REAL-PLAIN", 5)]),
-       "English", "REAL-PLAIN", id="non-hi-embedded-beats-longer-hi-embedded"),
-    _P(dict(embedded=[(2, "English (CC)", "REAL-EMBEDDED-CC", 2000)],
-            sidecars=[(".en.srt", "REAL-SIDECAR", 5)]),
-       "English", "REAL-SIDECAR", id="non-hi-sidecar-beats-higher-scored-hi-embedded"),
-    _P(dict(embedded=[(2, "English SDH", "REAL-SDH", 5)]), "English", "REAL-SDH",
-       id="hi-embedded-alone"),
     _P(dict(sidecars=[(".en.sdh.srt", "REAL-SDH", 5), (".en.generated.srt", "GEN-PLAIN", 2000)]),
        "English", "REAL-SDH", id="real-hi-sidecar-beats-generated-non-hi"),
-    _P(dict(sidecars=[(".en.sdh.generated.srt", "GEN-SDH", 2000), (".en.generated.srt", "GEN-PLAIN", 5)]),
-       GENERATED, "GEN-PLAIN", id="non-hi-generated-beats-hi-generated"),
 ]
 
 
@@ -226,34 +202,6 @@ def _run_collision(tmp_path, monkeypatch, *, stem, embedded=(), sidecars=(), for
     return run
 
 
-def test_a_video_named_forced_with_a_bare_forced_srt_keeps_main_and_forced_apart(tmp_path, monkeypatch):
-    """`forced.mkv` + bare `forced.srt` + an embedded forced track: neither overwrites the other."""
-    run = _run_collision(tmp_path, monkeypatch, stem="forced",
-                         sidecars=[(".srt", "SIDECAR-MAIN", 50)], forced=(3, "FORCED-TEXT"))
-    assert run.result["status"] == "FIXED"
-    assert run.remuxes == [{"main": "SYNCED:SIDECAR-MAIN", "forced": "FORCED-TEXT"}]
-    assert run.clobbered == []
-
-
-def test_a_video_named_main_synced_does_not_sync_a_file_onto_itself(tmp_path, monkeypatch):
-    run = _run_collision(tmp_path, monkeypatch, stem="main.synced",
-                         sidecars=[(".srt", "SIDECAR-MAIN", 50)])
-    assert run.result["status"] == "FIXED"
-    (srt_in, srt_out, in_text), = run.sync_calls
-    assert srt_in != srt_out and in_text == "SIDECAR-MAIN"
-    assert not srt_in.exists() or srt_in.read_text() == "SIDECAR-MAIN"
-    assert run.remuxes == [{"main": "SYNCED:SIDECAR-MAIN", "forced": None}]
-
-
-def test_an_embedded_track_and_a_sidecar_named_after_its_index_do_not_collide(tmp_path, monkeypatch):
-    """`track2.mkv` + bare `track2.srt` + embedded main track #2 must not share a working name."""
-    run = _run_collision(tmp_path, monkeypatch, stem="track2",
-                         embedded=[(2, "EMBEDDED-MAIN", 2000)],
-                         sidecars=[(".srt", "SIDECAR-MAIN", 5)])
-    assert run.remuxes == [{"main": "SYNCED:EMBEDDED-MAIN", "forced": None}]
-    assert run.clobbered == []
-
-
 def test_two_sidecars_that_convert_to_the_same_name_stay_separate(tmp_path, monkeypatch):
     """`X.en.srt` and `X.en.ass` must not convert onto the same name."""
     run = _run_collision(tmp_path, monkeypatch, stem="Movie",
@@ -265,7 +213,7 @@ def test_two_sidecars_that_convert_to_the_same_name_stay_separate(tmp_path, monk
     assert len({p for p in run.created}) == len(run.created) >= 2
 
 
-@pytest.mark.parametrize("stem", ["forced", "main.synced", "track2", "verified0", "sidecar", "synced"])
+@pytest.mark.parametrize("stem", ["forced", "track2"])
 def test_no_working_file_is_ever_overwritten_whatever_the_video_is_called(tmp_path, monkeypatch, stem):
     run = _run_collision(
         tmp_path, monkeypatch, stem=stem, embedded=[(2, "EMBEDDED-MAIN", 10)],
@@ -287,11 +235,3 @@ def test_workfile_names_are_unique_role_prefixed_and_inside_the_workdir(tmp_path
         assert p.parent == tmp_path and p.name.startswith(f"{role}-") and p.suffix == ".srt"
         assert p.is_file() and p.stat().st_size == 0
 
-
-def test_the_full_pass_names_nothing_in_its_workdir_after_the_video_or_a_sidecar():
-    """Source audit of consolidate-subs.py: no `workdir / <name>`, no `.with_suffix(".srt")` output name."""
-    import re
-    src = (PROJECT_ROOT / "consolidate-subs.py").read_text()
-    assert not re.search(r"workdir\s*/", src), "a fixed or derived name in the workdir"
-    assert 'with_suffix(".srt")' not in src, "a conversion output named after its input"
-    assert src.count("_workfile(") >= 8

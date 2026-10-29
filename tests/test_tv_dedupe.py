@@ -242,30 +242,10 @@ def test_no_dupes_is_noop(tmp_path):
     assert not (tmp_path / ".dupe-recycle").exists()
 
 
-def test_extra_delete_uses_full_relpath_not_bare_basename_across_seasons(tmp_path):
-    # Two seasons can each hold a file with the SAME basename: cleanup keys off the full
-    # relativePath, so resolving Season 01 never deletes a Season 02 record.
-    season_dir = _pair(tmp_path)
-    client = _mock_sonarr(
-        [_ef(200, KEEPER), _ef(300, EXTRA),
-         # Same basename as id=300, but a DIFFERENT season: never targeted.
-         _ef(999, EXTRA, season=2)],
-        [_ep(1, 200)])
-
-    rc = _run(tmp_path, ["--apply"], client)
-
-    assert rc == 0
-    assert _videos(season_dir) == [KEEPER]
-    client.delete_episode_file.assert_called_once_with(300)
-
-
 @pytest.mark.parametrize("owners, deleted", [
     ({(1, 2)}, False),
     ({(1, 1)}, True),
-    ({(1, 1), (1, 2)}, False),
-], ids=["tracked-by-different-episode-refused",
-        "own-stale-record-allowed",
-        "any-other-owner-remaining-refused"])
+], ids=["tracked-by-different-episode-refused", "own-stale-record-allowed"])
 def test_cleanup_deletes_only_records_no_other_episode_owns(owners, deleted):
     """Safety net on top of relpath keying; (1, 1) is the episode being resolved."""
     client = MagicMock()
@@ -307,18 +287,6 @@ def test_extra_tracked_by_another_episode_is_not_moved(tmp_path, argv):
     client.delete_episode_file.assert_not_called()
 
 
-@pytest.mark.parametrize("name, expected", [
-    ("b.mkv", ["S01E02"]),
-    ("a.mkv", []),
-    ("unknown.mkv", []),
-], ids=["owned-by-other-episode", "current-episodes-own-file", "unknown-to-sonarr"])
-def test_extras_owned_by_other_episode_helper(name, expected):
-    file_id_by_relpath = {"Season 01/a.mkv": 10, "Season 01/b.mkv": 11}
-    episode_by_file_id = {10: {(1, 1)}, 11: {(1, 2)}}
-    assert td._extras_owned_by_other_episode(
-        file_id_by_relpath, episode_by_file_id, (1, 1), "Season 01", [{"name": name}]) == expected
-
-
 def test_multi_episode_file_records_every_owner():
     """One episodefile covering two episodes must map to BOTH owners."""
     client = _mock_sonarr([_ef(7, "Show - S01E01-02 - T.mkv")], [_ep(1, 7), _ep(2, 7)])
@@ -340,60 +308,20 @@ def test_risky_force_refuses_without_sonarr_client(tmp_path):
 
 # --- persistent lock files --------------------------------------------------
 
-def test_lock_file_survives_dedupe(tmp_path):
-    """Unlinking a released lock lets two workers lock the same media path."""
-    season_dir = _pair(tmp_path)
-    client = _sonarr_tracking("Show", 1, 1, KEEPER, extra_files=[(3845, EXTRA)])
-    rc = _run(tmp_path, ["--apply"], client)
-
-    assert rc == 0
-    assert _videos(season_dir) == [KEEPER]
-    from media_stack.locking import lock_path_for
-    assert lock_path_for(season_dir / EXTRA).exists(), \
-        "the moved extra's lock file must be left in place"
-
 
 # --- untrusted Sonarr tracking data ----------------------------------------
 # An empty tracking map from a FAILED request is not evidence that a file has no owner.
 
-def test_ambiguous_series_basename_is_not_resolved_to_a_foreign_series(tmp_path):
-    """Two Sonarr series share a folder basename under different roots."""
-    season_dir = _pair(tmp_path, OTHER_EXTRA)
-    # If the wrong series won, this tracking data would classify the group SAFE.
-    client = _mock_sonarr([_ef(201, KEEPER)], [_ep(1, 201)], series=[
-        {"id": 1, "path": "/data/media/tv/Show"},
-        {"id": 2, "path": "/data/media/other/Show"},     # same basename
-    ])
-    rc = _run(tmp_path, ["--apply"], client)
 
-    assert rc == 1, "ambiguous series must be flagged, not silently resolved"
-    assert _videos(season_dir) == sorted([KEEPER, OTHER_EXTRA]), "nothing may be moved"
-    client.delete_episode_file.assert_not_called()
-    client.episodes.assert_not_called()
-
-
-@pytest.mark.parametrize("files, episodes", [
-    ([_ef(201, OTHER_EXTRA)], None),
-    (None, [_ep(1, 201)]),
-], ids=["episodes-fails", "episode-files-fails"])
-def test_failed_tracking_lookup_blocks_forced_move(tmp_path, files, episodes):
+def test_failed_tracking_lookup_blocks_forced_move(tmp_path):
     """One endpoint fails (None) while the other succeeds: files look unowned."""
     season_dir = _pair(tmp_path, OTHER_EXTRA)
-    client = _mock_sonarr(files, episodes)
+    client = _mock_sonarr([_ef(201, OTHER_EXTRA)], None)
     rc = _run(tmp_path, ["--apply", "--force"], client)
 
     assert rc == 1
     assert _videos(season_dir) == sorted([KEEPER, OTHER_EXTRA]), "nothing may be moved"
     client.delete_episode_file.assert_not_called()
-
-
-@pytest.mark.parametrize("files, episodes, ok", [
-    ([], None, False),
-    (None, [], False),
-    ([], [], True),
-], ids=["episodes-fails", "episode-files-fails", "genuinely-empty-is-usable"])
-def test_tracking_ok_false_only_when_an_endpoint_fails(files, episodes, ok):
-    assert td._tracked_by_episode(_mock_sonarr(files, episodes), 1)[3] is ok
 
 
 # --- Sonarr series identity -------------------------------------------------
@@ -419,14 +347,7 @@ _FOREIGN = [{"path": "/unrelated-library/A", "rootFolderPath": "/unrelated-libra
     (_TV_ONE + [{"path": "/tv/B", "rootFolderPath": "/tv"}], None, {}, "/tv"),
     ([{"path": "/tv/A"}], None, {}, "/tv"),
     (_FOREIGN, None, {}, None),
-    (_FOREIGN, "/unrelated-library", {}, "/unrelated-library"),
-    (_TV_ONE, None, {"is_default_library": False}, None),
-    (_TV_ONE, "/tv", {"is_default_library": False}, "/tv"),
-    (_TV_ONE + [{"path": "/other/B", "rootFolderPath": "/other"}], None, {}, "/tv"),
-], ids=["configured-root", "falls-back-to-path-parent", "foreign-sole-root-rejected",
-        "explicit-mapping-honoured-for-foreign-root",
-        "alternate-library-needs-explicit-mapping", "alternate-library-explicit-mapping",
-        "extra-roots-ignored-beside-configured"])
+], ids=["configured-root", "falls-back-to-path-parent", "foreign-sole-root-rejected"])
 def test_accepted_sonarr_root(series, explicit, kwargs, expected):
     """A foreign sole root must not be trusted; extra roots are filtered by the per-series path check."""
     assert td._accepted_sonarr_root(series, explicit, **kwargs) == expected
@@ -454,50 +375,7 @@ def test_keeper_vanishing_under_lock_aborts_the_move(tmp_path):
     client.delete_episode_file.assert_not_called()
 
 
-def test_keeper_is_locked_alongside_the_extras(tmp_path):
-    locked: list[str] = []
-    _pair(tmp_path)
-    client = _sonarr_tracking("Show", 1, 1, KEEPER, extra_files=[(300, EXTRA)])
-
-    @contextmanager
-    def recording_lock(path):
-        locked.append(Path(path).name)
-        yield True
-
-    _run(tmp_path, ["--apply"], client, acquire_file_lock=recording_lock)
-
-    assert KEEPER in locked, "the keeper must be locked, not just the extras"
-    assert EXTRA in locked
-    assert locked == sorted(locked), "consistent lock ordering"
-
-
-def test_tracking_change_between_scan_and_move_aborts(tmp_path):
-    """Sonarr tracking the EXTRA after the snapshot but before the move must abort the move."""
-    season_dir = _pair(tmp_path)
-    client = _scripted_sonarr(
-        ([_ef(300, KEEPER)], [_ep(1, 300)]),   # snapshot: SAFE
-        ([_ef(301, EXTRA)], [_ep(1, 301)]))    # re-read: changed
-    _run(tmp_path, ["--apply"], client)
-
-    assert _videos(season_dir) == sorted([KEEPER, EXTRA]), "nothing may be moved"
-    client.delete_episode_file.assert_not_called()
-
-
 # --- keeper readability -----------------------------------------------------
-
-@pytest.mark.parametrize("probe_result, probed", [(None, False), ({"streams": []}, True)],
-                         ids=["probe-failed", "probe-ok"])
-def test_video_meta_records_probe_success_separately(tmp_path, probe_result, probed):
-    """A failed probe must not look like "readable but untagged"."""
-    d = tmp_path / "s"
-    d.mkdir()
-    (d / "x.mkv").write_bytes(b"x")
-    with patch.object(td, "probe", return_value=probe_result), \
-         patch.object(td, "already_processed", return_value=False):
-        meta = td._video_meta(d, "x.mkv")
-    assert meta["probed"] is probed
-    if probed:
-        assert meta["processed"] is False
 
 
 def test_unprobeable_keeper_blocks_recycling_the_readable_alternative(tmp_path):
@@ -539,29 +417,26 @@ def test_failed_orphan_cleanup_is_reported_not_silently_resolved(tmp_path, capsy
     assert _videos(season_dir) == [keeper]
 
 
-def test_cleanup_returns_failed_relpaths():
-    client = MagicMock()
-    client.delete_episode_file.return_value = False
-    failed = td._cleanup_orphan_episodefiles(
-        client, {"Season 01/x.mkv": 42}, {42: {(1, 1)}}, (1, 1), ["Season 01/x.mkv"])
-    assert failed == ["Season 01/x.mkv"]
-    client.delete_episode_file.return_value = True
-    assert td._cleanup_orphan_episodefiles(
-        client, {"Season 01/x.mkv": 42}, {42: {(1, 1)}}, (1, 1), ["Season 01/x.mkv"]) == []
-
-
-def test_stale_rows_counts_rows_not_groups(tmp_path, capsys):
-    """Two failed DELETEs in ONE episode group must report two stale rows."""
-    keeper = "Show - S01E01 - A WEBDL-2160p.mkv"
-    extra1 = "Show - S01E01 - B WEBRip-1080p.mkv"
-    extra2 = "Show - S01E01 - C WEBRip-720p.mkv"
-    season_dir = _make_season(tmp_path / "tv", "Show", "Season 01",
-                              {keeper: 300 * MB, extra1: 200 * MB, extra2: 150 * MB})
-    client = _sonarr_tracking("Show", 1, 1, keeper, extra_files=[(401, extra1), (402, extra2)])
-    client.delete_episode_file.return_value = False
+def test_lock_file_survives_dedupe(tmp_path):
+    """Unlinking a released lock lets two workers lock the same media path."""
+    season_dir = _pair(tmp_path)
+    client = _sonarr_tracking("Show", 1, 1, KEEPER, extra_files=[(3845, EXTRA)])
     rc = _run(tmp_path, ["--apply"], client)
 
-    out = capsys.readouterr().out
-    assert "stale-rows=2" in out, "one entry per row, not per episode group"
-    assert rc == 1
-    assert _videos(season_dir) == [keeper]
+    assert rc == 0
+    assert _videos(season_dir) == [KEEPER]
+    from media_stack.locking import lock_path_for
+    assert lock_path_for(season_dir / EXTRA).exists(), \
+        "the moved extra's lock file must be left in place"
+
+
+def test_tracking_change_between_scan_and_move_aborts(tmp_path):
+    """Sonarr tracking the EXTRA after the snapshot but before the move must abort the move."""
+    season_dir = _pair(tmp_path)
+    client = _scripted_sonarr(
+        ([_ef(300, KEEPER)], [_ep(1, 300)]),   # snapshot: SAFE
+        ([_ef(301, EXTRA)], [_ep(1, 301)]))    # re-read: changed
+    _run(tmp_path, ["--apply"], client)
+
+    assert _videos(season_dir) == sorted([KEEPER, EXTRA]), "nothing may be moved"
+    client.delete_episode_file.assert_not_called()

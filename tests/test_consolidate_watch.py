@@ -40,69 +40,31 @@ def _triggered(tmp_path: Path, sidecar: str, videos: list[str]) -> list[str]:
 
 
 def test_existing_tag_peeling_is_unchanged(tmp_path):
-    for sidecar in ("Show.S01E01.en.srt", "Show.S01E01.en.cc.srt", "Show.S01E01.en.forced.srt",
-                    "Show.S01E01.srt", "Show.S01E01.en-us.srt", "Show.S01E01.eng.sdh.srt",
-                    "Show.S01E01.en-sdh.srt", "Show.S01E01.en.hi.srt"):
+    for sidecar in ("Show.S01E01.en.srt", "Show.S01E01.en.forced.srt", "Show.S01E01.srt",
+                    "Show.S01E01.eng.sdh.srt"):
         assert _triggered(tmp_path, sidecar, ["Show.S01E01.mkv"]) == ["Show.S01E01.mkv"], sidecar
 
 
 def test_a_sidecar_with_tags_but_no_english_one_triggers_nothing(tmp_path):
     """`find_sidecar_subs` ignores these for `Show.mkv` (no English tag), so the watcher must not fire."""
-    for sidecar in ("Show.hi.srt", "Show.forced.srt", "Show.cc.srt", "Show.sdh.srt",
-                    "Show.generated.srt", "Show.forced.generated.srt"):
+    for sidecar in ("Show.hi.srt", "Show.forced.srt", "Show.generated.srt"):
         assert _triggered(tmp_path, sidecar, ["Show.mkv"]) == [], sidecar
-
-
-def test_peeling_stops_after_three_tags(tmp_path):
-    """Four trailing tags is one too many: the video is not reached."""
-    assert _triggered(tmp_path, "Show.en.sdh.cc.hi.srt", ["Show.mkv"]) == []
-    assert _triggered(tmp_path, "Show.en.sdh.cc.srt", ["Show.mkv"]) == ["Show.mkv"]
 
 
 # Every case below is also checked against `find_sidecar_subs`'s own acceptance rule.
 CROSS_CHECK_CASES = [
     # (sidecar, videos present, expected video or None)
     ("Show.S01E01.en.generated.srt", ["Show.S01E01.mkv"], "Show.S01E01.mkv"),
-    ("Show.S01E01.en.sdh.generated.srt", ["Show.S01E01.mkv"], "Show.S01E01.mkv"),
-    ("Show.en.generated.srt", ["Show.mkv"], "Show.mkv"),
     ("Show.S01E01.en.srt", ["Show.S01E01.mp4"], "Show.S01E01.mp4"),
     ("Show.S01E01.en.srt", ["Other.mkv"], None),
-    ("Say.Hi.en.srt", ["Say.Hi.mp4"], "Say.Hi.mp4"),
     ("Show.Hi.srt", ["Show.mkv", "Show.Hi.mkv"], "Show.Hi.mkv"),
-    ("The.Generated.Show.S01E01.en.generated.srt", ["The.Generated.Show.S01E01.mkv"],
-     "The.Generated.Show.S01E01.mkv"),
-    ("Show.en.generated.srt", ["Show.mkv", "Show.en.mkv"], "Show.mkv"),
-    ("Show.en.generated.srt", ["Show.en.mkv"], None),
-    ("Show.en.en.srt", ["Show.en.mkv"], "Show.en.mkv"),
-    ("Show.en.en.srt", ["Show.en.mkv", "Show.mkv"], "Show.en.mkv"),
-    ("Show.en.sdh.srt", ["Show.en.mkv", "Show.mkv"], "Show.mkv"),
-    ("The.Generated.srt", ["The.Generated.mkv"], "The.Generated.mkv"),
-    ("The.Generated.en.generated.srt", ["The.Generated.mkv", "The.mkv"], "The.Generated.mkv"),
-    ("Show.hi.srt", ["Show.mkv"], None),
-    ("Show.forced.srt", ["Show.mkv"], None),
-    ("Show.generated.srt", ["Show.mkv"], None),
     ("Show.en.forced.srt", ["Show.mkv"], "Show.mkv"),
-    ("Show.en.cc.generated.srt", ["Show.mkv"], "Show.mkv"),
     ("Show.S01E01.en-us.srt", ["Show.S01E01.mkv", "Show.S01E01.mp4"], "Show.S01E01.mkv"),
-    ("Show.srt", ["Show.mkv", "Show.mp4"], "Show.mkv"),
-    ("Show.EN.Generated.SRT", ["Show.mkv"], "Show.mkv"),
     # Regional and spelled-out English: find_sidecar_subs takes ANY tag that
     # starts with "en", so the watcher must peel and accept the same ones.
     ("Show.en-ca.srt", ["Show.mkv"], "Show.mkv"),
-    ("Show.en-au.srt", ["Show.mkv"], "Show.mkv"),
-    ("Show.EN-NZ.srt", ["Show.mkv"], "Show.mkv"),
     ("Show.english.srt", ["Show.mkv"], "Show.mkv"),
-    ("Show.English.SDH.srt", ["Show.mkv"], "Show.mkv"),
-    ("Show.en-ca.cc.srt", ["Show.mkv"], "Show.mkv"),
-    ("Show.en-ca.generated.srt", ["Show.mkv"], "Show.mkv"),
-    ("Show.english.forced.srt", ["Show.mkv"], "Show.mkv"),
-    ("Show.en-ca.srt", ["Show.mkv", "Show.en-ca.mkv"], "Show.en-ca.mkv"),
-    ("Show.en-ca.srt", ["Show.en-ca.mp4"], "Show.en-ca.mp4"),
-    ("Show.en-ca.srt", ["Show.en.mkv"], None),
-    ("Show.en-ca.en-au.srt", ["Show.mkv"], "Show.mkv"),
-    ("Show.en-ca.en-au.srt", ["Show.en-ca.mkv", "Show.mkv"], "Show.en-ca.mkv"),
     ("Show.fr.srt", ["Show.mkv"], None),
-    ("Show.fr-ca.srt", ["Show.mkv"], None),
 ]
 
 

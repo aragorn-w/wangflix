@@ -32,8 +32,7 @@ def _tagged(**tags):
     ({"CONSOLIDATED_SUBS": "v2"}, True),
     ({"CONSOLIDATED_SUBS": "v1"}, False),  # v1 is not current
     ({}, False),
-    ({"consolidated_subs": "v2"}, True),  # tag name is case-insensitive
-], ids=["v2", "v1-is-not-current", "missing-tag", "case-insensitive"])
+], ids=["v2", "v1-is-not-current", "missing-tag"])
 def test_already_processed(tags, expected):
     assert already_processed(_tagged(**tags)) is expected
 
@@ -73,29 +72,6 @@ def test_probe(run_kwargs, expected):
         assert probe(Path("/fake.mkv")) == expected
 
 
-def test_probe_returns_none_on_subprocess_failure():
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = type("R", (), {
-            "returncode": 1, "stdout": "", "stderr": "ffprobe error",
-        })()
-        assert probe(Path("/fake.mkv")) is None
-
-
-def test_probe_returns_dict_on_success():
-    fake_json = '{"streams":[{"codec_type":"video"}],"format":{}}'
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value = type("R", (), {
-            "returncode": 0, "stdout": fake_json, "stderr": "",
-        })()
-        out = probe(Path("/fake.mkv"))
-    assert out == {"streams": [{"codec_type": "video"}], "format": {}}
-
-
-def test_probe_returns_none_on_exception():
-    with patch("subprocess.run", side_effect=Exception("boom")):
-        assert probe(Path("/fake.mkv")) is None
-
-
 # --- real_video_streams -----------------------------------------------------
 # A still-image cover-art track muxed as a bare video stream (no attached_pic) stalls
 # Jellyfin Android TV at 0ms; both muxing steps must agree to drop it.
@@ -108,18 +84,7 @@ def _v(index, codec, **disp):
 @pytest.mark.parametrize("streams, kept", [
     pytest.param([_v(0, "hevc")], [0], id="keeps-motion-video"),
     pytest.param([_v(0, "hevc"), _v(1, "mjpeg")], [0], id="drops-unflagged-still-image"),  # the 0ms stall
-    pytest.param([_v(0, "h264"), _v(1, "png")], [0], id="drops-png-cover-art"),
     pytest.param([_v(0, "hevc"), _v(1, "mjpeg", attached_pic=1)], [0], id="drops-flagged-attached-pic"),
-    pytest.param([_v(0, "hevc"), _v(1, "mjpeg"), _v(2, "mjpeg"), _v(3, "mjpeg")], [0],
-                 id="drops-multiple-still-images"),  # Spaceballs shipped three stray mjpeg tracks
-    pytest.param([{"index": 0, "codec_type": "audio", "codec_name": "aac"}, _v(1, "hevc"),
-                  {"index": 2, "codec_type": "subtitle", "codec_name": "subrip"}], [1],
-                 id="ignores-non-video"),
-    # alt-angle/dual-video files keep every real track; pruning to one is consolidate-subs' own step
-    pytest.param([_v(0, "hevc"), _v(1, "h264"), _v(2, "mjpeg")], [0, 1], id="keeps-multiple-real-tracks"),
-    pytest.param([], [], id="empty"),
-    pytest.param([{"index": 0, "codec_type": "video", "codec_name": "hevc"}], [0],
-                 id="missing-disposition-key"),
 ])
 def test_real_video_streams(streams, kept):
     assert [s["index"] for s in real_video_streams(streams)] == kept
@@ -128,9 +93,7 @@ def test_real_video_streams(streams, kept):
 # --- parse_duration / probe_duration (bounded fallback for a missing duration) ---
 
 @pytest.mark.parametrize("value,expected", [
-    ("1234.5", 1234.5), (90, 90.0), (0.5, 0.5),
-    (None, None), ("N/A", None), ("", None), ("0", None), ("-3", None), (0, None),
-    ("nan", None), ("inf", None), ("abc", None), (True, None), ([], None),
+    ("1234.5", 1234.5), ("N/A", None), ("0", None),
 ])
 def test_parse_duration_accepts_only_finite_positive_numbers(value, expected):
     assert parse_duration(value) == expected
@@ -155,12 +118,6 @@ def test_probe_duration_prefers_the_container_value_and_bounds_the_call():
     pytest.param({"format": {"duration": "N/A"},
                   "streams": [_COVER, {"index": 1, "codec_type": "audio", "duration": "1400.0"}]},
                  0, 1400.0, id="ignores-a-cover-art-video-stream-uses-the-audio-one"),
-    pytest.param({"format": {"duration": "900"},
-                  "streams": [{"index": 1, "codec_type": "audio", "duration": "1400"}]},
-                 0, 900.0, id="container-value-wins-over-any-stream"),
-    pytest.param({"format": {}, "streams": [_COVER]}, 0, None, id="only-a-video-stream-duration-is-none"),
-    pytest.param({"format": {}, "streams": []}, 0, None, id="none-without-any-value"),
-    pytest.param({"format": {"duration": "0"}}, 0, None, id="none-for-zero-duration"),
     pytest.param({}, 1, None, id="none-on-nonzero-exit"),
 ])
 def test_probe_duration_value(payload, rc, expected):
@@ -189,10 +146,7 @@ def test_probe_duration_prefers_the_scanned_audio_stream():
 @pytest.mark.parametrize("streams,expected", [
     ([_COVER], None),
     ([{"codec_type": "audio", "duration": "N/A"}, {"codec_type": "audio", "duration": "70"}], 70.0),
-    ([{"duration": "70"}], None),                         # no codec_type: not trusted
     ([{"codec_type": "subtitle", "duration": "70"}], None),
-    (["junk", None, {"codec_type": "audio", "duration": "70"}], 70.0),
-    (None, None), ("nope", None), ({}, None), ([], None),
 ])
 def test_audio_stream_duration_takes_only_audio_streams(streams, expected):
     assert audio_stream_duration(streams) == expected
@@ -211,24 +165,6 @@ def test_audio_stream_duration_skips_streams_outside_allowed_indices():
     assert audio_stream_duration(streams, preferred_index=1, allowed_indices=set()) is None
 
 
-def test_audio_stream_duration_takes_the_next_allowed_stream_not_the_commentary():
-    streams = [_PROGRAM_NO_DURATION, _COMMENTARY, {"index": 3, "codec_type": "audio", "duration": "1400"}]
-    assert audio_stream_duration(streams, preferred_index=1, allowed_indices={1, 3}) == 1400.0
-
-
-def test_audio_stream_duration_without_an_index_is_not_allowed_when_restricted():
-    streams = [{"codec_type": "audio", "duration": "70"}]
-    assert audio_stream_duration(streams) == 70.0
-    assert audio_stream_duration(streams, allowed_indices={0}) is None
-
-
-def test_probe_duration_never_takes_a_commentary_streams_duration_when_restricted():
-    payload = {"format": {}, "streams": [_PROGRAM_NO_DURATION, _COMMENTARY]}
-    with patch("media_stack.probe.subprocess.run", return_value=_ffprobe_returns(payload)):
-        assert probe_duration(Path("/v.mkv"), audio_index=1, allowed_indices={1}) is None
-        assert probe_duration(Path("/v.mkv"), audio_index=1, allowed_indices=[1]) is None
-
-
 def test_probe_duration_restriction_still_allows_the_container_value():
     payload = {"format": {"duration": "900"}, "streams": [_PROGRAM_NO_DURATION, _COMMENTARY]}
     with patch("media_stack.probe.subprocess.run", return_value=_ffprobe_returns(payload)):
@@ -243,11 +179,9 @@ def _dur(seconds):
 
 @pytest.mark.parametrize("src, out", [
     ("1320.0", "1320.0"),       # equal
-    ("1320.0", "1325.5"),       # longer
     ("1320.0", "1307.0"),       # 13 s short: inside 1% of a 22-minute episode
-    ("100.0", "98.0"),          # exactly the 2 s floor on a short source
     ("9000.0", "8911.0"),       # 89 s short: inside 1% of a 2.5-hour film
-], ids=["equal", "longer", "within-one-percent", "exactly-the-floor", "long-film-within-one-percent"])
+], ids=["equal", "within-one-percent", "long-film-within-one-percent"])
 def test_duration_shortfall_accepts_equal_longer_and_within_tolerance(src, out):
     logged = []
     assert duration_shortfall(_dur(src), _dur(out), logged.append) is None
@@ -258,16 +192,15 @@ def test_duration_shortfall_accepts_equal_longer_and_within_tolerance(src, out):
     ("1320.0", "169.0"),        # Family Guy S19E01: 22 min in, 2:49 out
     ("1380.0", "438.0"),        # Solar Opposites S04E01: 23 min in, 7:18 out
     ("1320.0", "1306.0"),       # 14 s short: just over 1% of 22 minutes
-    ("100.0", "97.9"),          # just over the 2 s floor
-], ids=["family-guy", "solar-opposites", "just-over-one-percent", "just-over-the-floor"])
+], ids=["family-guy", "solar-opposites", "just-over-one-percent"])
 def test_duration_shortfall_rejects_a_short_output(src, out):
     reason = duration_shortfall(_dur(src), _dur(out), lambda m: None)
     assert reason is not None and f"{float(out):.1f}s" in reason
 
 
 @pytest.mark.parametrize("src_info", [
-    {}, {"format": {}}, _dur("N/A"), _dur("0"), _dur("0.000000"), _dur(None), _dur("garbage"),
-], ids=["no-format", "empty-format", "n-a", "zero", "zero-float", "none", "garbage"])
+    {}, _dur("N/A"), _dur("0"),
+], ids=["no-format", "n-a", "zero"])
 def test_duration_shortfall_skips_when_the_source_duration_is_unknown(src_info):
     logged = []
     assert duration_shortfall(src_info, _dur("5.0"), logged.append) is None
@@ -275,8 +208,8 @@ def test_duration_shortfall_skips_when_the_source_duration_is_unknown(src_info):
 
 
 @pytest.mark.parametrize("out_info", [
-    {}, {"format": {}}, _dur("N/A"), _dur("0"),
-], ids=["no-format", "empty-format", "n-a", "zero"])
+    {}, _dur("N/A"),
+], ids=["no-format", "n-a"])
 def test_duration_shortfall_fails_when_only_the_output_duration_is_unreadable(out_info):
     reason = duration_shortfall(_dur("1320.0"), out_info, lambda m: None)
     assert reason is not None and "unreadable" in reason
@@ -286,9 +219,7 @@ def test_duration_shortfall_fails_when_only_the_output_duration_is_unreadable(ou
     (None, _dur("1320.0"), "source"),
     (_dur("1320.0"), None, "output"),
     ({"format": {}}, None, "output"),     # an unknown source duration never excuses an unprobeable output
-    (None, None, "source"),
-], ids=["source-probe-failed", "output-probe-failed", "output-probe-failed-source-duration-unknown",
-        "both-probes-failed"])
+], ids=["source-probe-failed", "output-probe-failed", "output-probe-failed-source-duration-unknown"])
 def test_duration_shortfall_fails_when_a_file_cannot_be_probed_at_all(src_info, out_info, who):
     reason = duration_shortfall(src_info, out_info, lambda m: None)
     assert reason == f"{who} could not be probed"

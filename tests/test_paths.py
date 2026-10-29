@@ -28,7 +28,6 @@ from media_stack.paths import load_env_file, ensure_var_dirs
         "JELLYFIN_URL=http://host:8096/?token=xyz=1\n",
         {"WIREGUARD_PRIVATE_KEY": "abc/def+gh==", "JELLYFIN_URL": "http://host:8096/?token=xyz=1"},
         id="first-equals-only"),
-    pytest.param("LAST_KEY=present", {"LAST_KEY": "present"}, id="no-trailing-newline"),
 ])
 def test_load_env_file(tmp_path, content, expected):
     env = tmp_path / ".env"

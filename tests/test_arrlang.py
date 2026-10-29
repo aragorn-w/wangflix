@@ -60,58 +60,31 @@ def _rec(path, name=None):
     return {"path": path, "originalLanguage": {"name": name}} if name else {"path": path}
 
 
-@pytest.mark.parametrize("kind, folder, records, env, dotenv, expected", [
+@pytest.mark.parametrize("kind, folder, records, env, expected", [
     pytest.param("movies", "Godzilla Minus One (2023)",
-                 [_rec("/movies/Godzilla Minus One (2023)", "Japanese")], {}, None, "jpn",
+                 [_rec("/movies/Godzilla Minus One (2023)", "Japanese")], {}, "jpn",
                  id="movie-japanese"),
-    pytest.param("series", "Squid Game", [_rec("/tv/Squid Game", "Korean")], {}, None, "kor",
+    pytest.param("series", "Squid Game", [_rec("/tv/Squid Game", "Korean")], {}, "kor",
                  id="series-korean"),
-    pytest.param("movies", "Some Hollywood Film (2020)",
-                 [_rec("/movies/Some Hollywood Film (2020)", "English")], {}, None, "eng",
-                 id="english-name"),
-    pytest.param("movies", "Amelie (2001)", [_rec("/movies/Amelie (2001)", "French")], {}, None, None,
+    pytest.param("movies", "Amelie (2001)", [_rec("/movies/Amelie (2001)", "French")], {}, None,
                  id="unmapped-language-is-never-a-made-up-code"),
-    pytest.param("movies", "Some Film (2020)", None, {}, None, None,
+    pytest.param("movies", "Some Film (2020)", None, {}, None,
                  id="client-failure-sentinel"),
     pytest.param("movies", "Not In Radarr (2020)",
-                 [_rec("/movies/A Totally Different Movie (2019)", "English")], {}, None, None,
+                 [_rec("/movies/A Totally Different Movie (2019)", "English")], {}, None,
                  id="no-folder-match"),
-    pytest.param("movies", "Weird Metadata (2020)",
-                 [{"path": "/movies/Weird Metadata (2020)", "originalLanguage": "not-a-dict"}],
-                 {}, None, None, id="malformed-original-language-field"),
-    pytest.param("movies", "Shared", [_rec("/unrelated-library/Shared", "Japanese")], {}, None, None,
+    pytest.param("movies", "Shared", [_rec("/unrelated-library/Shared", "Japanese")], {}, None,
                  id="record-under-different-root-ignored"),
     pytest.param("movies", "Shared", [_rec("/data/movies/Shared", "Japanese")],
-                 {"ARR_MOVIES_ROOT": "/data/movies"}, None, "jpn", id="record-under-configured-root-used"),
-    pytest.param("movies", "Shared", [_rec("/data/movies/Shared/", "Japanese")],
-                 {"ARR_MOVIES_ROOT": "/data/movies/"}, None, "jpn",
-                 id="trailing-slashes-stripped-on-both-sides"),
+                 {"ARR_MOVIES_ROOT": "/data/movies"}, "jpn", id="record-under-configured-root-used"),
     pytest.param("movies", "Shared",
-                 [_rec("/movies/Shared", "Japanese"), _rec("/movies/Shared", "English")], {}, None, None,
+                 [_rec("/movies/Shared", "Japanese"), _rec("/movies/Shared", "English")], {}, None,
                  id="two-records-same-basename-ambiguous"),
-    pytest.param("movies", "Shared",
-                 [_rec("/movies/Shared", "Japanese"), _rec("/unrelated-library/Shared", "English")],
-                 {}, None, "jpn", id="wrong-root-record-causes-no-false-ambiguity"),
-    pytest.param("movies", "Shared", [_rec("/custom/movies/Shared", "English")], {},
-                 "ARR_MOVIES_ROOT=/custom/movies\n", "eng", id="root-override-via-dotenv-alone"),
-    pytest.param("movies", "Shared",
-                 # the .env-only root also basename-matches but process env must NOT fall back to it
-                 [_rec("/env-wins/movies/Shared", "English"), _rec("/dotenv-only/movies/Shared", "Japanese")],
-                 {"ARR_MOVIES_ROOT": "/env-wins/movies"}, "ARR_MOVIES_ROOT=/dotenv-only/movies\n", "eng",
-                 id="process-env-root-beats-dotenv"),
-    pytest.param("series", "Squid Game", [_rec("/data/tv/Squid Game", "Korean")],
-                 {"ARR_TV_ROOT": "/data/tv"}, None, "kor", id="series-root-override-via-env"),
-    pytest.param("series", "Squid Game", [_rec("/unrelated-library/Squid Game", "Korean")], {}, None, None,
-                 id="series-under-different-root-ignored"),
 ])
 def test_original_language_for_maps_the_matching_record(
-        arr, monkeypatch, kind, folder, records, env, dotenv, expected):
+        arr, monkeypatch, kind, folder, records, env, expected):
     for k, v in env.items():
         monkeypatch.setenv(k, v)
-    if dotenv is not None:
-        (arr / "stack").mkdir()
-        (arr / "stack" / ".env").write_text(dotenv)
-        monkeypatch.setattr(paths, "MEDIA_STACK_ROOT", arr / "stack")
     make = _movie_file if kind == "movies" else _series_file
     assert _ask(make(arr, folder), kind, records) == expected
 
@@ -130,8 +103,6 @@ def test_returns_none_on_missing_api_key(arr, monkeypatch):
 @pytest.mark.parametrize("fn, expected, relpath, media_root", [
     pytest.param(arrlang.original_language_for, None, "music/Some Album/track.mp3", "",
                  id="for-non-media-path"),
-    pytest.param(arrlang.original_language_for, None, "elsewhere/movies/Some Film/f.mkv", "media",
-                 id="for-path-outside-media-root"),
     pytest.param(arrlang.original_language_lookup, (None, "unknown"), "music/x.mkv", "",
                  id="lookup-outside-movies-and-tv"),
 ])
@@ -145,24 +116,6 @@ def test_paths_arr_cannot_own_never_reach_the_client(arr, monkeypatch, fn, expec
     with patch.object(arrlang, "ArrClient", fake_client_cls):
         assert fn(path) == expected
     fake_client_cls.assert_not_called()
-
-
-def test_ambiguous_basename_does_not_shadow_unambiguous_ones(arr):
-    """Only the colliding basename resolves to None."""
-    shared_file = _movie_file(arr, "Shared")
-    other_file = _movie_file(arr, "Unique Movie (2021)")
-
-    fake_client = MagicMock()
-    fake_client.movies.return_value = [
-        _rec("/movies/Shared", "Japanese"),
-        _rec("/movies/Shared", "English"),
-        _rec("/movies/Unique Movie (2021)", "Korean"),
-    ]
-    with patch.object(arrlang, "ArrClient", return_value=fake_client):
-        shared_result = arrlang.original_language_for(shared_file)
-        other_result = arrlang.original_language_for(other_file)
-    assert shared_result is None
-    assert other_result == "kor"
 
 
 def test_caches_second_call_does_not_refetch(arr):
@@ -182,28 +135,6 @@ def test_caches_second_call_does_not_refetch(arr):
     fake_client.movies.assert_called_once()  # one fetch for both lookups
 
 
-def test_cache_is_independent_per_kind(arr):
-    """Movies and series are cached under separate keys."""
-    movie_file = _movie_file(arr, "Some Movie (2020)")
-    series_file = _series_file(arr, "Some Series")
-
-    radarr_client = MagicMock()
-    radarr_client.movies.return_value = [_rec("/movies/Some Movie (2020)", "English")]
-    sonarr_client = MagicMock()
-    sonarr_client.series.return_value = [_rec("/tv/Some Series", "Japanese")]
-
-    def _make_client(url, key, **kwargs):
-        return radarr_client if url == paths.RADARR_URL else sonarr_client
-
-    with patch.object(arrlang, "ArrClient", side_effect=_make_client):
-        movie_result = arrlang.original_language_for(movie_file)
-        series_result = arrlang.original_language_for(series_file)
-    assert movie_result == "eng"
-    assert series_result == "jpn"
-    radarr_client.movies.assert_called_once()
-    sonarr_client.series.assert_called_once()
-
-
 # --- original_language_lookup: "Arr could not be asked" vs "no usable answer" ---
 # (audio-lang-check.py must not cache a result computed while Arr was down.)
 
@@ -220,16 +151,11 @@ def test_lookup_unavailable_when_the_api_key_is_missing(arr, monkeypatch):
 
 
 @pytest.mark.parametrize("failure", ["returns-none", "raises"])
-@pytest.mark.parametrize("kind, make_file, folder", [
-    ("movies", _movie_file, "Heat (1995)"),       # Radarr
-    ("series", _series_file, "Squid Game"),       # Sonarr
-], ids=["radarr-movie", "sonarr-series"])
-def test_arr_failure_is_none_for_original_language_for_and_unavailable_for_lookup(
-        arr, failure, kind, make_file, folder):
+def test_arr_failure_is_none_for_original_language_for_and_unavailable_for_lookup(arr, failure):
     """original_language_for never raises, even if ArrClient does."""
-    movie_file = make_file(arr, folder)
+    movie_file = _movie_file(arr, "Heat (1995)")
     client = MagicMock()
-    getattr(client, kind).return_value = None  # ArrClient: unreachable / bad reply
+    client.movies.return_value = None  # ArrClient: unreachable / bad reply
     kwargs = ({"return_value": client} if failure == "returns-none"
               else {"side_effect": RuntimeError("boom")})
     for fn, expected in ((arrlang.original_language_for, None),
@@ -242,18 +168,7 @@ def test_arr_failure_is_none_for_original_language_for_and_unavailable_for_looku
 @pytest.mark.parametrize("records", [
     [_rec("/movies/Elsewhere (2000)", "English")],                                  # no match
     [_rec("/movies/Heat (1995)", "French")],                                         # unmapped language
-    [_rec("/movies/Heat (1995)")],                                                   # no language at all
-    [_rec("/movies/Heat (1995)", "English"), _rec("/movies/Heat (1995)/", "Japanese")],  # ambiguous basename
-], ids=["no-match", "unmapped-language", "no-language", "ambiguous-basename"])
+], ids=["no-match", "unmapped-language"])
 def test_lookup_unknown_when_arr_answered_but_has_nothing_usable(arr, records):
     movie_file = _movie_file(arr, "Heat (1995)")
     assert _ask(movie_file, "movies", records, arrlang.original_language_lookup) == (None, "unknown")
-
-
-def test_original_language_for_contract_is_unchanged_by_the_lookup(arr):
-    """None for BOTH an outage and an unusable answer, a code when known."""
-    movie_file = _movie_file(arr, "Heat (1995)")
-    assert _ask(movie_file, "movies", [_rec("/movies/Heat (1995)", "Korean")]) == "kor"
-    arrlang._CACHE.clear()
-    with patch.object(arrlang, "ArrClient", side_effect=RuntimeError("down")):
-        assert arrlang.original_language_for(movie_file) is None

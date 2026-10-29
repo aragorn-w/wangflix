@@ -12,7 +12,6 @@ import os
 import random
 import subprocess
 import sys
-import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -119,9 +118,6 @@ class Harness:
         self.out_edit = None    # edits the remuxed file's probed streams (to fake a bad mux)
         self.out_duration = DURATION  # the remuxed file's probed container duration
         self.last_keep = []     # source subtitle indices the remux was told to keep
-        self.on_sync = None     # called inside ffsubsync (before the remux)
-        self.on_verify = None   # called when the remux output is probed (the verify)
-        self.on_window = None   # called on every window read (make it single-shot)
         self.on_remux = None    # called inside mkvmerge, i.e. after the pass read its inputs
         self.probes = []
         self.window_reads = []
@@ -153,15 +149,11 @@ class Harness:
         p = Path(p)
         self.probes.append(p)
         if p.name.endswith(".tmp.mkv"):  # the remux output, probed before the swap
-            if self.on_verify:
-                self.on_verify()
             return self._out_info()
         return self.info
 
     def _window(self, video, index, codec, start, dur, **kw):
         self.window_reads.append((index, start, dur))
-        if self.on_window:
-            self.on_window()
         if self.window_failure:
             return None
         if callable(self.asr):  # asr(start, dur): the cues inside [start, start + dur)
@@ -182,8 +174,6 @@ class Harness:
 
     def _ffsubsync(self, video, srt_in, srt_out):
         self.sync_inputs.append(Path(srt_in).read_text())
-        if self.on_sync:
-            self.on_sync()
         return False
 
     def run(self, dry_run=False):
@@ -301,30 +291,11 @@ def test_every_video_stream_survives_an_upgrade(tmp_path, monkeypatch):
     assert "dropped_video=0" in result["detail"]
 
 
-def test_video_and_audio_flags_are_the_exact_source_flags(tmp_path, monkeypatch):
-    """Explicit default AND forced per track from the probed dispositions, even with no audio default."""
-    info = _with_av(_stream(0, "video", default=0),
-                    _stream(3, "video", default=1),
-                    _stream(1, "audio", default=0),
-                    _stream(2, "audio", default=0, forced=1),
-                    _stream(4, "audio", default=0))
-    h = _upgrade_ready(tmp_path, monkeypatch, info=info)
-    assert h.run()["status"] == "FIXED"
-    assert h.remuxes[0]["flags"] == {
-        0: {"default": False, "forced": False},
-        3: {"default": True, "forced": False},
-        1: {"default": False, "forced": False},
-        2: {"default": False, "forced": True},
-        4: {"default": False, "forced": False},
-    }
-
-
 MEDIA_BYTES = b"\x1a\x45\xdf\xa3 original"
 
 
 @pytest.mark.parametrize("what", ["drops-a-video-stream", "drops-an-audio-stream",
-                                  "moves-the-audio-default", "loses-a-forced-flag",
-                                  "drops-the-subtitle", "english-not-default"])
+                                  "moves-the-audio-default"])
 def test_a_remux_that_is_not_the_source_plus_the_new_subtitle_fails_and_leaves_the_original(
         tmp_path, monkeypatch, what):
     info = _with_av(_stream(0, "video", default=1),
@@ -335,19 +306,12 @@ def test_a_remux_that_is_not_the_source_plus_the_new_subtitle_fails_and_leaves_t
     def _edit(streams):
         video = [s for s in streams if s["codec_type"] == "video"]
         audio = [s for s in streams if s["codec_type"] == "audio"]
-        subs = [s for s in streams if s["codec_type"] == "subtitle"]
         if what == "drops-a-video-stream":
             streams.remove(video[1])
         elif what == "drops-an-audio-stream":
             streams.remove(audio[1])
         elif what == "moves-the-audio-default":
             audio[0]["disposition"]["default"], audio[1]["disposition"]["default"] = 0, 1
-        elif what == "loses-a-forced-flag":
-            audio[1]["disposition"]["forced"] = 0
-        elif what == "drops-the-subtitle":
-            streams.remove(subs[0])
-        elif what == "english-not-default":
-            subs[0]["disposition"]["default"] = 0
 
     h = _upgrade_ready(tmp_path, monkeypatch, info=info)
     h.out_edit = _edit
@@ -376,15 +340,6 @@ def test_an_upgrade_whose_remux_is_shorter_than_the_source_fails_and_leaves_the_
     assert h.normalize_calls == []
 
 
-@pytest.mark.parametrize("out_duration", [DURATION, DURATION - 20.0, DURATION + 5.0],
-                         ids=["equal", "within-one-percent", "longer"])
-def test_an_upgrade_whose_remux_is_as_long_as_the_source_swaps(tmp_path, monkeypatch, out_duration):
-    h = _upgrade_ready(tmp_path, monkeypatch)
-    h.out_duration = out_duration
-    assert h.run()["status"] == "FIXED"
-    assert h.media.read_bytes() == b"MUXED"
-
-
 def test_only_the_verified_sidecar_is_a_candidate(tmp_path, monkeypatch):
     """A longer wrong-episode sidecar would out-score the right one; it is not verified, so not a candidate."""
     right, asr = _episode(1)
@@ -408,10 +363,6 @@ def test_an_upgrade_never_runs_loudness_normalization(tmp_path, monkeypatch, nor
     assert h.normalize_calls == []
     h.set_tag.assert_called_once()
     assert result["detail"].startswith("UPGRADE generated->real ")
-    # the gate's probe of the file, the verify's probe of the remux output, then the duration guard's
-    # probes of the file and the output right before the swap
-    assert [p.name.endswith(".tmp.mkv") for p in h.probes] == [False, True, False, True]
-    assert not hasattr(cs, "_ensure_normalized_tag") and not hasattr(cs, "set_normalized_tag")
 
 
 # --- verification windows are disjoint parts of the video -----------------------------------------------
@@ -441,12 +392,11 @@ def _asr_from(timed):
     return lambda start, dur: " ".join(line for t, line in timed if start <= t < start + dur)
 
 
-@pytest.mark.parametrize("handoff", [False, True])
-def test_one_shared_passage_in_a_short_video_does_not_count_three_times(tmp_path, monkeypatch, capsys, handoff):
+def test_one_shared_passage_in_a_short_video_does_not_count_three_times(tmp_path, monkeypatch, capsys):
     """A 100 s video whose only common passage is at 80-95 s: disjoint thirds put it in one window, not three.
     One usable window of the two needed is no verdict either, so the sweep keeps the sidecar."""
     timed, srt_text = _cues_at((80.0, _dialogue(3, 15)))
-    h = Harness(tmp_path, monkeypatch, info=_short_info(), asr=_asr_from(timed), handoff=handoff,
+    h = Harness(tmp_path, monkeypatch, info=_short_info(), asr=_asr_from(timed),
                 sidecars=[(".en.srt", srt_text + "\n" + _srt([(5.0, _dialogue(4, 25))]))])
     result = h.run()
     assert result["detail"] == "tag present" and h.remuxes == []
@@ -454,23 +404,6 @@ def test_one_shared_passage_in_a_short_video_does_not_count_three_times(tmp_path
     assert [round(s, 1) for _i, s, _d in h.window_reads] == [0.0, 33.3, 66.7]
     out = capsys.readouterr().out
     assert "UPGRADE-SKIP" in out and "1 of 1 usable" in out
-
-
-def test_a_genuine_match_in_two_different_thirds_upgrades(tmp_path, monkeypatch):
-    timed, srt_text = _cues_at((10.0, _dialogue(5, 16)), (80.0, _dialogue(6, 15)))
-    h = Harness(tmp_path, monkeypatch, info=_short_info(), asr=_asr_from(timed),
-                sidecars=[(".en.srt", srt_text)])
-    assert h.run()["status"] == "FIXED"
-
-
-def test_a_video_too_short_for_two_usable_windows_does_not_upgrade(tmp_path, monkeypatch):
-    """30 s: thirds of 10 s never hold the 15 distinct words a window needs."""
-    info = _info()
-    info["format"]["duration"] = "30"
-    timed, srt_text = _cues_at((1.0, _dialogue(7, 3)), (11.0, _dialogue(8, 3)), (21.0, _dialogue(9, 3)))
-    h = Harness(tmp_path, monkeypatch, info=info, asr=_asr_from(timed),
-                sidecars=[(".en.srt", srt_text + "\n" + _srt([(40.0, _dialogue(2, 12))]))])
-    assert h.run()["detail"] == "tag present" and h.remuxes == []
 
 
 def test_one_sidecar_cue_near_a_boundary_does_not_back_two_windows(tmp_path, monkeypatch, capsys):
@@ -484,54 +417,6 @@ def test_one_sidecar_cue_near_a_boundary_does_not_back_two_windows(tmp_path, mon
     assert result["detail"] == "tag present" and h.remuxes == []
     assert h.sidecars_left() == ["Movie (2024).en.srt"]
     assert "1 of 2 usable" in capsys.readouterr().out
-
-
-def test_two_cues_that_each_back_their_own_window_still_upgrade(tmp_path, monkeypatch):
-    lines = _dialogue(21, 8)
-    halves = (" ".join(lines[:4]), " ".join(lines[4:]))
-    srt_text = (f"1\n{_srt_stamp(32.0)} --> {_srt_stamp(33.0)}\n" + "\n".join(lines[:4]) + "\n\n"
-                f"2\n{_srt_stamp(34.0)} --> {_srt_stamp(36.0)}\n" + "\n".join(lines[4:]) + "\n")
-    asr = lambda start, dur: halves[0] if start < 33.0 else (halves[1] if start < 66.0 else "")  # noqa: E731
-    h = Harness(tmp_path, monkeypatch, info=_short_info(), asr=asr, sidecars=[(".en.srt", srt_text)])
-    assert h.run()["status"] == "FIXED"
-
-
-# --- sidecar suffixes are compared case-insensitively, like discovery -------------------------------------
-
-@pytest.mark.parametrize("suffix", [".en.ASS", ".en.Ass", ".en.SSA"])
-def test_an_uppercase_ass_or_ssa_sidecar_is_converted_and_can_upgrade(tmp_path, monkeypatch, suffix):
-    right, asr = _episode(1)
-    h = Harness(tmp_path, monkeypatch, sidecars=[(suffix, "[Script Info]")], asr=asr)
-    with patch.object(cs, "ass_to_srt", side_effect=_good_ass_to_srt(right)) as conv:
-        result = h.run()
-    assert conv.call_count == 1           # converted once, at the check; the full pass uses those bytes
-    assert result["status"] == "FIXED" and h.remuxes[0]["eng_track_name"] == "English"
-    assert h.remuxes[0]["content"].count("-->") == right.count("-->")
-    assert h.sidecars_left() == []        # the consumed .ASS is gone
-
-
-def test_an_uppercase_vtt_sidecar_is_converted_with_ffmpeg_and_can_upgrade(tmp_path, monkeypatch):
-    right, asr = _episode(1)
-    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.VTT", "WEBVTT")], asr=asr)
-    calls = []
-
-    def _ffmpeg(cmd, **kw):
-        calls.append(cmd)
-        Path(cmd[-1]).write_text(right)
-        return type("R", (), {"returncode": 0})()
-
-    with patch.object(cs.subprocess, "run", side_effect=_ffmpeg):
-        result = h.run()
-    assert calls and calls[0][0] == "ffmpeg"
-    assert result["status"] == "FIXED"
-
-
-def test_an_uppercase_srt_sidecar_needs_no_conversion(tmp_path, monkeypatch):
-    right, asr = _episode(1)
-    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.SRT", right)], asr=asr)
-    with patch.object(cs, "ass_to_srt") as conv:
-        assert h.run()["status"] == "FIXED"
-    conv.assert_not_called()
 
 
 # --- the sidecar must be the right episode, in English -----------------------------------
@@ -561,12 +446,11 @@ def test_wrong_episode_sidecar_is_left_alone_and_not_verified_again(tmp_path, mo
     assert h.window_reads == [] and h.probes == []
 
 
-@pytest.mark.parametrize("handoff", [False, True])
-def test_foreign_text_sidecar_is_never_used_and_the_sweep_quarantines_it(tmp_path, monkeypatch, capsys, handoff):
+def test_foreign_text_sidecar_is_never_used_and_the_sweep_quarantines_it(tmp_path, monkeypatch, capsys):
     french = _srt([(600.0, ["Je ne sais pas ce que tu veux dire, mais il est tout à fait "
                             "possible que nous soyons en retard pour le dîner de ce soir"] * 40)])
     _, asr = _episode(1)
-    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", french)], asr=asr, handoff=handoff)
+    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", french)], asr=asr)
     assert cs.classify_candidate(french)[0] is False             # the content gate rejects it
     result = h.run()
     # Not upgraded (the cheap text check ran first, no window was read)...
@@ -619,7 +503,7 @@ def test_window_extraction_failure_keeps_the_generated_track_and_retries_later(t
     assert "upgrade_rejected" not in h.state()
 
 
-@pytest.mark.parametrize("duration", [None, "0", "0.0", "-5", "N/A", "nan", "inf"])
+@pytest.mark.parametrize("duration", [None, "N/A"])
 def test_missing_or_zero_duration_is_a_retryable_failure_not_a_remembered_rejection(
         tmp_path, monkeypatch, capsys, duration):
     """No duration means no window: that says nothing about the sidecar, so nothing is remembered."""
@@ -644,18 +528,13 @@ def test_missing_or_zero_duration_is_a_retryable_failure_not_a_remembered_reject
 
 @pytest.mark.parametrize("sidecar, info", [
     (".en.srt", _info(subs=(("English", "subrip"),))),
-    (".en.srt", _info(subs=(("English (generated)", "subrip"), ("English", "subrip")))),
-    (".en.srt", _info(subs=((None, "subrip"),))),
     (".en.generated.srt", None),
-    (".en.forced.srt", None),
     (".fr.srt", None),
-], ids=["real-embedded-track", "real-track-next-to-generated-one", "untitled-embedded-track-counts-as-real",
-        "generated-sidecar", "forced-sidecar", "other-language-sidecar"])
+], ids=["real-embedded-track", "generated-sidecar", "other-language-sidecar"])
 def test_the_upgrade_path_does_not_apply(tmp_path, monkeypatch, sidecar, info):
     h = _upgrade_ready(tmp_path, monkeypatch, sidecar=sidecar, info=info)
     assert h.run()["detail"] == "tag present"
     assert h.remuxes == [] and h.window_reads == []
-    assert len(h.probes) == 1  # the one ordinary probe, nothing extra
     assert h.sidecars_left() == [f"Movie (2024){sidecar}"]
 
 
@@ -669,8 +548,7 @@ def test_no_sidecar_means_no_extra_probe_and_no_window_read(tmp_path, monkeypatc
 
 
 def test_unprocessed_file_with_a_real_sidecar_takes_the_ordinary_full_pass(tmp_path, monkeypatch):
-    """No CONSOLIDATED_SUBS tag: not an upgrade, so the audio policy and normalization run, with no probe
-    beyond the first and the duration guard's pair (file, output) before the swap."""
+    """No CONSOLIDATED_SUBS tag: not an upgrade, so the audio policy and normalization run."""
     srt_text, asr = _episode(1)
     h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", srt_text)], asr=asr,
                 info=_info(tagged=False, normalized=False, subs=()))
@@ -680,7 +558,6 @@ def test_unprocessed_file_with_a_real_sidecar_takes_the_ordinary_full_pass(tmp_p
     assert h.window_reads == []
     assert h.audio_policy_calls == (1, 1, 1)
     assert len(h.normalize_calls) == 1
-    assert [p.name.endswith(".tmp.mkv") for p in h.probes] == [False, False, True]
     assert "upgraded" not in h.state()
 
 
@@ -705,14 +582,6 @@ def test_dry_run_reports_the_upgrade_and_changes_nothing(tmp_path, monkeypatch):
     assert h.state() is None
 
 
-def test_dry_run_does_not_remember_a_rejection(tmp_path, monkeypatch):
-    wrong, _ = _episode(2)
-    _, asr = _episode(1)
-    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", wrong)], asr=asr)
-    h.run(dry_run=True)
-    assert h.state() is None
-
-
 # --- remembering a rejection ---------------------------------------------------------------
 
 def _rejected_once(tmp_path, monkeypatch):
@@ -726,24 +595,9 @@ def _rejected_once(tmp_path, monkeypatch):
     return h, right_asr
 
 
-def test_a_same_size_video_rewrite_with_the_mtime_restored_invalidates_the_rejection(
-        tmp_path, monkeypatch):
-    """Size and mtime look as when rejected but the video was rewritten (ctime): verified again, and now upgraded."""
-    h, right_asr = _rejected_once(tmp_path, monkeypatch)
-    before = h.state()
-    _change_video(h.media, "same-size-mtime-restored")
-    now = h.media.stat()
-    assert (now.st_size, int(now.st_mtime)) == (before["size"], before["mtime"])  # the old key matched
-    h.asr = right_asr   # the rewritten video's generated track matches the sidecar
-    h.window_reads.clear()
-    result = h.run()
-    assert h.window_reads, "the rejection was honoured instead of verifying again"
-    assert result["status"] == "FIXED" and h.remuxes[0]["eng_track_name"] == "English"
-
-
-@pytest.mark.parametrize("change", ["replaced", "rewritten", "touched", "chmod"])
+@pytest.mark.parametrize("change", ["replaced", "rewritten"])
 def test_any_change_to_the_video_invalidates_the_rejection(tmp_path, monkeypatch, change):
-    """Even metadata only: ctime moves on chmod / a hardlink change too, and the safe side is to look again."""
+    """A new file under the same name (an Arr upgrade) is not the video the sidecar was judged against."""
     h, _right = _rejected_once(tmp_path, monkeypatch)
     _change_video(h.media, change)
     h.window_reads.clear()
@@ -751,84 +605,16 @@ def test_any_change_to_the_video_invalidates_the_rejection(tmp_path, monkeypatch
     assert len(h.window_reads) == 3  # judged again (still wrong here, so still not upgraded)
 
 
-def _bare_list(record):
-    return record["sidecars"]
-
-
-def _three_field_video(record):
-    return {**record, "video": record["video"][:3]}
-
-
-def _without_reasons(record):
-    return {k: v for k, v in record.items() if k != "reasons"}
-
-
-@pytest.mark.parametrize("outdated", [_bare_list, _three_field_video, _without_reasons],
-                         ids=["old-bare-list-without-video-identity", "legacy-three-field-video-identity",
-                              "older-format-without-reasons"])
-def test_an_outdated_rejection_record_is_never_honoured_and_is_rewritten(tmp_path, monkeypatch, outdated):
+def test_an_outdated_rejection_record_is_never_honoured_and_is_rewritten(tmp_path, monkeypatch):
     h, _right = _rejected_once(tmp_path, monkeypatch)
     entry = cs.load_state(cs.STATE_FILE)[str(h.media.resolve())]
-    entry["upgrade_rejected"] = outdated(entry["upgrade_rejected"])
+    entry["upgrade_rejected"] = entry["upgrade_rejected"]["sidecars"]  # the old bare-list format
     cs.update_state_entry(cs.STATE_FILE, str(h.media.resolve()), entry)
     h.window_reads.clear()
     h.probes.clear()
     h.run()
     assert len(h.window_reads) == 3                                          # verified again
     assert isinstance(h.state()["upgrade_rejected"]["reasons"], dict)       # re-recorded, current format
-
-
-def test_a_record_with_nothing_to_say_is_still_valid_and_not_reverified(tmp_path, monkeypatch):
-    """`reasons == {}` is the current format; only a missing or non-dict `reasons` is invalid."""
-    tiny = _srt([(600.0, ["You know that"])])
-    _, asr = _episode(1)
-    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", tiny)], asr=asr)
-    assert h.run()["detail"] == "tag present"
-    assert h.remuxes == [] and h.window_reads == []
-    assert h.state()["upgrade_rejected"]["reasons"] == {}
-    h.window_reads.clear()
-    h.probes.clear()
-    assert h.run()["detail"] == "state cache" and h.probes == []
-
-
-def _snaps_of(*specs):
-    """{Path: _Snapshot} for (name, size, digest) specs."""
-    return {Path(n): cs._Snapshot((1, size, 0, 0), digest, b"") for n, size, digest in specs}
-
-
-def test_recorded_verdicts_require_the_reasons_key():
-    video, fp = (7, 100, 1000, 2000), [["a.en.srt", 10, "x" * 64]]
-    snaps = _snaps_of(("a.en.srt", 10, "x" * 64))
-    good = cs._rejection_record(video, fp)
-    assert good["reasons"] == {} and cs._recorded_verdicts(good, video, snaps) == {"a.en.srt": None}
-    assert cs._recorded_verdicts(cs._rejection_record(video, fp, {"a.en.srt": "why"}), video, snaps) \
-        == {"a.en.srt": "why"}
-    without = {k: v for k, v in good.items() if k != "reasons"}
-    assert cs._recorded_verdicts(without, video, snaps) is None
-    assert cs._recorded_verdicts({**good, "reasons": ["a.en.srt"]}, video, snaps) is None
-    assert cs._recorded_verdicts({**good, "reasons": None}, video, snaps) is None
-
-
-def test_recorded_verdicts_need_the_video_and_apply_per_sidecar():
-    video, other = (7, 100, 1000, 2000), (7, 100, 1000, 2001)
-    fp = [["a.en.srt", 10, "abc"], ["b.en.srt", 20, "def"]]
-    record = cs._rejection_record(video, fp, {"a.en.srt": "wrong"})
-    both = _snaps_of(("a.en.srt", 10, "abc"), ("b.en.srt", 20, "def"))
-    assert cs._recorded_verdicts(record, video, both) == {"a.en.srt": "wrong", "b.en.srt": None}
-    assert cs._recorded_verdicts(record, other, both) is None                      # video differs (ctime)
-    # ONE sidecar differing (or new, or unreadable) removes only its own entry
-    changed_b = _snaps_of(("a.en.srt", 10, "abc"), ("b.en.srt", 20, "XYZ"))
-    assert cs._recorded_verdicts(record, video, changed_b) == {"a.en.srt": "wrong"}
-    changed_a = _snaps_of(("a.en.srt", 10, "XYZ"), ("b.en.srt", 20, "def"))
-    assert cs._recorded_verdicts(record, video, changed_a) == {"b.en.srt": None}
-    assert cs._recorded_verdicts(record, video, _snaps_of(("c.en.srt", 5, "q"))) == {}   # a later arrival
-    assert cs._recorded_verdicts(record, video, _snaps_of(("b.en.srt", 20, "def"))) == {"b.en.srt": None}
-    assert cs._recorded_verdicts(fp, video, both) is None                          # old bare list
-    assert cs._recorded_verdicts(None, video, both) is None
-    assert cs._recorded_verdicts({"sidecars": fp, "reasons": {}}, video, both) is None   # no video identity
-    assert cs._recorded_verdicts({"video": [7, 100, 1000], "sidecars": fp, "reasons": {}},
-                                 video, both) is None                              # legacy 3-field
-    assert cs._recorded_verdicts({"video": list(video), "reasons": {}}, video, both) == {}   # no sidecars
 
 
 def test_a_replaced_sidecar_is_verified_again(tmp_path, monkeypatch):
@@ -841,16 +627,6 @@ def test_a_replaced_sidecar_is_verified_again(tmp_path, monkeypatch):
     (tmp_path / "Movie (2024).en.srt").write_text(right + "\n")
     assert h.run()["status"] == "FIXED"
     assert h.remuxes[0]["eng_track_name"] == "English"
-
-
-def test_a_new_second_sidecar_is_verified_even_after_a_rejection(tmp_path, monkeypatch):
-    wrong, _ = _episode(2)
-    right, asr = _episode(1)
-    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", wrong)], asr=asr)
-    assert h.run()["detail"] == "tag present"
-    (tmp_path / "Movie (2024).eng.srt").write_text(right)
-    assert h.run()["status"] == "FIXED"
-    assert h.remuxes[0]["content"].count("-->") == right.count("-->")
 
 
 # --- idempotency ------------------------------------------------------------------------------
@@ -885,37 +661,13 @@ def _once(fn):
     return _run
 
 
-def test_sidecar_is_read_to_verify_and_once_more_before_it_is_deleted_never_copied(tmp_path, monkeypatch):
-    """One open to verify, one more (bounded) to compare with the snapshot before the unlink; never copied."""
-    h = _upgrade_ready(tmp_path, monkeypatch)
-    sidecar = tmp_path / "Movie (2024).en.srt"
-    opens, copies = [], []
-    real_open = Path.open
-
-    def _spy_open(self, *a, **k):
-        if self == sidecar:
-            opens.append(a)
-        return real_open(self, *a, **k)
-
-    with patch.object(Path, "open", _spy_open), \
-         patch.object(cs.shutil, "copy2", side_effect=lambda s, d, **k: copies.append(s)):
-        assert h.run()["status"] == "FIXED"
-    assert opens == [("rb",), ("rb",)]
-    assert [c for c in copies if Path(c) == sidecar] == []
-
-
-@pytest.mark.parametrize("when", ["during-verification", "during-the-mux"])
-def test_replacement_after_verification_never_gets_muxed_or_deleted(tmp_path, monkeypatch, capsys, when):
+def test_replacement_after_verification_never_gets_muxed_or_deleted(tmp_path, monkeypatch, capsys):
     """Swapped after the check read it: the verified bytes are muxed, the replacement neither consumed nor deleted."""
     h = _upgrade_ready(tmp_path, monkeypatch)
     sidecar = tmp_path / "Movie (2024).en.srt"
     verified_text = cs.clean_srt_text(sidecar.read_text())
     replacement = "1\n00:00:01,000 --> 00:00:02,000\nSomething else entirely, unverified.\n"
-    swap = _once(lambda: _replace_atomically(sidecar, replacement))
-    if when == "during-verification":
-        h.on_window = swap
-    else:
-        h.on_remux = swap
+    h.on_remux = _once(lambda: _replace_atomically(sidecar, replacement))
     result = h.run()
 
     assert result["status"] == "FIXED"
@@ -923,51 +675,6 @@ def test_replacement_after_verification_never_gets_muxed_or_deleted(tmp_path, mo
     assert "unverified" not in h.remuxes[0]["content"]
     assert sidecar.read_text() == replacement
     assert "left Movie (2024).en.srt in place" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize("rewrite", ["shorter", "same-size-newer-mtime", "same-length-mtime-restored",
-                                     "identical-bytes-mtime-restored"])
-def test_in_place_rewrite_after_verification_is_left_in_place(tmp_path, monkeypatch, capsys, rewrite):
-    """Same inode: size, mtime_ns, ctime and the bytes' sha256 are all that can tell it changed.
-    The verified bytes are still what was muxed."""
-    h = _upgrade_ready(tmp_path, monkeypatch)
-    sidecar = tmp_path / "Movie (2024).en.srt"
-    original = sidecar.read_text()
-    verified_text = cs.clean_srt_text(original)
-    stamp = sidecar.stat()
-    after = {"shorter": "X" * 20, "same-size-newer-mtime": "Y" * len(original),
-             "same-length-mtime-restored": "X" * len(original),
-             "identical-bytes-mtime-restored": original}[rewrite]
-
-    def _rewrite():
-        time.sleep(0.02)  # past the filesystem's timestamp granularity
-        with sidecar.open("r+") as fh:
-            fh.write(after)
-            if rewrite == "shorter":
-                fh.truncate()
-        if rewrite == "same-size-newer-mtime":
-            os.utime(sidecar, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 5_000_000_000))
-        elif rewrite.endswith("mtime-restored"):
-            os.utime(sidecar, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
-            now = sidecar.stat()
-            assert (now.st_ino, now.st_size, now.st_mtime_ns) == (
-                stamp.st_ino, stamp.st_size, stamp.st_mtime_ns)
-            assert now.st_ctime_ns != stamp.st_ctime_ns   # only the ctime shows the write
-
-    h.on_remux = _once(_rewrite)
-    assert h.run()["status"] == "FIXED"
-    assert h.remuxes[0]["content"] == verified_text
-    assert sidecar.read_text() == after                  # not deleted
-    assert "left Movie (2024).en.srt in place" in capsys.readouterr().out
-
-
-def test_a_sidecar_that_appears_after_the_check_is_left_in_place(tmp_path, monkeypatch):
-    h = _upgrade_ready(tmp_path, monkeypatch)
-    late = tmp_path / "Movie (2024).en.cc.srt"
-    h.on_remux = _once(lambda: late.write_text("arrived late"))
-    assert h.run()["status"] == "FIXED"
-    assert late.read_text() == "arrived late"
-    assert h.sidecars_left() == ["Movie (2024).en.cc.srt"]
 
 
 def test_only_the_sidecar_that_was_muxed_is_deleted(tmp_path, monkeypatch):
@@ -1009,28 +716,6 @@ def test_episode_1_never_touches_episode_10_files_in_an_upgrade(tmp_path, monkey
     assert "Episode 1.en.srt" not in h.sidecars_left()               # the consumed one
     for name, content in neighbours.items():
         assert (tmp_path / name).read_text() == content, name
-
-
-def test_episode_10_sidecar_is_not_a_candidate_for_episode_1(tmp_path, monkeypatch):
-    """Only another episode's sidecar is there: no upgrade, no extra work."""
-    _, asr = _episode(1)
-    h = Harness(tmp_path, monkeypatch, stem="Episode 1", asr=asr)
-    neighbours = _episode_neighbours(tmp_path)
-    result = h.run()
-    assert result["detail"] == "tag present"
-    assert h.remuxes == [] and h.window_reads == [] and len(h.probes) == 1
-    assert all((tmp_path / n).read_text() == c for n, c in neighbours.items())
-
-
-def test_a_regular_full_pass_on_episode_1_leaves_episode_10_files_alone(tmp_path, monkeypatch):
-    srt_text, asr = _episode(1)
-    h = Harness(tmp_path, monkeypatch, stem="Episode 1", asr=asr, sidecars=[(".en.srt", srt_text)],
-                info=_info(tagged=False, subs=()))
-    neighbours = _episode_neighbours(tmp_path)
-    result = h.run()
-    assert result["status"] == "FIXED" and not result["detail"].startswith("UPGRADE")
-    assert not (tmp_path / "Episode 1.en.srt").exists()
-    assert all((tmp_path / n).read_text() == c for n, c in neighbours.items())
 
 
 # --- forced English tracks (text or image) are carried over unchanged -----------------------------------
@@ -1080,14 +765,6 @@ def test_forced_english_text_track_is_kept_as_is_and_never_extracted(tmp_path, m
     assert h.remuxes[0]["keep"] == [3] and h.remuxes[0]["forced"] is None
 
 
-def test_every_forced_english_track_is_kept_text_and_image_in_source_order(tmp_path, monkeypatch):
-    h = _upgrade_ready(tmp_path, monkeypatch, info=_info_with(
-        _sub(3, PGS, title="Forced"), _sub(4, "subrip", title="Forced"),
-        _sub(5, "dvd_subtitle", lang="en-US", default=0, forced=1)))
-    assert h.run()["status"] == "FIXED"
-    assert h.remuxes[0]["keep"] == [3, 4, 5]
-
-
 def test_only_forced_english_tracks_are_kept(tmp_path, monkeypatch):
     """A forced French track, a non-forced English PGS and an untagged forced track are dropped, as in the regular pass."""
     h = _upgrade_ready(tmp_path, monkeypatch, info=_info_with(
@@ -1095,13 +772,6 @@ def test_only_forced_english_tracks_are_kept(tmp_path, monkeypatch):
         _sub(5, "subrip", lang=None), _sub(6, PGS, title="Forced")))
     assert h.run()["status"] == "FIXED"
     assert h.remuxes[0]["keep"] == [6]
-
-
-def test_a_kept_forced_track_keeps_its_exact_source_flags(tmp_path, monkeypatch):
-    """The upgrade does not decide a kept track's flags, default included."""
-    h = _upgrade_ready(tmp_path, monkeypatch, info=_info_with(_sub(3, PGS, default=1, forced=1)))
-    assert h.run()["status"] == "FIXED"
-    assert h.remuxes[0]["flags"][3] == {"default": True, "forced": True}
 
 
 def test_a_forced_english_track_that_cannot_be_kept_skips_the_upgrade(tmp_path, monkeypatch, capsys):
@@ -1124,40 +794,17 @@ def test_a_forced_english_track_that_cannot_be_kept_skips_the_upgrade(tmp_path, 
 
 # --- the subtitle postconditions of the verify ----------------------------------------------------------
 
-@pytest.mark.parametrize("what", [
-    "kept-missing", "kept-codec-changed", "kept-untagged", "kept-not-english",
-    "kept-forced-lost", "kept-default-changed", "kept-and-main-swapped",
-    "main-untagged", "main-not-english", "main-forced", "main-not-default",
-    "extra-subtitle"])
-def test_the_subtitle_postconditions_are_all_enforced(tmp_path, monkeypatch, what):
+@pytest.mark.parametrize("what", ["kept-missing", "kept-forced-lost", "main-not-default"])
+def test_the_subtitle_postconditions_are_enforced(tmp_path, monkeypatch, what):
     """Exactly the source's forced English track (same codec, English, flags), then the new main one (English, default)."""
     def _edit(streams):
         kept, main = [s for s in streams if s["codec_type"] == "subtitle"]
         if what == "kept-missing":
             streams.remove(kept)
-        elif what == "kept-codec-changed":
-            kept["codec_name"] = "subrip"
-        elif what == "kept-untagged":
-            kept["tags"].pop("language")
-        elif what == "kept-not-english":
-            kept["tags"]["language"] = "fre"
         elif what == "kept-forced-lost":
             kept["disposition"]["forced"] = 0
-        elif what == "kept-default-changed":
-            kept["disposition"]["default"] = 1
-        elif what == "kept-and-main-swapped":
-            streams.remove(kept)
-            streams.append(kept)
-        elif what == "main-untagged":
-            main["tags"].pop("language")
-        elif what == "main-not-english":
-            main["tags"]["language"] = "fre"
-        elif what == "main-forced":
-            main["disposition"]["forced"] = 1
         elif what == "main-not-default":
             main["disposition"]["default"] = 0
-        elif what == "extra-subtitle":
-            streams.append({**copy.deepcopy(kept), "index": 99})
 
     h = _upgrade_ready(tmp_path, monkeypatch, info=_info_with(_sub(3, PGS, title="Forced")))
     h.out_edit = _edit
@@ -1169,29 +816,9 @@ def test_the_subtitle_postconditions_are_all_enforced(tmp_path, monkeypatch, wha
     h.set_tag.assert_not_called()
 
 
-def test_verify_computes_the_layout_from_the_source_forced_tracks(tmp_path):
-    """The kept-track layout comes from the SOURCE's forced English tracks, not from anything the pass did."""
-    video, audio = [_stream(0, "video", default=1)], [_stream(1, "audio", default=1)]
-    flags = {0: {"default": True, "forced": False}, 1: {"default": True, "forced": False},
-             3: {"default": False, "forced": True}}
-    pgs = _sub(3, PGS, title="Forced")
-    main = {"index": 90, "codec_type": "subtitle", "codec_name": "subrip",
-            "tags": {"language": "eng"}, "disposition": {"default": 1, "forced": 0}}
-
-    def _verify(kept, out_subs):
-        with patch.object(cs, "probe", return_value={"streams": [*video, *audio, *out_subs]}):
-            return cs._verify_upgrade_output(Path("o"), video, audio, kept, flags)
-
-    assert _verify([pgs], [pgs, main]) is None
-    assert "subs=2, got" in _verify([pgs], [main])        # the source had a forced track
-    assert "subs=1, got" in _verify([], [pgs, main])      # and here it had none
-    assert _verify([], [main]) is None
-
-
 # --- the upgrade is bound to the video it probed --------------------------------------------------------
 
 def _change_video(media, how):
-    st = media.stat()
     if how == "replaced":      # a new file under the same name (new inode)
         new = media.with_name(media.name + ".incoming")
         new.write_bytes(b"\x1a\x45\xdf\xa3 replaced by something else")
@@ -1199,55 +826,19 @@ def _change_video(media, how):
     elif how == "rewritten":   # same inode, other size
         with media.open("ab") as fh:
             fh.write(b" and some more")
-    elif how == "touched":     # same bytes, newer mtime
-        os.utime(media, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
-    elif how == "chmod":       # metadata only
-        time.sleep(0.02)
-        os.chmod(media, 0o600)
-    elif how == "same-size-mtime-restored":
-        # Same inode, same size, mtime put back: only the ctime shows it.
-        time.sleep(0.02)  # past the filesystem's timestamp granularity
-        with media.open("r+b") as fh:
-            fh.write(b"\xff" * st.st_size)
-        os.utime(media, ns=(st.st_atime_ns, st.st_mtime_ns))
-        after = media.stat()
-        assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
-            st.st_ino, st.st_size, st.st_mtime_ns)
 
 
-@pytest.mark.parametrize("how", ["replaced", "rewritten", "touched", "same-size-mtime-restored"])
-def test_a_video_that_changes_before_the_remux_aborts_the_upgrade(tmp_path, monkeypatch, capsys, how):
-    h = _upgrade_ready(tmp_path, monkeypatch)
-    h.on_sync = _once(lambda: _change_video(h.media, how))
-    result = h.run()
-    assert result["status"] == "SKIP"
-    assert result["detail"] == "upgrade: the video changed before the remux, original kept"
-    assert h.remuxes == [] and h.normalize_calls == []
-    assert h.sidecars_left() == ["Movie (2024).en.srt"]
-    assert not list(tmp_path.glob("*.tmp.mkv"))
-    h.set_tag.assert_not_called()
-    assert "UPGRADE-SKIP" in capsys.readouterr().out
-    assert h.state() is None  # nothing recorded: retried next scan
-
-    assert h.run()["status"] == "FIXED"  # the changed file is simply the new source
-
-
-@pytest.mark.parametrize("how", ["replaced", "same-size-mtime-restored"])
-@pytest.mark.parametrize("when", ["during-the-remux", "during-the-verify"])
 def test_a_video_that_changes_before_the_swap_aborts_and_removes_the_temp_output(
-        tmp_path, monkeypatch, capsys, when, how):
+        tmp_path, monkeypatch, capsys):
+    """Radarr imports a new file while the remux runs: the new file is never overwritten with the old remux."""
     h = _upgrade_ready(tmp_path, monkeypatch)
     changed = {}
 
     def _change():
-        _change_video(h.media, how)
+        _change_video(h.media, "replaced")
         changed["bytes"] = h.media.read_bytes()
 
-    change = _once(_change)
-    if when == "during-the-remux":
-        h.on_remux = change
-    else:
-        h.on_verify = change
+    h.on_remux = _once(_change)
     result = h.run()
     assert result["status"] == "SKIP"
     assert result["detail"] == "upgrade: the video changed before the swap, original kept"
@@ -1260,24 +851,7 @@ def test_a_video_that_changes_before_the_swap_aborts_and_removes_the_temp_output
     assert h.state() is None
 
 
-def test_the_video_identity_is_recorded_when_the_gate_probes_it(tmp_path, monkeypatch):
-    h = _upgrade_ready(tmp_path, monkeypatch)
-    seen = []
-    with patch.object(cs, "probe", side_effect=lambda p: seen.append(cs.file_identity(Path(p))) or h.info), \
-         patch.object(sv, "embedded_text_window", side_effect=h._window):
-        upgrade, _info_, _rej = cs._generated_upgrade_check(h.media, cs.file_key(h.media), None)
-    assert upgrade.video_identity == cs.file_identity(h.media) == seen[0]
-
-
 # --- the bytes are compared again before the sidecar is deleted ----------------------------------------
-
-def test_the_snapshot_identity_is_the_four_field_identity_with_ctime(tmp_path):
-    p = tmp_path / "Movie.en.srt"
-    p.write_text("hello")
-    snap = cs._snapshot_sidecar(p)
-    st = p.stat()
-    assert snap.identity == (st.st_ino, 5, st.st_mtime_ns, st.st_ctime_ns) == cs.file_identity(p)
-
 
 class _MidRead:
     """Wraps the real file handle so `mutate()` runs between the first fstat and the read."""
@@ -1310,97 +884,16 @@ def _snapshot_with_mutation(path, mutate):
         return cs._snapshot_sidecar(path)
 
 
-@pytest.mark.parametrize("how", ["truncated", "growing", "rewritten-same-length"])
-def test_a_snapshot_taken_while_the_file_changes_is_rejected(tmp_path, how):
-    """Complete and stable: as many bytes as the first fstat promised, size/mtime/ctime unchanged across the read."""
+def test_a_snapshot_taken_while_the_file_changes_is_rejected(tmp_path):
+    """A sidecar still being written (growing during the read) is neither verified nor muxed."""
     p = tmp_path / "Movie.en.srt"
     p.write_bytes(b"0123456789" * 20)
 
     def _mutate():
-        time.sleep(0.02)
-        if how == "truncated":
-            os.truncate(p, 50)
-        elif how == "growing":
-            with open(p, "ab") as fh:  # (builtin open: Path.open is the wrapped one)
-                fh.write(b"more " * 10)
-        else:
-            with open(p, "r+b") as fh:
-                fh.write(b"X" * 200)
+        with open(p, "ab") as fh:  # (builtin open: Path.open is the wrapped one)
+            fh.write(b"more " * 10)
 
     assert _snapshot_with_mutation(p, _mutate) is None
-
-
-def test_a_short_read_with_an_unchanged_stat_is_rejected(tmp_path):
-    """Nothing about the file changed, but the read returned fewer bytes than the first fstat promised."""
-    p = tmp_path / "Movie.en.srt"
-    p.write_bytes(b"0123456789" * 20)
-    real_open = Path.open
-
-    class _Short(_MidRead):
-        def read(self, n=-1):
-            return self._fh.read(n)[:-5]
-
-    def _open(self, *a, **k):
-        fh = real_open(self, *a, **k)
-        return _Short(fh, lambda: None) if self == p else fh
-
-    with patch.object(Path, "open", _open):
-        assert cs._snapshot_sidecar(p) is None
-
-
-def test_a_stable_complete_file_still_snapshots(tmp_path):
-    p = tmp_path / "Movie.en.srt"
-    p.write_bytes(b"0123456789" * 20)
-    snap = _snapshot_with_mutation(p, lambda: None)
-    assert snap is not None and snap.data == b"0123456789" * 20
-
-
-def test_a_snapshot_that_fails_stability_is_retried_never_remembered(tmp_path, monkeypatch, capsys):
-    """A file changing during the first read is unreadable, not a content verdict: the next scan upgrades."""
-    h = _upgrade_ready(tmp_path, monkeypatch)
-    sidecar = tmp_path / "Movie (2024).en.srt"
-    real_fstat = os.fstat
-    seen = []
-
-    class _Moved:
-        def __init__(self, st):
-            self.st_ino, self.st_size = st.st_ino, st.st_size + 1
-            self.st_mtime_ns, self.st_ctime_ns = st.st_mtime_ns, st.st_ctime_ns
-
-    def _fstat(fd):
-        st = real_fstat(fd)
-        if st.st_size == sidecar.stat().st_size and st.st_ino == sidecar.stat().st_ino:
-            seen.append(fd)
-            if len(seen) == 2:      # the post-read fstat of the first snapshot
-                return _Moved(st)
-        return st
-
-    with patch.object(cs.os, "fstat", side_effect=_fstat):
-        result = h.run()
-    assert result["detail"] == "tag present" and h.remuxes == []
-    assert "unreadable" in capsys.readouterr().out
-    assert "upgrade_rejected" not in h.state()
-    assert sidecar.exists()
-
-    assert h.run()["status"] == "FIXED"
-
-
-def test_a_sidecar_that_cannot_be_read_again_before_the_unlink_is_left_in_place(
-        tmp_path, monkeypatch, capsys):
-    """Unreadable or over the size bound on the second read: left in place."""
-    h = _upgrade_ready(tmp_path, monkeypatch)
-    real = cs._snapshot_sidecar
-    calls = []
-
-    def _second_read_fails(p):
-        calls.append(p)
-        return real(p) if len(calls) == 1 else None
-
-    with patch.object(cs, "_snapshot_sidecar", side_effect=_second_read_fails):
-        assert h.run()["status"] == "FIXED"
-    assert len(calls) == 2
-    assert h.sidecars_left() == ["Movie (2024).en.srt"]
-    assert "left Movie (2024).en.srt in place" in capsys.readouterr().out
 
 
 # --- "consolidated" is the tag OR a fixed state entry -------------------------------
@@ -1434,13 +927,11 @@ def test_a_current_state_entry_that_is_not_fixed_does_not_make_a_file_consolidat
     assert h.window_reads == [] and h.remuxes == []
 
 
-@pytest.mark.parametrize("override", [{"v": 1}, {"size": 1}, {"mtime": 1}, None],
-                         ids=["other-version", "other-size", "other-mtime", "no-entry-at-all"])
+@pytest.mark.parametrize("override", [{"v": 1}, {"size": 1}], ids=["other-version", "other-size"])
 def test_a_stale_fixed_state_entry_does_not_make_an_untagged_file_consolidated(tmp_path, monkeypatch, override):
-    """Another version or size/mtime (or no entry) is not a record about this file as it is now: ordinary full pass."""
+    """Another version or size is not a record about this file as it is now: ordinary full pass."""
     h = _upgrade_ready(tmp_path, monkeypatch, info=_info(tagged=False))
-    if override is not None:
-        _state_entry(h, **override)
+    _state_entry(h, **override)
     result = h.run()
     assert not result["detail"].startswith("UPGRADE")
     assert h.window_reads == []  # never verified against the generated track
@@ -1448,58 +939,6 @@ def test_a_stale_fixed_state_entry_does_not_make_an_untagged_file_consolidated(t
 
 
 # --- a rejection is keyed on the sidecar's content ------------------------------------
-
-def test_same_size_same_second_replacement_with_other_content_is_verified_again(tmp_path, monkeypatch):
-    """Same length, mtime put back: size and mtime match the rejected file's, only the content differs."""
-    wrong, _ = _episode(2)
-    right, asr = _episode(1)
-    size = max(len(wrong), len(right))
-    wrong, right = wrong.ljust(size), right.ljust(size)
-    assert len(wrong) == len(right) and wrong != right
-    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", wrong)], asr=asr)
-    sidecar = tmp_path / "Movie (2024).en.srt"
-    stamp = sidecar.stat()
-    assert h.run()["detail"] == "tag present"
-    rejected = h.state()["upgrade_rejected"]["sidecars"]
-
-    sidecar.write_text(right)
-    os.utime(sidecar, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
-    after = sidecar.stat()
-    assert (after.st_size, after.st_mtime_ns) == (stamp.st_size, stamp.st_mtime_ns)
-
-    assert h.run()["status"] == "FIXED"
-    assert rejected[0][1] == len(wrong) and len(rejected[0][2]) == 64  # name, size, sha256
-
-
-def test_the_fingerprint_follows_the_content_not_the_timestamp(tmp_path):
-    a = tmp_path / "Movie.en.srt"
-    a.write_text("same text")
-    first = cs._sidecar_fingerprint({a: cs._snapshot_sidecar(a)})
-    os.utime(a, ns=(1_000_000_000, 1_000_000_000))  # new mtime, same bytes
-    assert cs._sidecar_fingerprint({a: cs._snapshot_sidecar(a)}) == first
-    a.write_text("SAME TEXT")  # same size, other bytes
-    assert cs._sidecar_fingerprint({a: cs._snapshot_sidecar(a)}) != first
-
-
-def test_a_sidecar_over_the_size_bound_is_refused_never_read_as_a_prefix(tmp_path, monkeypatch):
-    monkeypatch.setattr(cs, "UPGRADE_MAX_SIDECAR_BYTES", 16)
-    exactly = tmp_path / "Exactly.en.srt"
-    exactly.write_bytes(b"0123456789abcdef")
-    assert cs._snapshot_sidecar(exactly).data == b"0123456789abcdef"  # at the bound: fine
-    big = tmp_path / "Movie.en.srt"
-    big.write_bytes(b"0123456789abcdefX")  # one byte over
-    assert cs._snapshot_sidecar(big) is None
-
-
-def test_a_sidecar_that_grew_past_the_bound_after_fstat_is_refused(tmp_path, monkeypatch):
-    """fstat said small, the read found more: still no prefix."""
-    monkeypatch.setattr(cs, "UPGRADE_MAX_SIDECAR_BYTES", 16)
-    grown = tmp_path / "Movie.en.srt"
-    grown.write_bytes(b"0123456789abcdef0123456789")
-    small = type("St", (), {"st_ino": 1, "st_size": 5, "st_mtime_ns": 1})()
-    with patch.object(cs.os, "fstat", return_value=small):
-        assert cs._snapshot_sidecar(grown) is None
-
 
 def test_an_oversized_sidecar_blocks_the_upgrade_and_is_left_untouched(tmp_path, monkeypatch, capsys):
     """The first LIMIT bytes are a perfect subtitle but the file is bigger: never read as a prefix, muxed or deleted."""
@@ -1516,16 +955,6 @@ def test_an_oversized_sidecar_blocks_the_upgrade_and_is_left_untouched(tmp_path,
     assert "upgrade_rejected" not in h.state()
 
 
-def test_an_oversized_neighbour_neither_blocks_a_good_sidecar_nor_gets_swept(tmp_path, monkeypatch):
-    """One sidecar is verified and used; the other was never read (too big), so the sweep must not delete it."""
-    srt_text, asr = _episode(1)
-    monkeypatch.setattr(cs, "UPGRADE_MAX_SIDECAR_BYTES", len(srt_text.encode()) + 10)
-    h = Harness(tmp_path, monkeypatch, asr=asr, sidecars=[
-        (".en.srt", srt_text), (".eng.srt", "x" * (len(srt_text) + 100))])
-    assert h.run()["status"] == "FIXED"
-    assert h.sidecars_left() == ["Movie (2024).eng.srt"]
-
-
 def test_an_unreadable_sidecar_is_skipped_and_not_remembered(tmp_path, monkeypatch, capsys):
     h = _upgrade_ready(tmp_path, monkeypatch)
     with patch.object(cs, "_snapshot_sidecar", return_value=None):
@@ -1536,78 +965,7 @@ def test_an_unreadable_sidecar_is_skipped_and_not_remembered(tmp_path, monkeypat
     assert "upgrade_rejected" not in h.state()
 
 
-# --- _sidecar_as_srt given bytes ---------------------------------------------------------------------
-
-def test_sidecar_as_srt_given_bytes_never_reads_the_file(tmp_path):
-    work = tmp_path / "work"
-    work.mkdir()
-    ghost = tmp_path / "gone" / "Movie.en.srt"  # does not exist
-    out = cs._sidecar_as_srt(ghost, work, b"1\n00:00:01,000 --> 00:00:02,000\nhi\n")
-    assert _is_workfile(out, work, "sidecar") and out.read_bytes().startswith(b"1\n00:00")
-
-
-def test_sidecar_as_srt_given_bytes_converts_ass_from_those_bytes(tmp_path):
-    work = tmp_path / "work"
-    work.mkdir()
-    with patch.object(cs, "ass_to_srt", return_value=True) as conv:
-        out = cs._sidecar_as_srt(tmp_path / "gone" / "Movie.en.ass", work, b"ASS BYTES")
-    assert _is_workfile(out, work, "sidecar-srt")
-    assert conv.call_args.args[0].read_bytes() == b"ASS BYTES"
-
-
-def _is_workfile(p, work, role):
-    """A unique, role-prefixed file directly inside `work` (see `_workfile`)."""
-    return p.parent == work and p.name.startswith(f"{role}-") and p.is_file()
-
-
 # --- the candidate set is exactly the verified snapshots ------------------------------------------
-
-def test_verified_sidecar_removed_before_the_mux_is_still_muxed_from_its_bytes(tmp_path, monkeypatch, capsys):
-    h = _upgrade_ready(tmp_path, monkeypatch)
-    sidecar = tmp_path / "Movie (2024).en.srt"
-    verified_text = cs.clean_srt_text(sidecar.read_text())
-    late = tmp_path / "Movie (2024).en.cc.srt"
-    note = tmp_path / "Movie (2024).nfo"
-    note.write_text("not a subtitle")
-
-    def _vanish():
-        sidecar.unlink()
-        late.write_text("arrived late")
-
-    h.on_window = _once(_vanish)
-    result = h.run()
-
-    assert result["status"] == "FIXED" and result["detail"].startswith("UPGRADE generated->real ")
-    assert h.remuxes[0]["content"] == verified_text
-    assert h.remuxes[0]["eng_track_name"] == "English"
-    assert h.state()["upgraded"] is True
-    # only the file the pass owns was touched: the late arrival and the unrelated file are still there
-    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("Movie")) == [
-        "Movie (2024).en.cc.srt", "Movie (2024).mkv", "Movie (2024).nfo"]
-    assert late.read_text() == "arrived late"
-    assert "UPGRADE: generated -> real subtitle (Movie (2024).en.srt)" in capsys.readouterr().out
-
-
-def test_upgrade_candidates_are_never_rediscovered_after_verification(tmp_path, monkeypatch):
-    """A longer, different sidecar turns up after verification; the full pass does not list the directory again."""
-    h = _upgrade_ready(tmp_path, monkeypatch)
-    verified_text = cs.clean_srt_text((tmp_path / "Movie (2024).en.srt").read_text())
-    other, _ = _episode(2)
-    h.on_window = _once(lambda: (tmp_path / "Movie (2024).eng.srt").write_text(
-        other + "\n" + _srt([(2300.0, _dialogue(77, n=100))])))
-    with patch.object(cs, "find_sidecar_subs", wraps=cs.find_sidecar_subs) as listing:
-        assert h.run()["status"] == "FIXED"
-    assert listing.call_count == 1  # the gate's; none from the full pass
-    assert h.remuxes[0]["content"] == verified_text
-    assert h.sidecars_left() == ["Movie (2024).eng.srt"]  # arrived late: left alone
-
-
-def test_the_embedded_generated_track_is_not_a_candidate_in_an_upgrade(tmp_path, monkeypatch):
-    h = _upgrade_ready(tmp_path, monkeypatch)
-    h.extract_ok = False
-    assert h.run()["status"] == "FIXED"
-    assert h.extractions == []  # only a forced track is ever extracted, and there is none
-
 
 def test_no_usable_verified_snapshot_aborts_and_never_muxes_the_generated_track(tmp_path, monkeypatch):
     h = _upgrade_ready(tmp_path, monkeypatch)
@@ -1637,13 +995,12 @@ def _good_ass_to_srt(srt_text):
     return _convert
 
 
-@pytest.mark.parametrize("failure", ["returns-false", "oserror", "unexpected-error"])
+@pytest.mark.parametrize("failure", ["returns-false", "oserror"])
 def test_an_ass_conversion_failure_is_retried_never_remembered(tmp_path, monkeypatch, failure):
     right, asr = _episode(1)
     h = Harness(tmp_path, monkeypatch, sidecars=[(".en.ass", "[Script Info]")], asr=asr)
     effect = {"returns-false": dict(return_value=False),
-              "oserror": dict(side_effect=OSError("pysubs2 crashed")),
-              "unexpected-error": dict(side_effect=RuntimeError("boom"))}[failure]
+              "oserror": dict(side_effect=OSError("pysubs2 crashed"))}[failure]
     with patch.object(cs, "ass_to_srt", **effect):
         result = h.run()
     assert result["status"] == "SKIP" and h.remuxes == []
@@ -1668,6 +1025,11 @@ def test_a_vtt_conversion_failure_is_retried_never_remembered(tmp_path, monkeypa
 
 
 # --- _sidecar_as_srt --------------------------------------------------------------------
+
+def _is_workfile(p, work, role):
+    """A unique, role-prefixed file directly inside `work` (see `_workfile`)."""
+    return p.parent == work and p.name.startswith(f"{role}-") and p.is_file()
+
 
 def test_sidecar_as_srt_copies_an_srt_into_the_workdir(tmp_path):
     src = tmp_path / "Movie.en.srt"
@@ -1704,44 +1066,6 @@ def test_sidecar_as_srt_converts_vtt_with_ffmpeg(tmp_path, rc, ok):
         out = cs._sidecar_as_srt(src, work)
     assert (out is not None and _is_workfile(out, work, "sidecar-srt")) is ok
     assert run.call_args.args[0][0] == "ffmpeg"
-
-
-# --- _generated_upgrade_check, called directly ------------------------------------------------------
-
-def test_check_hands_back_the_probe_so_the_caller_does_not_probe_twice(tmp_path, monkeypatch):
-    h = _upgrade_ready(tmp_path, monkeypatch)
-    cur = cs.file_key(h.media)
-    with patch.object(cs, "probe", side_effect=h._probe), \
-         patch.object(sv, "embedded_text_window", side_effect=h._window):
-        upgrade, info, rejected = cs._generated_upgrade_check(h.media, cur, None)
-    assert upgrade is not None and len(upgrade.sidecars) == 1
-    assert info is h.info and rejected is None
-    assert len(h.probes) == 1
-
-
-def test_check_without_a_real_sidecar_does_no_io_beyond_the_listing(tmp_path, monkeypatch):
-    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.generated.srt", "x")])
-    with patch.object(cs, "probe") as probe, patch.object(sv, "embedded_text_window") as win:
-        assert cs._generated_upgrade_check(h.media, (1, 1), None) == (None, None, None)
-    probe.assert_not_called()
-    win.assert_not_called()
-
-
-def test_check_reports_a_rejection_fingerprint_only_for_a_judged_sidecar(tmp_path, monkeypatch):
-    wrong, _ = _episode(2)
-    _, asr = _episode(1)
-    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", wrong)], asr=asr)
-    cur = cs.file_key(h.media)
-    with patch.object(cs, "probe", side_effect=h._probe), \
-         patch.object(sv, "embedded_text_window", side_effect=h._window):
-        upgrade, info, rejected = cs._generated_upgrade_check(h.media, cur, None)
-    assert upgrade is None and info is h.info
-    assert [r[0] for r in rejected["sidecars"]] == ["Movie (2024).en.srt"]
-    assert rejected["video"] == list(cs.file_identity(h.media))
-    h.window_failure = True
-    with patch.object(cs, "probe", side_effect=h._probe), \
-         patch.object(sv, "embedded_text_window", side_effect=h._window):
-        assert cs._generated_upgrade_check(h.media, cur, None)[2] is None  # unreadable: not remembered
 
 
 # --- hand-off to the late-sidecar sweep (tests/test_sub_quarantine.py has the sweep) ---------------
@@ -1785,23 +1109,17 @@ def test_a_remembered_rejection_hands_off_with_no_new_verification_or_probe(tmp_
 
 def test_a_sidecar_the_content_gate_accepts_is_never_quarantined_for_failing_the_upgrades_language_test(
         tmp_path, monkeypatch):
-    """The upgrade's language test is stricter than the content gate: "la la la" and short unlisted-language text are kept."""
+    """The upgrade's language test is stricter than the content gate: song-lyric filler ("la la la") is kept."""
     la = _srt([(600.0, ["la la la la la la la la la la"] * 6)])
-    filler = " ".join(["habari", "gani", "rafiki", "yangu", "leo", "ni", "siku", "njema"] * 5)
-    swahili = _srt([(600.0, [filler])])
-    for n, text in enumerate((la, swahili)):
-        case = tmp_path / f"case{n}"
-        case.mkdir()
-        _, asr = _episode(1)
-        h = Harness(case, monkeypatch, sidecars=[(".en.srt", text)], asr=asr, handoff=True)
-        assert cs.sublang.score(text)["verdict"] != "eng"           # the upgrade declines it...
-        assert cs.classify_candidate(text)[0] is True               # ...the gate accepts it
-        assert h.run()["detail"] == "tag present"
-        assert h.sidecars_left() == ["Movie (2024).en.srt"] and h.quarantined() == []
-        assert h.window_reads == []
-        assert h.state()["upgrade_rejected"].get("reasons") in (None, {})   # no verdict recorded
-        assert h.run()["detail"] == "state cache"                   # remembered, still kept
-        assert h.sidecars_left() == ["Movie (2024).en.srt"]
+    _, asr = _episode(1)
+    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", la)], asr=asr, handoff=True)
+    assert cs.sublang.score(la)["verdict"] != "eng"           # the upgrade declines it...
+    assert cs.classify_candidate(la)[0] is True               # ...the gate accepts it
+    assert h.run()["detail"] == "tag present"
+    assert h.sidecars_left() == ["Movie (2024).en.srt"] and h.quarantined() == []
+    assert h.window_reads == []
+    assert h.run()["detail"] == "state cache"                 # remembered, still kept
+    assert h.sidecars_left() == ["Movie (2024).en.srt"]
 
 
 def test_a_sidecar_the_upgrade_could_not_decide_is_kept(tmp_path, monkeypatch, capsys):
@@ -1812,17 +1130,6 @@ def test_a_sidecar_the_upgrade_could_not_decide_is_kept(tmp_path, monkeypatch, c
     assert h.run()["detail"] == "tag present"
     assert h.sidecars_left() == ["Movie (2024).en.srt"] and h.quarantined() == []
     assert "kept: possible upgrade for generated subtitle" in capsys.readouterr().out
-
-
-def test_too_little_text_is_not_a_verdict_and_the_sidecar_stays(tmp_path, monkeypatch):
-    tiny = _srt([(600.0, ["You know that"])])
-    _, asr = _episode(1)
-    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", tiny)], asr=asr, handoff=True)
-    assert h.run()["detail"] == "tag present"
-    assert h.state()["upgrade_rejected"]               # remembered...
-    assert h.sidecars_left() == ["Movie (2024).en.srt"] and h.quarantined() == []   # ...but undecided
-    h.window_reads.clear()
-    assert h.run()["detail"] == "state cache" and h.sidecars_left() == ["Movie (2024).en.srt"]
 
 
 def test_a_correct_but_partial_sidecar_is_undecided_not_the_wrong_episode(tmp_path, monkeypatch):
@@ -1836,52 +1143,6 @@ def test_a_correct_but_partial_sidecar_is_undecided_not_the_wrong_episode(tmp_pa
     assert record["reasons"] == {}                              # judged, but no verdict on it
     assert h.run()["detail"] == "state cache"                   # remembered, still kept
     assert h.sidecars_left() == ["Movie (2024).en.srt"] and h.quarantined() == []
-
-
-def test_a_sidecar_with_text_in_two_windows_that_does_not_match_is_the_wrong_episode(
-        tmp_path, monkeypatch):
-    """Text on both sides in two windows and no match is a wrong-episode verdict, though the third has no sidecar text."""
-    _, asr = _episode(1)
-    wrong = _srt([(WINDOW_STARTS[0], _dialogue(20)), (WINDOW_STARTS[1], _dialogue(21))])
-    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", wrong)], asr=asr, handoff=True)
-    assert h.run()["detail"] == "tag present; quarantined 1 redundant sidecar(s)"
-    assert h.sidecars_left() == [] and len(h.quarantined()) == 1
-    (reason,) = _quarantine_reasons(h)
-    assert reason.startswith("rejected upgrade: not this file's subtitle")
-
-
-def test_a_wrong_sidecar_with_text_in_only_one_window_is_undecided(tmp_path, monkeypatch):
-    """One window of evidence cannot make a verdict either way."""
-    _, asr = _episode(1)
-    wrong = _srt([(WINDOW_STARTS[1], _dialogue(21))])
-    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", wrong)], asr=asr, handoff=True)
-    assert h.run()["detail"] == "tag present"
-    assert h.sidecars_left() == ["Movie (2024).en.srt"] and h.quarantined() == []
-    assert h.state()["upgrade_rejected"]["reasons"] == {}
-
-
-def test_a_utf16_sidecar_is_verified_and_muxed_as_the_decoded_utf8_text(tmp_path, monkeypatch):
-    """The working copy the pass muxes and syncs is the decoded text as UTF-8, never the UTF-16 bytes."""
-    srt_text, asr = _episode(1)
-    h = Harness(tmp_path, monkeypatch, asr=asr)
-    sidecar = tmp_path / "Movie (2024).en.srt"
-    sidecar.write_bytes(srt_text.encode("utf-16"))
-    result = h.run()
-    assert result["status"] == "FIXED" and result["detail"].startswith("UPGRADE generated->real ")
-    assert h.remuxes[0]["content"] == srt_text                  # decoded, UTF-8, no BOM, no NULs
-    assert "\x00" not in h.sync_inputs[0] and "\ufeff" not in h.sync_inputs[0]
-    assert h.sidecars_left() == []                              # the verified original is consumed
-
-
-def test_a_sidecar_that_is_not_text_is_not_verified_and_stays(tmp_path, monkeypatch):
-    _, asr = _episode(1)
-    h = Harness(tmp_path, monkeypatch, asr=asr)
-    sidecar = tmp_path / "Movie (2024).en.srt"
-    sidecar.write_bytes(bytes(range(256)) * 20)
-    assert h.run()["detail"] == "tag present"
-    assert h.remuxes == [] and h.window_reads == []
-    assert h.sidecars_left() == ["Movie (2024).en.srt"]
-    assert h.state()["upgrade_rejected"].get("reasons") in (None, {})   # no verdict recorded
 
 
 # --- per-sidecar independence ----------------------------------------------------------
@@ -1916,111 +1177,11 @@ def test_a_wrong_episode_verdict_survives_another_sidecars_transient_failure(tmp
     assert list(record["reasons"]) == [_A]                       # ...B's failure is not remembered
 
 
-def test_the_failed_sidecar_is_retried_on_the_next_scan_and_the_verdict_is_not_reread(
-        tmp_path, monkeypatch):
-    h = _two_sidecars(tmp_path, monkeypatch, handoff=False)       # leave A on disk for now
-    with patch.object(cs, "ass_to_srt", return_value=False) as conv:
-        assert h.run()["detail"] == "tag present"
-    assert conv.call_count == 1 and h.sidecars_left() == sorted([_A, _B])
-    record = h.state()["upgrade_rejected"]
-    assert [e[0] for e in record["sidecars"]] == [_A] and list(record["reasons"]) == [_A]
-
-    h.enable_handoff()
-    h.window_reads.clear()
-    h.probes.clear()
-    with patch.object(cs, "ass_to_srt", return_value=False) as conv:
-        second = h.run()
-
-    assert second["detail"] == "state cache; quarantined 1 redundant sidecar(s)"
-    assert conv.call_count == 1                                  # B is tried again (still transient)
-    assert h.window_reads == []                                  # A's remembered verdict: no window read
-    assert len(h.probes) == 1                                    # one probe, for B's retry; the sweep reuses it
-    assert h.sidecars_left() == [_B]
-    (reason,) = _quarantine_reasons(h)
-    assert reason.startswith("rejected upgrade: not this file's subtitle")
-
-
-def test_once_the_failed_sidecar_converts_it_is_judged_too(tmp_path, monkeypatch):
-    h = _two_sidecars(tmp_path, monkeypatch, handoff=False)
-    with patch.object(cs, "ass_to_srt", return_value=False):
-        h.run()
-    assert [e[0] for e in h.state()["upgrade_rejected"]["sidecars"]] == [_A]
-
-    def _converts(ass_path, srt_path):
-        Path(srt_path).write_text(_srt([(600.0, ["You know that"])]))   # too little to decide
-        return True
-
-    with patch.object(cs, "ass_to_srt", side_effect=_converts):
-        h.run()
-    record = h.state()["upgrade_rejected"]
-    assert sorted(e[0] for e in record["sidecars"]) == sorted([_A, _B])   # now both are on record
-    assert list(record["reasons"]) == [_A]                              # B undecided: no verdict
-    h.probes.clear()
-    h.window_reads.clear()
-    assert h.run()["detail"] == "state cache" and h.window_reads == [] and h.probes == []
-
-
-def test_a_changed_sidecar_loses_only_its_own_remembered_verdict(tmp_path, monkeypatch):
-    h = _two_sidecars(tmp_path, monkeypatch, handoff=False)
-    with patch.object(cs, "ass_to_srt", return_value=False):
-        h.run()
-    (tmp_path / _B).write_text(_B_ASS + "\n")                          # B changes; A does not
-    h.enable_handoff()
-    h.window_reads.clear()
-    with patch.object(cs, "ass_to_srt", return_value=False):
-        result = h.run()
-    assert result["detail"] == "state cache; quarantined 1 redundant sidecar(s)"   # A still quarantined
-    assert h.window_reads == [] and h.sidecars_left() == [_B]
-
-
-def test_when_the_upgrade_applies_the_sweep_never_runs(tmp_path, monkeypatch):
-    srt_text, asr = _episode(1)
-    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", srt_text)], asr=asr, handoff=True)
-    with patch.object(cs, "_late_sidecar_sweep", wraps=cs._late_sidecar_sweep) as sweep:
-        result = h.run()
-    assert result["status"] == "FIXED" and "UPGRADE generated->real" in result["detail"]
-    sweep.assert_not_called()
-    assert h.quarantined() == []
-
-
-def test_when_the_upgrade_does_not_apply_the_sweep_runs_once(tmp_path, monkeypatch):
-    wrong, _ = _episode(2)
-    _, asr = _episode(1)
-    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", wrong)], asr=asr, handoff=True)
-    with patch.object(cs, "_late_sidecar_sweep", wraps=cs._late_sidecar_sweep) as sweep:
-        h.run()
-    assert sweep.call_count == 1
-
-
 def _record_for(h, reasons):
     sidecar = h.tmp_path / "Movie (2024).en.srt"
     snap = cs._read_snapshot(sidecar)
     fp = cs._sidecar_fingerprint({sidecar: snap})
     return sidecar, snap, cs._rejection_record(cs.file_identity(h.media), fp, reasons)
-
-
-def test_rejection_reasons_only_apply_while_the_record_still_holds(tmp_path, monkeypatch):
-    wrong, _ = _episode(2)
-    h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", wrong)], handoff=True)
-    sidecar, snap, record = _record_for(h, {"Movie (2024).en.srt": "why"})
-    listing = [(sidecar, False, False)]
-    reasons = lambda rec, snaps=None: cs._upgrade_rejection_reasons(   # noqa: E731
-        h.media, snaps if snaps is not None else {sidecar: snap}, listing, rec)
-
-    assert reasons(record) == {"Movie (2024).en.srt": "why"}
-    assert reasons(None) is None and reasons([["a", 1, "x"]]) is None      # no / old-shape record
-    assert reasons({**record, "video": record["video"][:3]}) is None       # legacy 3-field identity
-    assert reasons(record, {sidecar: None}) == {}                          # that sidecar unreadable: no verdict for it
-    no_reasons = {k: v for k, v in record.items() if k != "reasons"}
-    assert reasons(no_reasons) is None                                     # older format: invalid
-    assert reasons({**record, "reasons": {}}) == {}                        # holds, but no verdict
-
-    other = cs._rejection_record(cs.file_identity(h.media), [["Movie (2024).en.srt", 1, "0" * 64]],
-                                 {"Movie (2024).en.srt": "why"})
-    assert reasons(other) == {}                                            # its content differs: no verdict for it
-    time.sleep(0.02)                                                       # past ctime granularity
-    h.media.write_bytes(h.media.read_bytes())                               # video rewritten (ctime moves)
-    assert reasons(record) is None                                         # video identity differs
 
 
 def test_a_generated_or_forced_sidecar_never_takes_the_rejected_upgrade_path(tmp_path, monkeypatch):

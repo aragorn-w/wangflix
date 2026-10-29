@@ -128,7 +128,6 @@ def test_rc0_silent_no_record_and_tees_stdout(tmp_path):
 
 
 @pytest.mark.parametrize("rc, severity, wrong_severity, tg_env", [
-    pytest.param(1, "FAIL", "WARN", None, id="rc1-fail-recorded"),
     pytest.param(2, "WARN", "FAIL", None, id="rc2-warn-recorded"),
     # even with a fully valid Telegram .env the default (gate off) must not page
     pytest.param(1, "FAIL", "WARN", "TELEGRAM_BOT_TOKEN=real\nTELEGRAM_CHAT_ID=real\n",

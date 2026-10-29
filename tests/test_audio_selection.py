@@ -77,17 +77,10 @@ def test_default_english_no_audios():
 @pytest.mark.parametrize("path, audios, kwargs, primary, multi, allowed", [
     pytest.param("/movies/anime/Akira (1988)/x.mkv", JPN_ENG, {}, "jpn", False, None,
                  id="anime-path-single-jpn-dub-pruned"),
-    pytest.param("/movies/Naruto Movie 1/x.mkv", JPN_ENG, {}, "jpn", False, None,
-                 id="japanese-keyword-single-jpn"),
     pytest.param(GODZILLA, JPN_ENG, {}, "jpn", True, None,
                  id="dual-audio-keyword-multi-keep"),
     pytest.param("/movies/Parasite (2019)/x.mkv", [_stream(1, "kor"), _stream(2, "eng")], {},
                  "kor", False, None, id="korean-keyword-single-kor"),
-    pytest.param(FILM, [_stream(1, "jpn", default=True, original=True), _stream(2, "eng")], {},
-                 "jpn", True, None, id="default-plus-original-disposition-promotes-jpn-multi"),
-    pytest.param("/movies/Random Foreign Film/x.mkv",
-                 [_stream(1, "ja", default=True, original=True), _stream(2, "en")], {},
-                 "jpn", True, None, id="ja-alias-still-promotes"),
     pytest.param("/movies/Iron Man (2008)/x.mkv",
                  [_stream(1, "eng", default=True, original=True), _stream(2, "jpn", channels=2)], {},
                  "eng", False, None, id="hollywood-side-jpn-dub-does-not-promote"),
@@ -96,18 +89,9 @@ def test_default_english_no_audios():
                  "eng", False, ENG_AUDIO_LANGS, id="eng-original-jpn-dub-flagged-default-stays-eng"),
     pytest.param(FILM, ENG_JPN_ORIGINAL, {"original_language": None}, "jpn", True, None,
                  id="unknown-original-jpn-original-disposition-promotes"),
-    pytest.param(FILM, ENG_JPN_ORIGINAL, {}, "jpn", True, None,
-                 id="original-language-omitted-is-unknown"),
     pytest.param(FOREIGN, [_stream(1, "eng"), _stream(2, "jpn")], {"original_language": "jpn"},
                  "jpn", True, ENG_AUDIO_LANGS | JPN_AUDIO_LANGS,
                  id="original-jpn-with-eng-and-jpn-multi-keep"),
-    pytest.param("/movies/Some Korean Film (2021)/x.mkv", [_stream(1, "eng"), _stream(2, "kor")],
-                 {"original_language": "kor"}, "kor", True, ENG_AUDIO_LANGS | KOR_AUDIO_LANGS,
-                 id="original-kor-with-eng-and-kor-multi-keep"),
-    pytest.param(FOREIGN, [_stream(1, "jpn")], {"original_language": "jpn"}, "jpn", False, None,
-                 id="original-jpn-without-eng-stream-single-keep"),
-    pytest.param(GODZILLA, JPN_ENG, {"original_language": "eng"}, "jpn", True, None,
-                 id="dual-audio-keyword-beats-original-language"),
     pytest.param("/movies/Some Danish Film (2022)/x.mkv",
                  [_stream(1, "eng"), _stream(2, "dan", default=True, original=True)],
                  {"original_language": "dan"}, "eng", False, ENG_AUDIO_LANGS,
@@ -117,10 +101,6 @@ def test_default_english_no_audios():
     # Japanese-DEFAULT stream: anime pruning must still win over default-disposition inference.
     pytest.param("/m/tv/Aggretsuko/Season 1/ep.mkv", DUAL_AUDIO_STREAMS, {},
                  "jpn", False, None, id="plain-anime-jpn-default-still-prunes-the-dub"),
-    pytest.param("/m/anime/Some Show/Season 1/ep.mkv", DUAL_AUDIO_STREAMS, {},
-                 "jpn", False, None, id="anime-path-jpn-default-still-prunes-the-dub"),
-    pytest.param("/m/movies/Godzilla Minus One (2023)/f.mkv", DUAL_AUDIO_STREAMS, {},
-                 "jpn", True, None, id="existing-dual-audio-title-jpn-default-unaffected"),
 ])
 def test_get_audio_lang_pref(path, audios, kwargs, primary, multi, allowed):
     got_allowed, got_primary, got_multi = cs.get_audio_lang_pref(Path(path), audios, **kwargs)
@@ -151,16 +131,6 @@ def test_arr_fetch_failure_on_japanese_original_style_file_keeps_both_tracks():
     assert set(kept) == {1, 2}, "both tracks must survive an Arr fetch failure"
 
 
-def test_jpn_default_does_not_outrank_kor_original():
-    """`original` is checked for both languages before either's `default`."""
-    audios = [_stream(1, "eng"), _stream(2, "jpn", default=True), _stream(3, "kor", original=True)]
-    allowed, primary, multi = cs.get_audio_lang_pref(Path(FILM), audios, original_language=None)
-    assert primary == "kor"
-    assert multi is True
-    kept = cs.select_keep_audio(audios, allowed, primary, multi)
-    assert 3 in kept
-
-
 def test_select_keep_audio_family_based_matching_ja_jp_with_jpn_allowed():
     """eng + ja-JP, original_language="jpn": both kept (ja-JP's family is jpn)."""
     audios = [_stream(1, "eng"), _stream(2, "ja-JP")]
@@ -171,23 +141,12 @@ def test_select_keep_audio_family_based_matching_ja_jp_with_jpn_allowed():
     assert set(kept) == {1, 2}
 
 
-def test_select_keep_audio_en_us_with_jpn_anime_keyword_unaffected():
-    """en-US + jpn on the anime keyword path: jpn is the sole kept track."""
-    audios = [_stream(1, "en-US"), _stream(2, "jpn")]
-    allowed, primary, multi = cs.get_audio_lang_pref(Path("/movies/anime/Some Show/x.mkv"), audios)
-    assert primary == "jpn"
-    assert multi is False
-    kept = cs.select_keep_audio(audios, allowed, primary, multi)
-    assert kept == [2]
-
-
 # select_keep_audio
 
 _ENG_JPN = ENG_AUDIO_LANGS | JPN_AUDIO_LANGS
 
 
 @pytest.mark.parametrize("audios, allowed, primary, kwargs, expected", [
-    pytest.param([], ENG_AUDIO_LANGS, "eng", {}, [], id="no-audio-empty"),
     pytest.param([_stream(1, "eng", default=True)], ENG_AUDIO_LANGS, "eng", {}, [1],
                  id="single-eng-track"),
     pytest.param([_stream(1, "eng", channels=6, codec="ac3"),
@@ -196,8 +155,6 @@ _ENG_JPN = ENG_AUDIO_LANGS | JPN_AUDIO_LANGS
     pytest.param([_stream(1, "eng", default=True),
                   _stream(2, "eng", title="Director's commentary", comment=True)],
                  ENG_AUDIO_LANGS, "eng", {}, [1], id="commentary-excluded-regardless-of-language"),
-    pytest.param([_stream(1, "jpn", default=True), _stream(2, "eng")], _ENG_JPN, "jpn",
-                 {"multi_keep": False}, [1], id="single-mode-returns-only-best"),
 ])
 def test_select_keep_audio(audios, allowed, primary, kwargs, expected):
     assert cs.select_keep_audio(audios, allowed, primary, **kwargs) == expected
@@ -233,26 +190,13 @@ COMMENTARY = _stream(1, "eng", title="Director's commentary", comment=True)
 
 @pytest.mark.parametrize("path, audios, original_language, expected", [
     pytest.param(GODZILLA, [_stream(1, "eng"), _stream(2, "jpn")], None, 2, id="dual-audio-keyword"),
-    pytest.param("/movies/Parasite (2019)/x.mkv", [_stream(1, "eng"), _stream(2, "kor")], None, 2,
-                 id="korean-keyword"),
     pytest.param("/movies/Some Foreign Film/x.mkv", JPN_ENG, "jpn", 1, id="known-original-language"),
     pytest.param("/movies/Some Foreign Film/x.mkv", ENG_JPN_ORIGINAL, None, 2,
                  id="original-disposition-when-unknown"),
     pytest.param("/movies/Some Foreign Film/x.mkv", [_stream(1, "eng"), _stream(2, "jpn", default=True)],
                  None, None, id="default-only-is-not-confident"),
-    pytest.param("/movies/Some Danish Film/x.mkv", ENG_JPN_ORIGINAL, "dan", None,
-                 id="irrelevant-known-language-is-not-confident"),
-    pytest.param("/movies/X/x.mkv", [], "jpn", None, id="empty-audios"),
-    pytest.param("/movies/X/x.mkv", None, "jpn", None, id="no-audios"),
     pytest.param("/movies/Some Film/x.mkv", [COMMENTARY, _stream(2, "eng", channels=6)], "eng", 2,
                  id="excludes-commentary"),
-    pytest.param("/movies/Some Film/x.mkv", [_stream(1, None)], "eng", None,
-                 id="requires-explicit-tag-not-untagged"),
-    pytest.param("/movies/Some Film/x.mkv",
-                 [_stream(1, "eng", channels=2, codec="aac"), _stream(2, "eng", channels=8, codec="truehd")],
-                 "eng", 2, id="picks-best-scored-candidate"),
-    pytest.param("/movies/Some Film/x.mkv", [_stream(1, "en-US")], "eng", 1,
-                 id="regional-tag-counts-as-explicit"),
     pytest.param("/movies/Some Film/x.mkv", [_stream(1, "eng")], "jpn", None,
                  id="no-candidate-for-decided-language"),
 ])

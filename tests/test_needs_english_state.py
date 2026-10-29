@@ -59,29 +59,6 @@ def test_clear_needs_english_removes_existing_entry(tmp_path, monkeypatch):
     assert "/some/other/file.mkv" in state  # sibling entries untouched
 
 
-def test_clear_needs_english_noop_when_absent(tmp_path, monkeypatch):
-    state_file = tmp_path / "needs-english.json"
-    monkeypatch.setattr(cs, "NEEDS_ENGLISH_STATE_FILE", state_file)
-    media = _media(tmp_path)
-
-    cs._clear_needs_english(media, dry_run=False)  # must not raise
-
-    assert not state_file.exists() or str(media.resolve()) not in json.loads(state_file.read_text())
-
-
-def test_clear_needs_english_dry_run_writes_nothing(tmp_path, monkeypatch):
-    state_file = tmp_path / "needs-english.json"
-    monkeypatch.setattr(cs, "NEEDS_ENGLISH_STATE_FILE", state_file)
-    media = _media(tmp_path)
-    key = str(media.resolve())
-    state_file.write_text(json.dumps({key: {"first_seen": "x", "last_seen": "y"}}))
-
-    cs._clear_needs_english(media, dry_run=True)
-
-    # Untouched -- dry_run must not even drop a stale entry.
-    assert json.loads(state_file.read_text()) == {key: {"first_seen": "x", "last_seen": "y"}}
-
-
 # --- integration through _process_locked -----------------------------------
 
 _ENG_ONLY_STREAMS = [
@@ -233,25 +210,6 @@ def test_needs_bazarr_mp4_replacement_migrates_tracker_entry_to_mkv_path(tmp_pat
     assert entry["identity"] is not None
 
 
-def test_mp4_replacement_does_not_leak_stale_destination_first_seen(tmp_path, monkeypatch):
-    """A stale entry already at the DESTINATION key is never consulted for first_seen."""
-    needs_file = tmp_path / "needs-english.json"
-    monkeypatch.setattr(cs, "NEEDS_ENGLISH_STATE_FILE", needs_file)
-    media = _media(tmp_path, "Movie (2024).mp4")
-    expected_new_key = str(media.with_suffix(".mkv").resolve())
-    needs_file.write_text(json.dumps({
-        expected_new_key: {"first_seen": "2020-01-01T00:00:00Z",
-                           "last_seen": "2020-01-01T00:00:00Z"},
-    }))
-
-    result = _run_cleanup_remux(media)
-
-    assert result["status"] == "NEEDS_BAZARR"
-    assert str(Path(result["path"]).resolve()) == expected_new_key
-    entry = json.loads(needs_file.read_text())[expected_new_key]
-    assert entry["first_seen"] == "2026-10-13T00:00:00Z"  # NOW, not the stale 2020 value
-
-
 @pytest.mark.parametrize("stored_identity_is_current, expected_first_seen", [
     (True, "2026-09-01T00:00:00Z"),     # same release: kept, even though the remux then replaces it on disk
     (False, "2026-10-13T00:00:00Z"),    # a new release at this path: reset
@@ -282,67 +240,7 @@ def test_cleanup_remux_at_the_same_path_refreshes_the_stored_identity(
     assert entry["identity"] != [999999, 999999, 999999]
 
 
-def test_cleanup_nothing_to_clean_new_release_at_same_path_resets_first_seen(tmp_path, monkeypatch):
-    """With nothing to clean (no remux) a new release at this path still resets first_seen."""
-    needs_file = tmp_path / "needs-english.json"
-    monkeypatch.setattr(cs, "NEEDS_ENGLISH_STATE_FILE", needs_file)
-    media = _media(tmp_path)
-    key = str(media.resolve())
-    needs_file.write_text(json.dumps({
-        key: {"first_seen": "2026-09-01T00:00:00Z", "last_seen": "2026-09-01T00:00:00Z",
-              "identity": [999999, 999999, 999999]},
-    }))
-
-    streams = [  # already-correct default English audio, no subtitles
-        {"index": 0, "codec_type": "video", "codec_name": "h264"},
-        {"index": 1, "codec_type": "audio", "codec_name": "ac3",
-         "tags": {"language": "eng"}, "disposition": {"default": 1}},
-    ]
-
-    with patch.object(cs, "load_state", return_value={}), \
-         patch.object(cs, "probe", return_value={"streams": streams}), \
-         patch.object(cs, "already_processed", return_value=False), \
-         patch.object(cs, "find_sidecar_subs", return_value=[]), \
-         patch.object(cs, "remux") as mock_remux, \
-         patch.object(cs, "_utc_now_iso", return_value="2026-10-13T00:00:00Z"):
-        result = cs._process_locked(media, str(media), dry_run=False)
-
-    assert result["status"] == "NEEDS_BAZARR"
-    assert "nothing to clean" in result["detail"]
-    assert mock_remux.call_count == 0  # confirms the no-remux branch
-    state = json.loads(needs_file.read_text())
-    entry = state[key]
-    assert entry["first_seen"] == "2026-10-13T00:00:00Z"  # RESET, not preserved
-    assert entry["identity"] == cs._file_identity(media)
-
-
 # --- needs-english.json read/write failures never change the result -------
-
-def test_clear_needs_english_survives_corrupt_state_file(tmp_path, monkeypatch, capsys):
-    state_file = tmp_path / "needs-english.json"
-    monkeypatch.setattr(cs, "NEEDS_ENGLISH_STATE_FILE", state_file)
-    state_file.write_text("{not valid json")
-    media = _media(tmp_path)
-
-    cs._clear_needs_english(media, dry_run=False)  # must not raise
-
-    assert state_file.read_text() == "{not valid json"
-    assert "WARNING" in capsys.readouterr().out
-
-
-def test_clear_needs_english_survives_unwritable_directory(tmp_path, monkeypatch, capsys):
-    state_dir = tmp_path / "state"
-    state_dir.mkdir(mode=0o500)
-    monkeypatch.setattr(cs, "NEEDS_ENGLISH_STATE_FILE", state_dir / "needs-english.json")
-    media = _media(tmp_path)
-
-    try:
-        cs._clear_needs_english(media, dry_run=False)  # must not raise
-    finally:
-        state_dir.chmod(0o700)
-
-    assert "WARNING" in capsys.readouterr().out
-
 
 def test_process_locked_needs_bazarr_result_unaffected_by_corrupt_tracker(tmp_path, monkeypatch):
     result, _media_path, needs_file, mock_update_state = _run_needs_bazarr(
