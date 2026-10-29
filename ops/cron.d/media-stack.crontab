@@ -53,9 +53,9 @@
 
 # Hourly audio-language spot-check: release names and track tags lie about audio, and
 # nothing else listens to it.  audio-lang-check.py runs a short whisper language-ID window
-# per audio stream, newest files first, and Telegrams ONE message per run for NEW findings
-# (MISLABELED, NO_ENGLISH_AUDIO).  It NEVER deletes, blocklists or re-grabs.  Idle-priority
-# with the same pause-aware playback gate as sub-fallback.py.
+# per audio stream, newest files first, and Telegrams each NEW finding once (MISLABELED,
+# NO_ENGLISH_AUDIO; a failed send is logged, not retried).  It NEVER deletes, blocklists or
+# re-grabs.  Idle-priority with the same pause-aware playback gate as sub-fallback.py.
 # Minute :37 is off every other start minute (every-minute and */5 jobs, :20, daily :15/:30/:45/:50).
 37 * * * * nice -n19 ionice -c3 python3 $HOME/media-stack/audio-lang-check.py >> $HOME/media-stack/var/log/audio-lang-check.log 2>&1
 

@@ -26,7 +26,7 @@ stream, then a bounded ffprobe call).
 
 NEVER DELETES, BLOCKLISTS, OR RE-GRABS: Sonarr/Radarr will not import a same-quality
 replacement while the file exists, and deleting first risks leaving nothing. Findings go to
-Telegram, the state file and the derived `var/state/audio-lang-findings.json`.
+Telegram, the state file and the JSONL log.
 
 PLAYBACK: FAILS CLOSED, BOUNDED (`media_stack.playback`)
 `None` from `JellyfinClient.now_playing_sessions` means "someone is watching". No library
@@ -38,9 +38,10 @@ by `AUDIO_CHECK_MAX_WAIT_MIN` cumulatively PER FILE; past it the whole run ends 
 
 CANDIDATES
 `.mkv`/`.mp4` under `MEDIA_ROOT`'s `movies/` and `tv/`, skipping hidden names (including
-`.dupe-recycle`) and files modified < 10 minutes ago. Newest mtime first, so a fresh import
-surfaces within the hour while the backlog drains. A file is re-checked only when its
-`[st_ino, st_size, st_mtime_ns]` changes.
+`.dupe-recycle`) and files modified < 10 minutes ago (still being written). Newest mtime
+first, so a fresh import surfaces within the hour while the backlog drains. A file is
+re-checked only when its `[st_ino, st_size, st_mtime_ns]` changes. A title added to
+Radarr/Sonarr AFTER its file was checked is not revisited until the file changes.
 
 STATE: ONE FILE, VALIDATED WHOLE
 `var/state/audio-lang-check.state.json` is the only file read back. Per resolved path:
@@ -49,48 +50,44 @@ STATE: ONE FILE, VALIDATED WHOLE
   findings     MISLABELED / NO_ENGLISH_AUDIO dicts (may be empty)
   first_found, alerted    only with findings
   checked_at
-  original_status / original_language
-               the Radarr/Sonarr answer used: "known" (eng/jpn/kor) or "unknown"
-  streams      per-stream detections (index, tag, detected language,
-               probability, counts_as_english, reading)
-  original_rechecked_at   when an "unknown" original was last re-asked
-  retry        outstanding transient failure: attempts, next_retry_at, ...
-Every update is one `mutate_state` (flock), so a conclusion, findings, alert flag and
-identity are recorded together or not at all. The whole structure is validated on load and
-the script refuses to WRITE an entry the loader would reject. An unreadable file or
-malformed entry is a blinding error (exit 1 before any state, report or log write), never
-"treat as empty".
+  failed       failed analyses of that identity: identity, attempts, last_result, last_error
+Keys of older versions (`streams`, `original_status`, `original_language`,
+`original_rechecked_at`, and `retry`, whose counter also counted outages) are ignored on
+load, so a leftover `retry` never rules a file out, and dropped whenever the entry is
+rewritten. Every update is one `mutate_state` (flock), so
+a conclusion, findings, alert flag and identity are recorded together or not at all. The
+whole structure is validated on load and the script refuses to WRITE an entry the loader
+would reject. An unreadable file or malformed entry is a blinding error (exit 1 before any
+state or log write), never "treat as empty".
 
-TITLE ADDED TO RADARR/SONARR LATER: a conclusion with `original_status == "unknown"` is
-re-asked about (<= 200 lookups per run, least recently checked first, LIVE entries only so
-stale ones cannot starve them; Radarr and Sonarr tracked separately, so one outage skips only
-its own kind). Once known, the verdict is recomputed from the STORED detections (`_decide`)
-without re-listening and alerted as usual. Not done by `--dry-run`.
-
-FAILURES ARE RETRIED, NOT CACHED: PROBE_FAILED, ERROR, ARR_UNAVAILABLE (Arr could not be
-asked, as opposed to no usable language) and DEPENDENCY_MISSING (no `faster_whisper`; also
-ends the run with exit 1) write a `retry` record with backoff of 1 h doubling to 24 h, reset
-when the identity changes, leaving the rest of the entry untouched.
+FAILURES ARE RETRIED A FEW TIMES, NOT CACHED
+PROBE_FAILED and ERROR are tried again on every run until the same identity has failed
+`MAX_FAILED_ATTEMPTS` times (counted in `failed`); after that the file is skipped until it
+changes. ARR_UNAVAILABLE (Radarr/Sonarr could not be asked, as opposed to no usable
+language) records nothing (no state, no JSONL line) and is summarised in one log line: an
+outage never uses up a file's attempts. DEPENDENCY_MISSING (no `faster_whisper`) records nothing and ends the run
+with exit 1.
 
 FINDINGS ARE BOUND TO A FILE IDENTITY: an alert only goes out for an entry whose identity
-equals the file's current one; entries for a gone or replaced file are stale (never sent,
-findings stripped). If the file changed during analysis, the result is discarded and a later
-run redoes it.
+equals the file's current one; entries for a gone or replaced file are never sent. If the
+file changed during analysis, the result is discarded and a later run redoes it.
 
 ONE FILE AT A TIME, IDLE PRIORITY: `AUDIO_CHECK_BUDGET_MIN` stops STARTING new files once
 spent. Temp WAVs live in a per-file workdir under `WORKDIR_ROOT` (local disk, never the
 media pool). `WHISPER_THREADS` defaults to `min(2, cpu_count)` and cron runs it under
 `nice -n19 ionice -c3`; the pause-aware extraction is the real protection.
 
-ALERTING
-At most ONE Telegram message per run, for NEW or CHANGED findings only (a changed identity
-is a different file). At most 15 items and 3800 characters (Telegram rejects > 4096 UTF-16
-units), each item cut to 600; what does not fit stays pending, oldest first. Undelivered
-findings stay `alerted=false` and are retried next run; only entries named in a SENT message
-are marked alerted, under the same lock. Credentials come from `TELEGRAM_BOT_TOKEN`/
-`TELEGRAM_CHAT_ID` in the process environment, else the Claude Telegram plugin's `.env`
-(never this repo's `.env`); with both in the environment the plugin file is not read, and a
-failure reading it is logged and fails soft.
+ALERTING: EACH NEW FINDING IS SENT ONCE
+At the end of every real run (also after a playback timeout or a missing `faster_whisper`),
+findings that are new or changed (`alerted` not true, file still at the identity they were
+made on) go to Telegram, oldest first, at most 15 items and 3800 characters per message
+(Telegram rejects > 4096 UTF-16 units), each item cut to 600, as many messages as that
+takes. Every finding is marked `alerted` once its message was attempted, so a failed send
+is NOT retried: it is logged to stderr and as an `ALERT_FAILED` JSONL record naming the
+files. Credentials come from `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` in the process
+environment, else the Claude Telegram plugin's `.env` (never this repo's `.env`); with both
+in the environment the plugin file is not read, and a failure reading it is logged and fails
+soft (the send then fails and is logged as above).
 
 Exit codes:
   0  ok, including nothing to do, a second cron instance finding the lock held
@@ -101,8 +98,8 @@ Exit codes:
  75  `--path` only (EX_TEMPFAIL): another run holds the lock; stdout carries
      {"path": ..., "result": "BUSY", "reason": ...}
 
-`--path FILE` checks one file and prints JSON. It records NOTHING (no state, report, JSONL
-or Telegram), so it can never suppress the cron alert for the same file. It cannot be
+`--path FILE` checks one file and prints JSON. It records NOTHING (no state, JSONL or
+Telegram), so it can never suppress the cron alert for the same file. It cannot be
 combined with `--dry-run` (exit 2).
 
 `--dry-run` makes no WRITES: no `var/` directories, no lock file (importing the script
@@ -152,7 +149,6 @@ from media_stack.subverify import detect_language  # noqa: E402
 # No `ensure_var_dirs()` at import: `--dry-run` writes nothing.
 
 STATE_FILE = VAR_STATE / "audio-lang-check.state.json"
-REPORT_FILE = VAR_STATE / "audio-lang-findings.json"
 LOCK_FILE = VAR_RUN / "audio-lang-check.lock"
 JSONL_FILE = VAR_LOG / "audio-lang-check.jsonl"
 
@@ -171,19 +167,14 @@ MIN_WINDOW_GAP_S = 60.0   # windows are independent evidence only this far apart
 # Below this, two such windows cannot be placed: MISLABELED is skipped.
 MIN_MISLABEL_DURATION_S = 180.0
 
-RETRYABLE_RESULTS = frozenset({"PROBE_FAILED", "ERROR", "ARR_UNAVAILABLE", "DEPENDENCY_MISSING"})
-# Retry-type outcomes live only in the entry's `retry` record, never `result`.
+# Results that are never a conclusion. Only the first two are counted against a file.
+FAILED_RESULTS = frozenset({"PROBE_FAILED", "ERROR"})
+MAX_FAILED_ATTEMPTS = 3
 CONCLUSION_RESULTS = frozenset({"CHECKED", "UNVERIFIED"})
 FINDING_TYPES = frozenset({"MISLABELED", "NO_ENGLISH_AUDIO"})
-ORIGINAL_STATUSES = frozenset({"known", "unknown"})   # "unavailable" is never a conclusion
-ORIGINAL_CODES = frozenset({"eng", "jpn", "kor"})
-READINGS = frozenset({"english", "foreign", "unclear"})
-MAX_ORIGINAL_RECHECKS = 200
-RETRY_BASE_S = 3600.0       # first retry after 1 h ...
-RETRY_MAX_S = 24 * 3600.0   # ... doubling up to 24 h
 
 MAX_ALERT_ITEMS = 15
-# Under Telegram's 4096 UTF-16 units, leaving room for the "...and N more" tail.
+# Under Telegram's 4096 UTF-16 units.
 TELEGRAM_BUDGET_CHARS = 3800
 MAX_ALERT_LINE_CHARS = 600
 
@@ -227,13 +218,13 @@ _LONE_SURROGATE_RE = re.compile("[\ud800-\udfff]")
 def _clean_text(text: str) -> str:
     """Replace lone surrogates with U+FFFD: a file name with invalid UTF-8 arrives with
     `surrogateescape` surrogates and cannot be encoded, so path-derived text goes through here."""
-    return _LONE_SURROGATE_RE.sub("\ufffd", text)
+    return _LONE_SURROGATE_RE.sub("�", text)
 
 
-def log(msg: str) -> None:
-    """Timestamped line to stdout (stderr in `--path` mode)."""
+def log(msg: str, *, err: bool = False) -> None:
+    """Timestamped line to stdout (stderr with `err`, and always in `--path` mode)."""
     print(_clean_text(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"), flush=True,
-          file=sys.stderr if _LOG_TO_STDERR else sys.stdout)
+          file=sys.stderr if err or _LOG_TO_STDERR else sys.stdout)
 
 
 def _utc_now_iso() -> str:
@@ -255,8 +246,9 @@ def iter_media_files(media_root: Path) -> Iterator[Path]:
                     yield Path(dirpath) / name
 
 
-def _identity(path: Path) -> list[int] | None:
-    """`[st_ino, st_size, st_mtime_ns]`, or `None` if gone.
+def _identity(path: Path, now_s: float | None = None) -> list[int] | None:
+    """`[st_ino, st_size, st_mtime_ns]`, or `None` if gone (or, given `now_s`, modified
+    inside the `MIN_FILE_AGE_S` settle window).
 
     Deliberately not `media_stack.fileid`'s four fields: ctime also moves when Radarr/Sonarr
     add or remove a hardlink, which would re-run whisper on and re-alert about unchanged
@@ -266,16 +258,7 @@ def _identity(path: Path) -> list[int] | None:
         st = path.stat()
     except OSError:
         return None
-    return [st.st_ino, st.st_size, st.st_mtime_ns]
-
-
-def _stable_identity(path: Path, now_s: float) -> list[int] | None:
-    """`_identity`, but `None` also inside the `MIN_FILE_AGE_S` settle window."""
-    try:
-        st = path.stat()
-    except OSError:
-        return None
-    if now_s - st.st_mtime < MIN_FILE_AGE_S:
+    if now_s is not None and now_s - st.st_mtime < MIN_FILE_AGE_S:
         return None
     return [st.st_ino, st.st_size, st.st_mtime_ns]
 
@@ -290,43 +273,29 @@ def _finite_number(value: object) -> bool:
         return False
 
 
-def backoff_s(attempts: int) -> float:
-    """Delay before retry `attempts` (>= 1): 1 h, 2 h, 4 h, ... up to 24 h."""
-    return min(RETRY_MAX_S, RETRY_BASE_S * 2.0 ** min(max(attempts, 1) - 1, 16))
+def _failed_attempts(entry: object, identity: list[int]) -> int:
+    """`PROBE_FAILED`/`ERROR` analyses recorded for exactly this version of the file."""
+    failed = entry.get("failed") if isinstance(entry, dict) else None
+    attempts = failed.get("attempts") if isinstance(failed, dict) and failed.get("identity") == identity else 0
+    return attempts if _is_index(attempts) else 0
 
 
-def _backing_off(entry: object, identity: list[int], now_s: float) -> bool:
-    """`entry` has a retry for THIS identity still in the future; malformed counts as due."""
-    if not isinstance(entry, dict):
-        return False
-    retry = entry.get("retry")
-    if not isinstance(retry, dict) or retry.get("identity") != identity:
-        return False
-    at = retry.get("next_retry_at")
-    if not _finite_number(at):
-        return False
-    return at > now_s
-
-
-def select_candidates(identity_state: dict, media_root: Path, now_s: float) -> list[Path]:
-    """Unchecked, not backing off, past the settle window; newest mtime first."""
-    aged: list[tuple[float, Path]] = []
+def select_candidates(state: dict, media_root: Path, now_s: float) -> list[Path]:
+    """Settled files whose identity is not already concluded, or failed
+    `MAX_FAILED_ATTEMPTS` times; newest mtime first."""
+    found: list[tuple[int, Path]] = []
     for video in iter_media_files(media_root):
-        try:
-            st = video.stat()
-        except OSError:
+        identity = _identity(video, now_s)
+        if identity is None:
             continue
-        if now_s - st.st_mtime < MIN_FILE_AGE_S:
-            continue
-        identity = [st.st_ino, st.st_size, st.st_mtime_ns]
-        cached = identity_state.get(str(video.resolve()))
+        cached = state.get(str(video.resolve()))
         if isinstance(cached, dict) and cached.get("identity") == identity:
             continue
-        if _backing_off(cached, identity, now_s):
+        if _failed_attempts(cached, identity) >= MAX_FAILED_ATTEMPTS:
             continue
-        aged.append((st.st_mtime, video))
-    aged.sort(key=lambda t: t[0], reverse=True)
-    return [p for _, p in aged]
+        found.append((identity[2], video))
+    found.sort(key=lambda t: t[0], reverse=True)
+    return [p for _, p in found]
 
 
 def _mislabeled_language(windows: list[dict]) -> tuple[str, float] | None:
@@ -476,9 +445,9 @@ def _decide(
     original: str | None, stream_records: list[dict], mislabeled: list[dict],
     mislabel_skipped: bool,
 ) -> tuple[list[dict], str, str | None]:
-    """The ONE place the NO_ENGLISH_AUDIO / UNVERIFIED rules live, shared with
-    `recheck_unknown_originals` (STORED detections). `mislabeled` is the MISLABELED
-    findings; a stream's `reading` is `None` when its MISLABELED check was skipped."""
+    """The ONE place the NO_ENGLISH_AUDIO / UNVERIFIED rules live. `mislabeled` is the
+    MISLABELED findings; a stream's `reading` is `None` when its MISLABELED check was
+    skipped."""
     findings = [dict(f) for f in mislabeled]
     any_english = any(r.get("counts_as_english") for r in stream_records)
     any_unclear = any(not r.get("counts_as_english") and r.get("reading") != "foreign"
@@ -508,9 +477,9 @@ def process_candidate(
     video: Path, cfg: Config, jellyfin: JellyfinClient, workdir: Path,
 ) -> dict:
     """Original-language lookup, playback gate, probe, analysis of ONE file. Raises only
-    `PlaybackWaitTimeout`; transient failures come back as a `RETRYABLE_RESULTS` result.
-    The Arr lookup touches no media so it goes first: no whisper time on an untrustworthy
-    result."""
+    `PlaybackWaitTimeout`; failures come back as a `result` of `PROBE_FAILED`, `ERROR`,
+    `ARR_UNAVAILABLE` or `DEPENDENCY_MISSING`. The Arr lookup touches no media so it goes
+    first: no whisper time on an untrustworthy result."""
     rec: dict = {"path": str(video), "findings": []}
     budget = PlaybackWaitBudget(cfg.max_wait_min)
     try:
@@ -600,75 +569,38 @@ def _finding_problem(finding: object) -> str | None:
     return None
 
 
-def stored_stream_problem(stream: object) -> str | None:
-    """Why `stream` is not a well-formed detection record, else `None` (language/probability
-    are `None` for a skipped stream)."""
-    if not isinstance(stream, dict):
-        return "stream is not an object"
+def _failed_problem(failed: object) -> str | None:
+    if not isinstance(failed, dict):
+        return "failed is not an object"
+    attempts = failed.get("attempts")
     checks = {
-        "index": _is_index,
-        "tag": _is_str_or_none,
-        "detected_language": _is_str_or_none,
-        "probability": lambda v: v is None or _is_probability(v),
-        "counts_as_english": lambda v: isinstance(v, bool),
-        "reading": lambda v: v is None or (isinstance(v, str) and v in READINGS),
+        "identity": _is_identity(failed.get("identity")),
+        "attempts": _is_index(attempts) and attempts >= 1,
+        "last_result": isinstance(failed.get("last_result"), str)
+        and failed["last_result"] in FAILED_RESULTS,
+        "last_error": _is_str_or_none(failed.get("last_error")),
     }
     for field, ok in checks.items():
-        if field not in stream or not ok(stream[field]):
-            return f"streams[].{field} is missing or has the wrong type"
-    if "mislabel_skipped" in stream and not isinstance(stream["mislabel_skipped"], bool):
-        return "streams[].mislabel_skipped has the wrong type"
-    return None
-
-
-def finding_problem(finding: object) -> str | None:
-    """`_finding_problem`, never raising."""
-    try:
-        return _finding_problem(finding)
-    except Exception as exc:
-        return f"could not be validated ({type(exc).__name__})"
-
-
-def _findings_problem(value: object) -> str | None:
-    if not isinstance(value, list):
-        return "findings is not a list"
-    for f in value:
-        problem = finding_problem(f)
-        if problem:
-            return problem
-    return None
-
-
-def _retry_problem(retry: object) -> str | None:
-    if not isinstance(retry, dict):
-        return "retry is not an object"
-    required = {"identity": _is_identity,
-                "attempts": lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 1,
-                "next_retry_at": _finite_number}
-    for field, ok in required.items():
-        if field not in retry or not ok(retry[field]):
-            return f"retry.{field} is missing or has the wrong type"
-    for field in ("last_error", "last_attempt_at"):
-        if field in retry and not _is_str_or_none(retry[field]):
-            return f"retry.{field} has the wrong type"
-    last = retry.get("last_result")
-    if last is not None and not (isinstance(last, str) and last in RETRYABLE_RESULTS):
-        return f"retry.last_result {last!r} is not a retry-type outcome"
+        if not ok:
+            return f"failed.{field} is missing or has the wrong type"
     return None
 
 
 def _entry_problem(entry: object) -> str | None:
-    """Why `entry` is malformed, else `None`. Fields may be absent (a retry-only entry has
-    no `identity`) but every present one must be valid; retry-type outcomes appear only
-    inside `retry`."""
+    """Why `entry` is malformed, else `None`. Fields may be absent (a failure-only entry has
+    no `identity`) but every present one must be valid; failure outcomes appear only inside
+    `failed`. Keys this version does not use (module docstring) are not looked at."""
     if not isinstance(entry, dict):
         return "entry is not an object"
     if "result" in entry and not (isinstance(entry["result"], str)
                                   and entry["result"] in CONCLUSION_RESULTS):
         return (f"result {entry['result']!r} is not a conclusion "
                 f"({', '.join(sorted(CONCLUSION_RESULTS))})")
-    if "findings" in entry:
-        problem = _findings_problem(entry["findings"])
+    findings = entry.get("findings", [])
+    if not isinstance(findings, list):
+        return "findings is not a list"
+    for f in findings:
+        problem = _finding_problem(f)
         if problem:
             return problem
     checks = {
@@ -680,24 +612,8 @@ def _entry_problem(entry: object) -> str | None:
     for field, ok in checks.items():
         if field in entry and not ok(entry[field]):
             return f"{field} has the wrong type"
-    if "original_status" in entry or "original_language" in entry:
-        status, code = entry.get("original_status"), entry.get("original_language")
-        if not isinstance(status, str) or status not in ORIGINAL_STATUSES:
-            return f"original_status {status!r} is not one of {sorted(ORIGINAL_STATUSES)}"
-        code_known = isinstance(code, str) and code in ORIGINAL_CODES
-        if (status == "known") != code_known or (status == "unknown" and code is not None):
-            return f"original_language {code!r} does not match original_status {status!r}"
-    if "streams" in entry:
-        if not isinstance(entry["streams"], list):
-            return "streams is not a list"
-        for s in entry["streams"]:
-            problem = stored_stream_problem(s)
-            if problem:
-                return problem
-    if "original_rechecked_at" in entry and not isinstance(entry["original_rechecked_at"], str):
-        return "original_rechecked_at has the wrong type"
-    if "retry" in entry:
-        return _retry_problem(entry["retry"])
+    if "failed" in entry:
+        return _failed_problem(entry["failed"])
     return None
 
 
@@ -730,32 +646,14 @@ def _load_state(path: Path) -> dict | None:
     return data
 
 
-def _compact_streams(records: object) -> list[dict]:
-    """Per-stream fields kept in state: enough to re-run `_decide`, no windows."""
-    out = []
-    for r in records if isinstance(records, list) else []:
-        c = {"index": r.get("index"), "tag": r.get("tag"),
-             "detected_language": r.get("detected_language"), "probability": r.get("probability"),
-             "counts_as_english": bool(r.get("counts_as_english")), "reading": r.get("reading")}
-        if r.get("mislabel_skipped"):
-            c["mislabel_skipped"] = True
-        out.append(c)
-    return out
-
-
 def _conclusion_entry(existing: dict, identity: list[int], rec: dict, checked_at: str) -> dict:
-    """The whole entry for a conclusion at `identity`; anything unlisted (a `retry` too) is
-    superseded. The same file with the same findings keeps `alerted` and `first_found`;
-    new findings or a CHANGED identity start `alerted=False`."""
+    """The whole entry for a conclusion at `identity`; anything unlisted (a `failed` record or
+    a key of an older version too) is superseded. The same file with the same findings keeps
+    `alerted` and `first_found`; new findings or a CHANGED identity start `alerted=False`."""
     findings = rec.get("findings") or []
     same_file = existing.get("identity") == identity
     entry: dict = {"identity": identity, "result": rec.get("result"),
                    "findings": findings, "checked_at": checked_at}
-    if rec.get("original_status") is not None:
-        entry["original_status"] = rec["original_status"]
-        entry["original_language"] = rec.get("original_language")
-    if rec.get("streams") is not None:
-        entry["streams"] = _compact_streams(rec["streams"])
     if findings:
         entry["first_found"] = (existing["first_found"]
                                 if same_file and isinstance(existing.get("first_found"), str)
@@ -790,151 +688,30 @@ def _record_result(video: Path, identity: list[int], rec: dict, checked_at: str)
     return True
 
 
-_ARR_SERVICE = {"movies": "Radarr", "tv": "Sonarr", "other": "Radarr/Sonarr"}
-
-
-def _arr_kind(path: Path) -> str:
-    """`"movies"` (Radarr), `"tv"` (Sonarr) or `"other"`, as `media_stack.arrlang` decides."""
-    try:
-        parts = path.resolve().relative_to(MEDIA_ROOT.resolve()).parts
-    except (ValueError, OSError):
-        return "other"
-    top = parts[0].lower() if len(parts) >= 2 else ""
-    return top if top in ("movies", "tv") else "other"
-
-
-def recheck_unknown_originals(state: dict) -> None:
-    """Re-ask Radarr/Sonarr about `original_status == "unknown"` conclusions (cached by
-    identity, so a later-added title would never be revisited). Once known, the verdict is
-    recomputed from STORED detections (`_decide`), no audio or playback gate, in one locked
-    update. LIVE entries only, filtered BEFORE the `MAX_ORIGINAL_RECHECKS` bound. The first
-    "unavailable" for a kind skips its remaining entries this run without using budget."""
-    live = [(k, e) for k, e in state.items()
-            if e.get("original_status") == "unknown" and e.get("streams")
-            and e.get("result") in CONCLUSION_RESULTS and e.get("identity")
-            and _identity(Path(k)) == e["identity"]]
-    if not live:
-        return
-    live.sort(key=lambda ke: ke[1].get("original_rechecked_at") or ke[1].get("checked_at") or "")
-    now = _utc_now_iso()
-    updates: dict[str, tuple[dict, dict]] = {}
-    looked = known = changed = skipped = 0
-    attempts = 0
-    unavailable: set[str] = set()
-    for key, entry in live:
-        if attempts >= MAX_ORIGINAL_RECHECKS:
-            break
-        path = Path(key)
-        kind = _arr_kind(path)
-        if kind in unavailable:
-            skipped += 1
-            continue
-        attempts += 1
-        code, status = original_language_lookup(path)
-        if status == ORIGINAL_UNAVAILABLE:
-            unavailable.add(kind)
-            log(f"original-language recheck: {_ARR_SERVICE[kind]} unavailable; "
-                f"skipping its remaining entries this run, trying again next run")
-            skipped += 1
-            continue
-        looked += 1
-        if status != "known":
-            updates[key] = (entry, {**entry, "original_rechecked_at": now})
-            continue
-        known += 1
-        mislabeled = [f for f in entry.get("findings", []) if f.get("type") == "MISLABELED"]
-        findings, result, _note = _decide(
-            code, entry["streams"], mislabeled,
-            any(s.get("mislabel_skipped") for s in entry["streams"]))
-        rec = {"result": result, "findings": findings, "original_language": code,
-               "original_status": "known", "streams": entry["streams"]}
-        new = _conclusion_entry(entry, entry["identity"], rec, now)
-        problem = entry_problem(new)
-        if problem:
-            log(f"original-language recheck: not recording {key} ({problem})")
-            continue
-        updates[key] = (entry, new)
-        if findings != entry.get("findings"):
-            changed += 1
-            log(f"original language of {key} is now {code}: findings "
-                f"{[f['type'] for f in entry.get('findings', [])]} -> {[f['type'] for f in findings]}")
-    down = "/".join(_ARR_SERVICE[k] for k in sorted(unavailable))
-    skipped_note = f", {skipped} skipped ({down} unavailable)" if skipped else ""
-    if not updates:
-        log(f"original-language recheck: {looked} looked up, none newly known{skipped_note}")
-        return
-
-    def _apply(current: dict) -> dict:
-        for k, (snapshot, new_entry) in updates.items():
-            if current.get(k) == snapshot:   # unchanged since the snapshot
-                current[k] = new_entry
-        return current
-
-    try:
-        mutate_state(STATE_FILE, _apply)
-    except Exception as exc:
-        log(f"WARNING: {STATE_FILE} original-language recheck not recorded "
-            f"({type(exc).__name__}: {exc}); will try again next run")
-        return
-    log(f"original-language recheck: {looked} looked up, {known} now known, "
-        f"{changed} with changed findings{skipped_note}")
-
-
-def _record_retry(video: Path, identity: list[int], rec: dict, now_s: float) -> None:
-    """Record a transient failure as a `retry` INSIDE the entry, leaving any earlier
-    conclusion, findings and alert flag untouched; honoured only while the identity is
-    unchanged. Write failures are logged and swallowed."""
+def _record_failure(video: Path, identity: list[int], rec: dict) -> None:
+    """Count a failed analysis in a `failed` record INSIDE the entry, leaving any earlier
+    conclusion, findings and alert flag untouched; the count restarts when the identity
+    changes. A leftover `retry` of an older version is dropped. Write failures are logged
+    and swallowed."""
     key = str(video.resolve())
 
     def _upsert(state: dict) -> dict:
         entry = state.get(key)
         entry = entry if isinstance(entry, dict) else {}
-        prev = entry.get("retry")
-        attempts = 1
-        if isinstance(prev, dict) and prev.get("identity") == identity:
-            n = prev.get("attempts")
-            if isinstance(n, int) and not isinstance(n, bool) and n >= 1:
-                attempts = n + 1
-        entry["retry"] = {
-            "identity": identity,
-            "attempts": attempts,
-            "next_retry_at": now_s + backoff_s(attempts),
-            "last_result": rec.get("result"),
-            "last_error": rec.get("error"),
-            "last_attempt_at": _utc_now_iso(),
-        }
-        problem = _retry_problem(entry["retry"])
+        entry.pop("retry", None)
+        entry["failed"] = {"identity": identity, "attempts": _failed_attempts(entry, identity) + 1,
+                           "last_result": rec.get("result"), "last_error": rec.get("error")}
+        problem = _failed_problem(entry["failed"])
         if problem:
-            raise ValueError(f"refusing to record a malformed retry record ({problem})")
+            raise ValueError(f"refusing to record a malformed failure record ({problem})")
         state[key] = entry
         return state
 
     try:
         mutate_state(STATE_FILE, _upsert)
     except Exception as exc:
-        log(f"WARNING: {STATE_FILE} retry record failed for {video} "
+        log(f"WARNING: {STATE_FILE} failure record failed for {video} "
             f"({type(exc).__name__}: {exc}); will retry next run")
-
-
-def write_report(state: dict) -> None:
-    """Regenerate `REPORT_FILE` with findings whose file still has the identity they were
-    made on. Derived, never read back; a write failure is harmless."""
-    report: dict[str, dict] = {}
-    for key, entry in state.items():
-        findings = entry.get("findings") if isinstance(entry, dict) else None
-        if findings and _identity(Path(key)) == entry.get("identity"):
-            report[key] = {"findings": findings, "first_found": entry.get("first_found"),
-                           "alerted": entry.get("alerted") is True, "identity": entry["identity"]}
-    tmp = REPORT_FILE.with_name(REPORT_FILE.name + ".tmp")
-    try:
-        tmp.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-        os.replace(tmp, REPORT_FILE)
-    except Exception as exc:
-        log(f"WARNING: {REPORT_FILE} (derived report) not written ({type(exc).__name__}: {exc})")
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def _append_jsonl(path: Path, rec: dict) -> None:
@@ -958,52 +735,20 @@ def _title_for(video: Path) -> str:
     return _clean_text(video.name)
 
 
-def _q(value: object) -> str:
-    """`?` for anything missing or unexpected."""
-    if value is None or isinstance(value, (dict, list)):
-        return "?"
-    text = str(value)
-    return text if text else "?"
+def _format_one_finding(f: dict) -> str:
+    """`f` is a validated finding (`_finding_problem`)."""
+    if f["type"] == "MISLABELED":
+        return (f"stream {f['stream_index']} tagged {f['tag'] or 'und'} but detected "
+                f"{f['detected_language']} (p={f['probability']:.2f})")
+    heard = ", ".join(f"{s['index']} tagged {s['tag'] or 'und'} heard {s['detected_language']} "
+                      f"(p={s['probability']:.2f})" for s in f["streams"])
+    return f"no confirmed English audio (original language: English); streams: {heard}"
 
 
-def _p(value: object) -> str:
-    """`0.85`, or `?` unless a finite number."""
-    if not _finite_number(value):
-        return "?"
-    return f"{value:.2f}"
-
-
-def _format_one_finding(f: object) -> str:
-    if not isinstance(f, dict):
-        return "?"
-    kind = f.get("type")
-    if kind == "MISLABELED":
-        return (f"stream {_q(f.get('stream_index'))} tagged {_q(f.get('tag') or 'und')} but "
-                f"detected {_q(f.get('detected_language'))} (p={_p(f.get('probability'))})")
-    if kind == "NO_ENGLISH_AUDIO":
-        streams = f.get("streams")
-        detail = ""
-        if isinstance(streams, list) and streams:
-            detail = ": " + ", ".join(
-                f"{_q(s.get('index'))} tagged {_q(s.get('tag') or 'und')} heard "
-                f"{_q(s.get('detected_language'))} (p={_p(s.get('probability'))})"
-                if isinstance(s, dict) else "?" for s in streams)
-        return f"no confirmed English audio (original language: English); streams{detail or ' ?'}"
-    return _q(kind)
-
-
-def _format_finding_line(path_str: str, findings: object) -> str:
-    """One `- title: finding; finding` line; never raises (unexpected renders `?`)."""
-    try:
-        title = _title_for(Path(path_str))
-    except Exception:
-        title = _clean_text(_q(path_str))
-    try:
-        items = findings if isinstance(findings, list) else []
-        body = "; ".join(_format_one_finding(f) for f in items) or "?"
-    except Exception:
-        body = "?"
-    return _clean_text(f"- {title}: {body}")
+def _format_finding_line(path_str: str, findings: list[dict]) -> str:
+    """One `- title: finding; finding` line."""
+    body = "; ".join(_format_one_finding(f) for f in findings)
+    return _clean_text(f"- {_title_for(Path(path_str))}: {body}")
 
 
 def _tg_len(text: str) -> int:
@@ -1019,39 +764,23 @@ def _truncate(text: str, limit: int) -> str:
     cut = text[: max(limit - 1, 0)]
     while cut and _tg_len(cut) + 1 > limit:
         cut = cut[:-1]
-    return cut + "\u2026"
+    return cut + "…"
 
 
-def build_alert_message(pending: list[tuple[str, dict]]) -> tuple[str, list[tuple[str, dict]]]:
-    """The one message for `pending` (oldest first) and the items it names. Items are added
-    while the text, INCLUDING the "...and N more" tail then needed, stays within
-    `TELEGRAM_BUDGET_CHARS` and `MAX_ALERT_ITEMS`; lines are cut to `MAX_ALERT_LINE_CHARS`
-    so the oldest always fits. Omitted items stay pending.
-
-    Never raises and emits no lone surrogates: an undecodable file name would otherwise
-    break the send and, being oldest-first, block every later finding forever. An
-    unformattable entry is `- ?`."""
-    text = f"audio-lang-check: {len(pending)} file(s) with unresolved audio-language findings"
-    tail_reserve = _tg_len(f"\n...and {len(pending)} more")  # the longest tail possible
-    included: list[tuple[str, dict]] = []
-    for i, (path_str, entry) in enumerate(pending):
-        if len(included) >= MAX_ALERT_ITEMS:
-            break
-        try:
-            line = _truncate(_format_finding_line(
-                path_str, entry.get("findings") if isinstance(entry, dict) else None),
-                MAX_ALERT_LINE_CHARS)
-        except Exception:  # second line of defence: one odd entry must not block the queue
-            line = "- ?"
-        reserve = 0 if i == len(pending) - 1 else tail_reserve
-        if _tg_len(text) + 1 + _tg_len(line) + reserve > TELEGRAM_BUDGET_CHARS:
+def build_alert_message(pending: list[tuple[str, dict]]) -> tuple[str, int]:
+    """One message naming the first items of `pending` (oldest first) and how many it names:
+    as many as fit `MAX_ALERT_ITEMS` and `TELEGRAM_BUDGET_CHARS`. Lines are cut to
+    `MAX_ALERT_LINE_CHARS`, so the first always fits; the caller sends the rest in further
+    messages."""
+    text = "audio-lang-check: new audio-language findings"
+    named = 0
+    for path_str, entry in pending[:MAX_ALERT_ITEMS]:
+        line = _truncate(_format_finding_line(path_str, entry["findings"]), MAX_ALERT_LINE_CHARS)
+        if _tg_len(text) + 1 + _tg_len(line) > TELEGRAM_BUDGET_CHARS:
             break
         text += "\n" + line
-        included.append((path_str, entry))
-    omitted = len(pending) - len(included)
-    if omitted:
-        text += f"\n...and {omitted} more"
-    return text, included
+        named += 1
+    return text, named
 
 
 def _telegram_credentials() -> tuple[str, str]:
@@ -1074,61 +803,64 @@ def _telegram_credentials() -> tuple[str, str]:
     return token or vals.get("TELEGRAM_BOT_TOKEN", ""), chat or vals.get("TELEGRAM_CHAT_ID", "")
 
 
-def _notify(message: str) -> bool:
-    """Best-effort send; `False` on any failure (logged)."""
+def _notify(message: str) -> str | None:
+    """Send `message`: `None` on success, else why not. Only the exception TYPE is reported
+    (a message could carry the token)."""
     try:
         token, chat = _telegram_credentials()
+        if not token or not chat:
+            return "no Telegram credentials"
+        if telegram_send(token, chat, _clean_text(message)):
+            return None
+        return "Telegram did not accept the message"
     except Exception as exc:
-        log(f"notify error (non-fatal): {type(exc).__name__}")
-        return False
-    if not token or not chat:
-        log("notify skipped: no Telegram credentials")
-        return False
-    try:
-        ok = telegram_send(token, chat, _clean_text(message))
-        log("notify sent" if ok else "notify failed (non-fatal)")
-        return ok
-    except Exception as exc:
-        log(f"notify error (non-fatal): {type(exc).__name__}")
-        return False
+        return f"send raised {type(exc).__name__}"
 
 
-def retry_alerts() -> None:
-    """Send ONE message for pending findings, oldest first. PENDING: findings present,
-    `alerted` not true, file still at the identity they were made on; a gone or replaced
-    file is stale (never sent, findings stripped). Only entries named in a CONFIRMED send
-    are marked `alerted`, under the same lock and only if unchanged since; a failed send
-    or an entry that did not fit stays pending."""
+def _alert_failed(reason: str, paths: list[str]) -> None:
+    log(f"ALERT NOT DELIVERED, NOT RETRIED ({reason}); findings for: {', '.join(paths)}", err=True)
+    _append_jsonl(JSONL_FILE, {"event": "ALERT_FAILED", "reason": reason, "paths": paths,
+                               "at": _utc_now_iso()})
+
+
+def send_alerts() -> None:
+    """One send attempt per new finding, oldest first, in as many messages as the length
+    bounds need. PENDING: findings present, `alerted` not true, file still at the identity
+    they were made on, checked again before each message (a gone or replaced file's findings
+    are never sent). Every entry named in a message is then marked `alerted`, under the lock
+    and only if unchanged since, whether or not Telegram took the message: a failed send is
+    logged, never retried."""
     state = _load_state(STATE_FILE)
     if state is None:
         log("not alerting this run (state unreadable)")
         return
-    pending, stale = [], {}
-    for k, v in state.items():
-        if not v.get("findings") or v.get("alerted") is True:
-            continue
-        current = _identity(Path(k))
-        if current is None or current != v.get("identity"):
-            stale[k] = v
+    rest = [(k, v) for k, v in state.items()
+            if v.get("findings") and v.get("alerted") is not True and v.get("identity") is not None]
+    rest.sort(key=lambda kv: kv[1].get("first_found") or "")
+    attempted: dict[str, dict] = {}
+    while True:
+        # Checked again before every message: a file replaced while earlier ones were sending
+        # is stale now.
+        rest = [(k, v) for k, v in rest if _identity(Path(k)) == v["identity"]]
+        if not rest:
+            break
+        text, named = build_alert_message(rest)
+        reason = _notify(text)
+        if reason:
+            _alert_failed(reason, [k for k, _ in rest[:named]])
         else:
-            pending.append((k, v))
-    if stale:
-        _strip_stale_findings(stale)
-    pending.sort(key=lambda kv: kv[1].get("first_found") or "")
-    if not pending:
-        return
-    message, shown = build_alert_message(pending)
-
-    if not _notify(message):
-        log("findings remain unalerted; the next run retries")
+            log(f"alert sent for {named} file(s)")
+        attempted.update(rest[:named])
+        rest = rest[named:]
+    if not attempted:
         return
 
-    snapshot = dict(shown)
+    snapshot = attempted
 
     def _mark(current: dict) -> dict:
         for k, seen in snapshot.items():
             cur = current.get(k)
-            # a rewritten entry is not yet alerted
+            # a rewritten entry is a new finding, not yet alerted
             if (isinstance(cur, dict) and cur.get("findings") == seen.get("findings")
                     and cur.get("identity") == seen.get("identity")):
                 cur["alerted"] = True
@@ -1138,39 +870,7 @@ def retry_alerts() -> None:
         mutate_state(STATE_FILE, _mark)
     except Exception as exc:
         log(f"WARNING: failed to record alert delivery ({type(exc).__name__}: {exc}); "
-            f"will re-alert next run")
-
-
-def _strip_stale_findings(stale: dict) -> None:
-    """Strip findings, `first_found` and `alerted` from stale entries still equal to the snapshot."""
-    for k in stale:
-        log(f"not alerting a stale finding (file gone or replaced since): {k}")
-
-    def _strip(state: dict) -> dict:
-        for k, snap in stale.items():
-            cur = state.get(k)
-            if cur == snap:
-                cur["findings"] = []
-                cur.pop("first_found", None)
-                cur.pop("alerted", None)
-        return state
-
-    try:
-        mutate_state(STATE_FILE, _strip)
-    except Exception as exc:
-        log(f"WARNING: {STATE_FILE} stale-finding cleanup failed "
-            f"({type(exc).__name__}: {exc})")
-
-
-def _end_of_run() -> None:
-    """Send pending alerts, then regenerate the derived report."""
-    try:
-        retry_alerts()
-    except Exception as exc:
-        log(f"WARNING: alerting failed ({type(exc).__name__}: {exc}); findings stay pending")
-    state = _load_state(STATE_FILE)
-    if state is not None:
-        write_report(state)
+            f"will alert again next run")
 
 
 def _process_one(
@@ -1184,6 +884,69 @@ def _process_one(
     except PlaybackWaitTimeout as exc:
         log(f"{exc}; ending cleanly")
         return None
+
+
+def _check_candidates(candidates: list[Path], cfg: Config) -> int:
+    """Analyze `candidates` one at a time within the run budget and record each result.
+    Exit status for `main()`."""
+    if not candidates:
+        log("nothing to do (0 candidates)")
+        return 0
+
+    jellyfin = JellyfinClient(cfg.jellyfin_url)
+    deadline = time.monotonic() + cfg.budget_min * 60
+    started = arr_unavailable = 0
+
+    for video in candidates:
+        if time.monotonic() >= deadline:
+            log(f"budget ({cfg.budget_min:g} min) reached; "
+                f"deferring {len(candidates) - started} remaining file(s) to the next run")
+            break
+
+        # Earlier candidates take minutes: the file may be gone or touched since the scan.
+        before = _identity(video, time.time())
+        if before is None:
+            continue
+
+        started += 1
+        log(f"start ({started}/{len(candidates)}): {video}")
+        rec = _process_one(video, cfg, jellyfin)
+        if rec is None:
+            return 0
+
+        if _identity(video, time.time()) != before:
+            log(f"DISCARDED (file changed or was touched during analysis): {video}")
+            continue
+
+        checked_at = _utc_now_iso()
+        rec["checked_at"] = checked_at
+        result = rec.get("result")
+
+        if result == "ARR_UNAVAILABLE":
+            arr_unavailable += 1
+            continue
+        if result == "DEPENDENCY_MISSING":
+            _append_jsonl(JSONL_FILE, rec)
+            log("ERROR: faster_whisper is not installed; every file would fail the "
+                "same way -- ending the run")
+            return 1
+        if result in FAILED_RESULTS:
+            _record_failure(video, before, rec)
+            _append_jsonl(JSONL_FILE, rec)
+            log(f"{result} (at most {MAX_FAILED_ATTEMPTS} attempts per file version): {video}"
+                + (f" [{rec['error']}]" if rec.get("error") else ""))
+            continue
+
+        if not _record_result(video, before, rec, checked_at):
+            continue
+        _append_jsonl(JSONL_FILE, rec)
+        log(f"{result} ({len(rec['findings'])} finding(s)): {video}")
+
+    if arr_unavailable:
+        log(f"{arr_unavailable} file(s) not checked: Radarr/Sonarr could not be asked; "
+            f"the next run tries again")
+    log(f"done: {started}/{len(candidates)} file(s) started this run")
+    return 0
 
 
 def main() -> int:
@@ -1239,8 +1002,7 @@ def main() -> int:
         if not video.is_file():
             log(f"ERROR: --path {video} is not a file")
             return 1
-        jellyfin = JellyfinClient(cfg.jellyfin_url)
-        rec = _process_one(video, cfg, jellyfin)
+        rec = _process_one(video, cfg, JellyfinClient(cfg.jellyfin_url))
         if rec is None:
             print(json.dumps({"path": str(video), "result": "PLAYBACK_WAIT_TIMEOUT"}, indent=2))
             return 0
@@ -1248,18 +1010,12 @@ def main() -> int:
         print(json.dumps(rec, indent=2))
         return 0
 
-    identity_state = _load_state(STATE_FILE)
-    if identity_state is None:
+    state = _load_state(STATE_FILE)
+    if state is None:
         log("run blinded: the state is unreadable or malformed (nothing was written)")
         return 1
 
-    if not args.dry_run:
-        try:
-            recheck_unknown_originals(identity_state)
-        except Exception as exc:
-            log(f"WARNING: original-language recheck failed ({type(exc).__name__}: {exc})")
-
-    candidates = select_candidates(identity_state, MEDIA_ROOT, time.time())
+    candidates = select_candidates(state, MEDIA_ROOT, time.time())
 
     if args.dry_run:
         log(f"DRY RUN: {len(candidates)} candidate(s) would be checked "
@@ -1268,66 +1024,13 @@ def main() -> int:
             log(f"  would check: {p}")
         return 0
 
-    if not candidates:
-        log("nothing to do (0 candidates)")
-        _end_of_run()
-        return 0
-
-    jellyfin = JellyfinClient(cfg.jellyfin_url)
-    budget_s = cfg.budget_min * 60
-    deadline = time.monotonic() + budget_s
-    started = 0
-
-    for video in candidates:
-        if time.monotonic() >= deadline:
-            log(f"budget ({cfg.budget_min:g} min) reached; "
-                f"deferring {len(candidates) - started} remaining file(s) to the next run")
-            break
-
-        # Revalidate: earlier candidates take minutes; the file may have changed or been checked.
-        before = _stable_identity(video, time.time())
-        if before is None:
-            continue
-        cached = identity_state.get(str(video.resolve()))
-        if isinstance(cached, dict) and cached.get("identity") == before:
-            continue
-
-        started += 1
-        log(f"start ({started}/{len(candidates)}): {video}")
-        rec = _process_one(video, cfg, jellyfin)
-        if rec is None:
-            _end_of_run()
-            return 0
-
-        if _stable_identity(video, time.time()) != before:
-            log(f"DISCARDED (file changed or was touched during analysis): {video}")
-            continue
-
-        checked_at = _utc_now_iso()
-        rec["checked_at"] = checked_at
-        result = rec.get("result")
-        findings = rec.get("findings") or []
-
-        if result in RETRYABLE_RESULTS:
-            _record_retry(video, before, rec, time.time())
-            _append_jsonl(JSONL_FILE, rec)
-            log(f"{result} (will retry with backoff): {video}"
-                + (f" [{rec['error']}]" if rec.get("error") else ""))
-            if result == "DEPENDENCY_MISSING":
-                log("ERROR: faster_whisper is not installed; every file would fail the "
-                    "same way -- ending the run")
-                _end_of_run()
-                return 1
-            continue
-
-        if not _record_result(video, before, rec, checked_at):
-            continue
-        _append_jsonl(JSONL_FILE, rec)
-        log(f"{result} ({len(findings)} finding(s)): {video}")
-
-    log(f"done: {started}/{len(candidates)} file(s) checked this run")
-    _end_of_run()
-    return 0
+    try:
+        return _check_candidates(candidates, cfg)
+    finally:
+        try:
+            send_alerts()
+        except Exception as exc:
+            log(f"WARNING: alerting failed ({type(exc).__name__}: {exc})", err=True)
 
 
 if __name__ == "__main__":
