@@ -1,0 +1,16 @@
+# Snapshot of /etc/systemd/system/realtek-fix.service.  Host-critical: disables
+# GSO/GRO/TSO/EEE on enp6s0f1; without it the Realtek 8169 NIC drops LAN connectivity
+# within hours of heavy Docker traffic.  The script it runs (/usr/local/bin/fix-realtek-nic.sh)
+# lives outside the repo so the fix works without the media stack.
+
+[Unit]
+Description=Fix Realtek NIC Offload and EEE Issues
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/fix-realtek-nic.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,86 @@
+# Versioned snapshot of the user crontab governing the media stack.  This file is the
+# source of truth: after changing it, re-install and run `bash ops/audit.sh`.
+#
+# Install with `bash ops/install.sh --apply`, which renders the `$HOME/media-stack`
+# placeholder to MEDIA_STACK_ROOT.  A raw `crontab ops/cron.d/media-stack.crontab` also
+# works for a checkout at `$HOME/media-stack` (cron's /bin/sh expands `$HOME` at run time).
+
+# m h  dom mon dow   command
+
+# qBittorrent stall reaper: every minute, kills torrents with no progress past STALL_THRESHOLD_SEC.
+* * * * * python3 $HOME/media-stack/nuke_stalled.py >> $HOME/media-stack/var/log/stall_killer.log 2>&1
+
+# Weekly Docker / apt / journal prune, Sunday 03:00.
+0 3 * * 0 ( docker image prune -af --filter "until=168h" && sudo aptitude autoclean -y && sudo journalctl --vacuum-time=7d ) >> $HOME/media-stack/var/log/weekly-prune.log 2>&1
+
+# Nightly host upgrade, 04:00 daily.  All cron hours here are in the host timezone.
+# Lives outside the repo ($HOME/nightly-upgrade.sh) because it touches non-stack host state.
+0 4 * * * $HOME/nightly-upgrade.sh
+
+# Watchdog for the job above: nightly-upgrade.sh is silent unless it fails, so this proves
+# the 04:00 run happened and catches its own Telegram push failing.  Also outside the repo.
+30 5 * * * $HOME/scripts/nightly-watchdog.sh >> $HOME/media-stack/var/log/nightly-watchdog.log 2>&1
+
+# Nightly subtitle consolidation sweep: idempotent backstop for consolidate-watch.service.
+0 5 * * * python3 $HOME/media-stack/consolidate-subs.py --scan $HOME/media-stack/data/media --jobs 2 >> $HOME/media-stack/var/log/consolidate-subs.log 2>&1
+
+# Daily Bazarr profile audit: fixes profileId=None items added without a default profile.
+30 4 * * * $HOME/media-stack/bazarr-profile-audit.py >> $HOME/media-stack/var/log/bazarr-profile-audit.log 2>&1
+
+# Daily movie de-dup: a Radarr upgrade-import leaves the replaced (pipeline-renamed) file
+# behind.  Auto-resolves the SAFE case (Radarr tracks the keeper: leftover moves to the
+# recoverable .dupe-recycle); flags the RISKY case for review and Telegrams a summary.
+45 4 * * * python3 $HOME/media-stack/movie-dedupe.py --apply --notify >> $HOME/media-stack/var/log/movie-dedupe.log 2>&1
+
+# Daily TV episode de-dup: Sonarr sibling of movie-dedupe.py, 5 min later so they never
+# overlap.  Same SAFE/RISKY model, plus it deletes Sonarr's orphan `episodefile` row for the
+# removed leftover via the API.
+50 4 * * * python3 $HOME/media-stack/tv-dedupe.py --apply --notify >> $HOME/media-stack/var/log/tv-dedupe.log 2>&1
+
+# Hourly aggregate healthcheck; healthcheck-alert.sh records a non-zero exit (FAIL=1,
+# WARN=2) to var/log/healthcheck-issues.log.
+0 * * * * $HOME/media-stack/ops/healthcheck-alert.sh >> $HOME/media-stack/var/log/healthcheck.log 2>&1
+
+# Hourly ASR subtitle fallback for files left in NEEDS_BAZARR (var/state/needs-english.json)
+# past SUB_FALLBACK_AGE_HOURS: tries subliminal, verifies the result against the file's own
+# audio with a short whisper window, else transcribes the whole file.  One file at a time.
+# `ionice -c3` is only defense in depth (mq-deadline's aging timer lets idle I/O through);
+# the real protection is the pause-aware playback gate (checks Jellyfin before every ffmpeg
+# extraction, fails closed, see JellyfinClient.now_playing_sessions).  A playback wait past
+# SUB_FALLBACK_MAX_WAIT_MIN ends the run cleanly; the next tick retries.
+# Minute :20 avoids the :00 healthcheck.
+20 * * * * nice -n19 ionice -c3 python3 $HOME/media-stack/sub-fallback.py >> $HOME/media-stack/var/log/sub-fallback.log 2>&1
+
+# Hourly audio-language spot-check: release names and track tags lie about audio, and
+# nothing else listens to it.  audio-lang-check.py runs a short whisper language-ID window
+# per audio stream, newest files first, and Telegrams ONE message per run for NEW findings
+# (MISLABELED, NO_ENGLISH_AUDIO).  It NEVER deletes, blocklists or re-grabs.  Idle-priority
+# with the same pause-aware playback gate as sub-fallback.py.
+# Minute :37 is off every other start minute (every-minute and */5 jobs, :20, daily :15/:30/:45/:50).
+37 * * * * nice -n19 ionice -c3 python3 $HOME/media-stack/audio-lang-check.py >> $HOME/media-stack/var/log/audio-lang-check.log 2>&1
+
+# ProtonVPN's forwarded port is dynamic; reconcile qBittorrent's listen port on a timer
+# rather than gluetun's one-shot up-command hook (fires before qBittorrent is up, is not
+# retried, and misses a qBittorrent restart).  Idempotent.
+*/5 * * * * python3 $HOME/media-stack/sync-forwarded-port.py >> $HOME/media-stack/var/log/sync-forwarded-port.log 2>&1
+
+# Malware is distributed as fake releases for UNAIRED episodes (no legitimate release
+# competes), with a different name and hash each time, so blocklisting is always a step
+# behind.  malware-guard.sh destroys the payload but leaves Sonarr stuck in importPending;
+# unaired-guard.py reaps that after the grab (Sonarr has no air-date gate on RSS) and
+# refuses to act on anything it cannot prove unaired (see its module docstring).
+*/5 * * * * python3 $HOME/media-stack/unaired-guard.py >> $HOME/media-stack/var/log/unaired-guard.log 2>&1
+
+# Weekly search for anything missing (Saturday 03:15).  Sonarr and Radarr search an item
+# once, when added, then only watch RSS, so a request whose first search found nothing
+# stays "processing" in Jellyseerr forever.  Sonarr gets its own missing-episode search;
+# Radarr gets an explicit list of RELEASED missing movies instead of its bulk search, since
+# the profile approves pre-release junk (see the module docstring).  Saturday 03:15 avoids
+# the Sunday 03:00 prune and the 04:00 nightly upgrade, which can reboot.
+15 3 * * 6 python3 $HOME/media-stack/search-missing.py >> $HOME/media-stack/var/log/search-missing.log 2>&1
+
+# Daily Shield configuration drift check, 12:15.  Compares each unit in SHIELD_DEVICES (.env)
+# with ops/shield/profile.json over network ADB and Telegrams only when something CHANGED.
+# REPORT-ONLY (an automatic debloat once broke Play Store and voice search): fixes stay
+# manual, from the hint lines in var/log/shield-check.log.  No-op when SHIELD_DEVICES is unset.
+15 12 * * * python3 $HOME/media-stack/shield-check.py >> $HOME/media-stack/var/log/shield-check.log 2>&1

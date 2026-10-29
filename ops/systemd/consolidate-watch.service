@@ -1,0 +1,24 @@
+# Snapshot of /etc/systemd/system/consolidate-watch.service: inotify trigger for
+# consolidate-subs.py (see consolidate-watch.sh).
+#
+# TEMPLATE, do not install raw: `$HOME/media-stack`, `User=mediauser` and
+# `Group=mediauser` are placeholders.  Install with `bash ops/install.sh --apply`;
+# check drift with `bash ops/audit.sh` (both render the placeholders).
+
+[Unit]
+Description=Consolidate subtitles on new media imports
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=mediauser
+Group=mediauser
+ExecStart=/bin/bash $HOME/media-stack/consolidate-watch.sh
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:$HOME/media-stack/var/log/consolidate-watch.service.log
+StandardError=append:$HOME/media-stack/var/log/consolidate-watch.service.log
+
+[Install]
+WantedBy=multi-user.target

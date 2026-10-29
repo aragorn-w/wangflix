@@ -1,0 +1,17 @@
+# Logrotate for the runtime logs under var/log; `ops/install.sh` renders the
+# `$HOME/media-stack` placeholder and installs it to /etc/logrotate.d/media-stack.
+#
+# `su root root`: var/log mixes owners (malware-guard.service writes as root) and is
+# group-writable, so logrotate needs an explicit `su`.
+# `copytruncate` is mandatory: consolidate-watch.service (systemd `append:`) and the cron
+# jobs (`>>`) hold their logs open, and a rename would leave them writing to an orphaned inode.
+$HOME/media-stack/var/log/*.log {
+    weekly
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}

@@ -1,0 +1,6 @@
+# Dev / CI tooling — NOT required at runtime (the stack runs without these).
+# Install with:  pip3 install --user -r requirements-dev.txt
+# Config for all three lives in pyproject.toml.
+ruff>=0.15
+mypy>=1.11
+pytest>=7.4

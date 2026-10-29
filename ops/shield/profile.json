@@ -1,0 +1,97 @@
+{
+  "_doc": "Desired state of the NVIDIA Shield TV Pro units, compared READ-ONLY by shield-check.py (applying stays manual: a past automatic debloat pass broke Play Store and voice search). disabled_packages: must be disabled if installed; not installed at all is fine. required_enabled_packages: must be installed and not disabled. absent_packages: must not be installed. settings: the exact string 'settings get <namespace> <key>' prints; an unset key reads back as the literal null (system nv_power_mode 0 is the Max performance processor mode). component_lists: a colon-separated list of Android component names; every listed component must be present, and the short form pkg/.Cls equals pkg/pkg.Cls. Device-specific settings are deliberately NOT listed, so the check never flags them: HDMI-CEC, IR remote, volume-control mode, Wi-Fi versus Ethernet, audio output, display mode and the device name (the bedroom unit has CEC and IR off on purpose).",
+  "disabled_packages": [
+    "android.autoinstalls.config.nvidia",
+    "com.amazon.amazonvideo.livingroom.nvidia",
+    "com.android.gallery3d",
+    "com.android.printspooler",
+    "com.google.android.backdrop",
+    "com.google.android.marvin.talkback",
+    "com.google.android.syncadapters.calendar",
+    "com.google.android.tv",
+    "com.google.android.tvlauncher",
+    "com.netflix.ninja",
+    "com.nvidia.app.messaging",
+    "com.nvidia.benchmarkblocker",
+    "com.nvidia.developerwidget",
+    "com.nvidia.diagtools",
+    "com.nvidia.factory",
+    "com.nvidia.factorybundling",
+    "com.nvidia.factorysyschecker",
+    "com.nvidia.feedback",
+    "com.nvidia.inputviewer",
+    "com.nvidia.nvgamecast",
+    "com.nvidia.osc",
+    "com.nvidia.shield.beta",
+    "com.nvidia.shieldbeta",
+    "com.nvidia.shield.nas",
+    "com.nvidia.shield.registration",
+    "com.nvidia.shield.smbserver",
+    "com.nvidia.shield.welcome",
+    "com.nvidia.stats",
+    "com.nvidia.tegraprofiler.security",
+    "com.nvidia.tegrazone3"
+  ],
+  "required_enabled_packages": [
+    "org.jellyfin.androidtv",
+    "com.spocky.projengmenu",
+    "org.smarttube.beta",
+    "io.github.jqssun.airplay",
+    "com.google.android.tts",
+    "com.google.android.speech.pumpkin",
+    "com.google.android.gms",
+    "com.google.android.katniss",
+    "com.android.hotwordenrollment.okgoogle",
+    "com.android.hotwordenrollment.xgoogle",
+    "com.nvidia.hotwordsetup",
+    "com.google.android.feedback",
+    "com.google.android.apps.mediashell",
+    "com.google.android.tvrecommendations",
+    "com.nvidia.ota",
+    "com.google.android.inputmethod.latin"
+  ],
+  "absent_packages": [
+    "com.fox.foxone",
+    "com.disney.disneyplus"
+  ],
+  "settings": {
+    "global": {
+      "animator_duration_scale": "0.5",
+      "transition_animation_scale": "0.5",
+      "window_animation_scale": "0.5",
+      "app_auto_update_policy": "2",
+      "ipv6_enabled": "DISABLEIPV6",
+      "stay_on_while_plugged_in": "0",
+      "auto_upgrade": "1",
+      "auto_upgrade_time": "4:0"
+    },
+    "secure": {
+      "accessibility_captioning_enabled": "1",
+      "accessibility_captioning_locale": "en_US",
+      "accessibility_captioning_preset": "4",
+      "default_input_method": "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME",
+      "voice_interaction_service": "com.google.android.katniss/.search.serviceapi.KatnissVoiceInteractionService",
+      "assistant": "com.google.android.katniss/.search.serviceapi.KatnissVoiceInteractionService",
+      "screensaver_enabled": "0",
+      "sleep_timeout": "1200000"
+    },
+    "system": {
+      "screen_off_timeout": "1200000",
+      "nv_fan_mode": "cool",
+      "nv_power_mode": "0",
+      "nv_upscale_detail": "3",
+      "nv_upscale_filter": "auto",
+      "nv_lower_volume_when_listening": "1"
+    }
+  },
+  "component_lists": {
+    "secure": {
+      "enabled_accessibility_services": [
+        "com.spocky.projengmenu/.services.ProjectivyAccessibilityService"
+      ],
+      "enabled_input_methods": [
+        "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME"
+      ]
+    }
+  }
+}

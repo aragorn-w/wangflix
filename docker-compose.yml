@@ -1,0 +1,281 @@
+services:
+  gluetun:
+    image: qmcgaw/gluetun
+    container_name: gluetun
+    labels:
+    - com.centurylinklabs.watchtower.enable=false
+    cap_add:
+    - NET_ADMIN
+    devices:
+    - /dev/net/tun:/dev/net/tun
+    # Ports bind to ALL interfaces so Tailnet clients (tailscale0) reach the admin UIs as well as the
+    # LAN; binding to MEDIA_LAN_IP only breaks Tailscale access. The perimeter relies on UFW off +
+    # Tailnet Lock on, no public-routable host interface, and admin UI auth where configured. On a
+    # host with a public interface, add `${MEDIA_LAN_IP}:HOST:CONTAINER` bindings (and one for the
+    # Tailscale IP).
+    ports:
+    - 8090:8090
+    # No static peer-port publish: inbound peers arrive on the port Proton allocates, which gluetun
+    # opens in its own firewall.
+    - 9696:9696
+    - 8989:8989
+    - 7878:7878
+    - 6767:6767
+    - 8192:8191
+    dns:
+    - 8.8.8.8
+    - 1.1.1.1
+    environment:
+    - VPN_SERVICE_PROVIDER=protonvpn
+    - VPN_TYPE=wireguard
+    - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY:?WIREGUARD_PRIVATE_KEY missing — see .env.example}
+    - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESS:?WIREGUARD_ADDRESS missing — see .env.example}
+    - SERVER_COUNTRIES=${VPN_COUNTRY:-Switzerland}
+    # Health checks target IPs, not hostnames: gluetun's default targets resolve through its OWN DNS
+    # at 127.0.0.1:53, so a resolver hiccup fails liveness while the tunnel is healthy. Port 443 still
+    # does a full TLS handshake, so it stays a real end-to-end check, and tunnel enforcement is
+    # unaffected (both IPs route via tun0, OUTPUT defaults to DROP, neither is inside
+    # FIREWALL_OUTBOUND_SUBNETS). The permanent-unhealthy state is believed to be an upstream
+    # health-checker deadlock (HEALTH_RESTART_VPN never fires again), fixed in v3.41.1. Watchtower
+    # stays disabled for gluetun (label above): a restart drops the netns for seven containers.
+    - HEALTH_TARGET_ADDRESSES=1.1.1.1:443,8.8.8.8:443
+    # ProtonVPN port forwarding (without it qBittorrent is outbound-only). PORT_FORWARD_ONLY is
+    # REQUIRED: Proton forwards only on its P2P servers and SERVER_COUNTRIES alone does not prefer
+    # them. A NAT-PMP-ENABLED WIREGUARD KEY IS ALSO REQUIRED (Proton hands the port out over NAT-PMP,
+    # udp/5351): generate it with NAT-PMP on and Moderate NAT off, on a Standard (not Secure Core)
+    # server, then RECREATE gluetun, which does not retry a failed allocation. The port is DYNAMIC, so
+    # no static port belongs anywhere in this file; sync-forwarded-port.py reconciles qBittorrent's
+    # listen port on a timer.
+    - VPN_PORT_FORWARDING=on
+    - PORT_FORWARD_ONLY=on
+    # gluetun's default :::8000 control server is reachable on the container IP and the auth file
+    # grants GET /v1/portforward with auth = "none", so pin it to loopback.
+    - HTTP_CONTROL_SERVER_ADDRESS=127.0.0.1:8000
+    # LAN + Tailnet CGNAT range (100.64.0.0/10). Inbound to published ports works via conntrack, but
+    # containers in gluetun's namespace that initiate outbound to Tailnet-only services (e.g. host
+    # webhooks via 100.x) need this allowlist. Override the LAN part via .env.
+    - FIREWALL_OUTBOUND_SUBNETS=${FIREWALL_OUTBOUND_SUBNETS:-10.0.0.0/24,100.64.0.0/10}
+    # Grants the one control-server route sync-forwarded-port.py polls; /gluetun/auth/config.toml is
+    # gluetun's default path.
+    volumes:
+    - ./ops/gluetun/auth-config.toml:/gluetun/auth/config.toml:ro
+    restart: unless-stopped
+    networks:
+    - internal-media
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent-dvr
+    network_mode: service:gluetun
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    - WEBUI_PORT=8090
+    volumes:
+    - ./config/qbittorrent:/config
+    - ./data/torrents:/downloads
+    restart: unless-stopped
+    depends_on:
+    - gluetun
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr-dvr
+    network_mode: service:gluetun
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    volumes:
+    - ./config/prowlarr:/config
+    restart: unless-stopped
+    depends_on:
+    - gluetun
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    network_mode: service:gluetun
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    volumes:
+    - ./config/sonarr:/config
+    - ${MEDIA_ROOT:-${MEDIA_STACK_ROOT:-$HOME/media-stack}/data/media}/tv:/tv
+    - ./data/torrents:/downloads
+    restart: unless-stopped
+    depends_on:
+    - gluetun
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    network_mode: service:gluetun
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    volumes:
+    - ./config/radarr:/config
+    - ${MEDIA_ROOT:-${MEDIA_STACK_ROOT:-$HOME/media-stack}/data/media}/movies:/movies
+    - ./data/torrents:/downloads
+    restart: unless-stopped
+    depends_on:
+    - gluetun
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:latest
+    container_name: bazarr
+    network_mode: service:gluetun
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    volumes:
+    - ./config/bazarr:/config
+    - ${MEDIA_ROOT:-${MEDIA_STACK_ROOT:-$HOME/media-stack}/data/media}/tv:/tv
+    - ${MEDIA_ROOT:-${MEDIA_STACK_ROOT:-$HOME/media-stack}/data/media}/movies:/movies
+    restart: unless-stopped
+    depends_on:
+    - gluetun
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr-dvr
+    network_mode: service:gluetun
+    environment:
+    - LOG_LEVEL=info
+    - TZ=${TZ:-UTC}
+    restart: unless-stopped
+    depends_on:
+    - gluetun
+  unpackerr:
+    image: golift/unpackerr
+    container_name: unpackerr
+    environment:
+    - UN_SONARR_0_URL=http://localhost:8989
+    - UN_SONARR_0_API_KEY=${SONARR_API_KEY:?SONARR_API_KEY missing — see .env.example}
+    - UN_RADARR_0_URL=http://localhost:7878
+    - UN_RADARR_0_API_KEY=${RADARR_API_KEY:?RADARR_API_KEY missing — see .env.example}
+    volumes:
+    - ./data/torrents:/downloads
+    restart: unless-stopped
+    network_mode: service:gluetun
+    depends_on:
+    - gluetun
+  watchtower:
+    # nickfedor/watchtower is the maintained fork: upstream containrrr is abandoned and its Docker API
+    # client (1.25) is below the daemon's 1.44 minimum.
+    image: nickfedor/watchtower:latest
+    container_name: watchtower
+    volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+    - WATCHTOWER_CLEANUP=true
+    - WATCHTOWER_POLL_INTERVAL=86400
+    restart: unless-stopped
+    networks:
+    - internal-media
+  tdarr:
+    container_name: tdarr
+    image: ghcr.io/haveagitgat/tdarr:latest
+    restart: unless-stopped
+    ports:
+    - 8265:8265
+    - 8266:8266
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    - serverIP=0.0.0.0
+    - disableAnalytics=true
+    volumes:
+    - ${MEDIA_STACK_ROOT:-$HOME/media-stack}/config/tdarr:/app/server
+    - ${MEDIA_STACK_ROOT:-$HOME/media-stack}/config/tdarr_configs:/app/configs
+    - ${MEDIA_ROOT:-${MEDIA_STACK_ROOT:-$HOME/media-stack}/data/media}:/media
+    networks:
+    - internal-media
+  tdarr-node:
+    container_name: tdarr-node
+    image: ghcr.io/haveagitgat/tdarr_node:latest
+    restart: unless-stopped
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    - nodeID=Balls3-NVIDIA
+    - serverIP=tdarr
+    - serverPort=8266
+    - disableAnalytics=true
+    volumes:
+    - ${MEDIA_STACK_ROOT:-$HOME/media-stack}/config/tdarr_node:/app/configs
+    - ${MEDIA_ROOT:-${MEDIA_STACK_ROOT:-$HOME/media-stack}/data/media}:/media
+    - /tmp:/temp
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            count: 1
+            capabilities:
+            - gpu
+    depends_on:
+    - tdarr
+    networks:
+    - internal-media
+  jellyfin:
+    container_name: jellyfin
+    image: jellyfin/jellyfin:latest
+    restart: unless-stopped
+    ports:
+    - 8096:8096
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    # Default to the LAN IP: a placeholder tailnet name would advertise a non-resolvable host.
+    - JELLYFIN_PublishedServerUrl=${JELLYFIN_PUBLISHED_URL:-${MEDIA_LAN_IP:-10.0.0.10}}
+    volumes:
+    - ${MEDIA_STACK_ROOT:-$HOME/media-stack}/config/jellyfin:/config
+    - ${MEDIA_ROOT:-${MEDIA_STACK_ROOT:-$HOME/media-stack}/data/media}:/data
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+          - driver: nvidia
+            count: 1
+            capabilities:
+            - gpu
+    networks:
+    - internal-media
+  jellyseerr:
+    image: ghcr.io/seerr-team/seerr:latest
+    container_name: jellyseerr
+    restart: unless-stopped
+    networks:
+    - internal-media
+    ports:
+    - 5055:5055
+    environment:
+    - LOG_LEVEL=debug
+    - TZ=${TZ:-UTC}
+    volumes:
+    - ${MEDIA_STACK_ROOT:-$HOME/media-stack}/config/jellyseerr:/app/config
+  # readarr: removed (upstream abandoned); config remains at ./config/readarr.
+  kavita:
+    image: lscr.io/linuxserver/kavita:latest
+    container_name: kavita
+    environment:
+    - PUID=${PUID:-1000}
+    - PGID=${PGID:-1000}
+    - TZ=${TZ:-UTC}
+    volumes:
+    - ./config/kavita:/config
+    - ${CALIBRE_LIBRARY:-/srv/calibre/library}:/books
+    restart: unless-stopped
+    # Direct publish, not via gluetun: a mapping on gluetun would point host:5000 at its empty namespace.
+    ports:
+    - 5000:5000
+    networks:
+    - internal-media
+networks:
+  internal-media:
+    driver: bridge
