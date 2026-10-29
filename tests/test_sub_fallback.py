@@ -1,7 +1,6 @@
 """`sub-fallback.py`, the hourly ASR fallback: Popen, the model plumbing and `JellyfinClient` are mocked and every var/ path is under `tmp_path`."""
 
 import fcntl
-import hashlib
 import importlib.util
 import itertools
 import json
@@ -54,7 +53,6 @@ def _media(tmp_path: Path, name: str = "Episode S01E01.mkv") -> Path:
 @pytest.fixture(autouse=True)
 def _isolate_runtime_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(sf, "NEEDS_ENGLISH_STATE_FILE", tmp_path / "needs-english.json")
-    monkeypatch.setattr(sf, "SUB_FALLBACK_PLACEMENTS_FILE", tmp_path / "sub-fallback-placements.json")
     monkeypatch.setattr(sf, "LOCK_FILE", tmp_path / "sub-fallback.lock")
     monkeypatch.setattr(sf, "JSONL_FILE", tmp_path / "sub-fallback.jsonl")
     monkeypatch.setattr(sf, "WORKDIR_ROOT", tmp_path / "workdir-root")
@@ -204,83 +202,24 @@ def test_drop_stale_entries_keeps_an_entry_re_recorded_since_the_snapshot():
     assert json.loads(state_file.read_text()) == {"/a.mkv": fresh_entry}
 
 
-# --- wait_while_playing: fail-closed + bounded ---------------------------
+# --- playback gate: the logic lives in media_stack.playback (tests/test_playback.py); here only the adapters' wiring ---
 
-@pytest.mark.parametrize("sequence", [[_BUSY, _BUSY, []], [None, None, []]],
-                         ids=["busy-sessions", "none-is-busy"])
-def test_wait_while_playing_polls_until_confirmed_idle(monkeypatch, sequence):
-    sleeps = []
-    monkeypatch.setattr(sf.time, "sleep", lambda s: sleeps.append(s))
-    sf.wait_while_playing(_FakeJellyfin(sequence), _cfg(), _budget())
-    assert sleeps == [sf.PLAYBACK_POLL_S, sf.PLAYBACK_POLL_S]
+def test_playback_adapters_bind_cfg_and_module_constants_into_the_shared_helpers():
+    jf, cfg, budget = _FakeJellyfin([]), _cfg(jellyfin_key="k", max_wait_min=7.0), _budget(7.0)
+    with patch.object(sf, "_shared_wait_while_playing") as shared_wait:
+        sf.wait_while_playing(jf, cfg, budget)
+    shared_wait.assert_called_once_with(jf, "k", 7.0, budget, poll_s=sf.PLAYBACK_POLL_S, log=sf.log)
 
-
-def test_wait_while_playing_returns_immediately_without_api_key():
-    jf = _FakeJellyfin([])
-    sf.wait_while_playing(jf, _cfg(jellyfin_key=""), _budget())  # must not raise / not call
-
-
-def test_wait_while_playing_returns_immediately_when_confirmed_idle():
-    jf = _FakeJellyfin([[]])
-    sf.wait_while_playing(jf, _cfg(), _budget())
-
-
-def test_wait_while_playing_raises_after_max_wait_exceeded(monkeypatch):
-    jf = _FakeJellyfin([_BUSY] * 100)
-    monkeypatch.setattr(sf.time, "sleep", lambda s: None)
-    times = iter([0.0] + [i * 100.0 for i in range(1, 100)])
-    monkeypatch.setattr(sf.time, "monotonic", lambda: next(times))
-    with pytest.raises(sf.PlaybackWaitTimeout):
-        sf.wait_while_playing(jf, _cfg(max_wait_min=1.0), _budget(1.0))
-
-
-def test_wait_while_playing_cumulative_across_separate_calls_exceeds_budget(monkeypatch):
-    """The budget bounds total wait across calls: two calls each under the allowance raise once their sum exceeds it."""
-    cfg = _cfg(max_wait_min=2.0)  # 120s total allowance
-    budget = _budget(cfg.max_wait_min)
-    clock = _FakeClock()
-    monkeypatch.setattr(sf.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(sf.time, "sleep", clock.sleep)
-
-    # First call: one busy poll (one PLAYBACK_POLL_S = 60 s), then clear.
-    jf1 = _FakeJellyfin([_BUSY, []])
-    sf.wait_while_playing(jf1, cfg, budget)
-    assert budget.remaining_s == pytest.approx(60.0)  # 120 - 60 spent
-
-    # Second call: continuously busy; only 60 s remain, so it raises at the second busy poll.
-    jf2 = _FakeJellyfin([_BUSY, _BUSY])
-    with pytest.raises(sf.PlaybackWaitTimeout):
-        sf.wait_while_playing(jf2, cfg, budget)
-
-
-# --- _call_with_playback_pause --------------------------------------------
-
-def test_call_with_playback_pause_passes_through_on_success():
-    jf = _FakeJellyfin([])
-    cfg = _cfg()
-    result = sf._call_with_playback_pause(
-        lambda *a, should_abort: "ok", jf, cfg, _budget(), "arg1")
-    assert result == "ok"
-
-
-def test_call_with_playback_pause_retries_after_extraction_interrupted(monkeypatch):
-    jf = _FakeJellyfin([])
-    cfg = _cfg(jellyfin_key="")  # wait_while_playing is a no-op with no key
-    calls = {"n": 0}
-
-    def _fn(*a, should_abort):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise ExtractionInterrupted("playback")
-        return "ok"
-
-    result = sf._call_with_playback_pause(_fn, jf, cfg, _budget())
-    assert result == "ok"
-    assert calls["n"] == 2
+    def fn(*args, should_abort, **kwargs):
+        raise AssertionError("never called: the shared helper is mocked")
+    with patch.object(sf, "call_with_playback_pause", return_value="ok") as shared_call:
+        assert sf._call_with_playback_pause(fn, jf, cfg, budget, "a", kw=1) == "ok"
+    shared_call.assert_called_once_with(
+        fn, jf, "k", 7.0, budget, "a", poll_s=sf.PLAYBACK_POLL_S, log=sf.log, kw=1)
 
 
 def test_call_with_playback_pause_retries_share_cumulative_budget(monkeypatch):
-    """Retries within one `_call_with_playback_pause` call each clear under the allowance but exhaust the shared budget on the third (180 s = 3 x 60 s)."""
+    """Through the adapter: retries within one call each clear under the allowance but exhaust the shared budget on the third (180 s = 3 x 60 s `PLAYBACK_POLL_S`)."""
     cfg = _cfg(max_wait_min=3.0)  # 180s total allowance
     budget = _budget(cfg.max_wait_min)
     clock = _FakeClock()
@@ -393,7 +332,7 @@ def _leftover_sfb_temps(dest: Path) -> list[Path]:
     return sorted(dest.parent.glob(sf._sidecar_temp_glob(dest)))
 
 
-def _place(tmp_path, video, dest, text="text", source="subliminal", *, identity=None, rec=None,
+def _place(tmp_path, video, dest, text="text", *, identity=None, rec=None,
            probe=_PROBED, processed=False, sidecars=(), extra=()):
     """Run `_place_sidecar` with probe, already_processed and discovery stubbed (`sidecars=None` keeps real discovery); `extra` are further patchers."""
     with ExitStack() as stack:
@@ -404,7 +343,7 @@ def _place(tmp_path, video, dest, text="text", source="subliminal", *, identity=
         for patcher in extra:
             stack.enter_context(patcher)
         return sf._place_sidecar(
-            video, dest, text, source,
+            video, dest, text,
             video_identity=sf._video_identity(video) if identity is None else identity,
             pipeline_timeout_s=60.0, rec={} if rec is None else rec, workdir=tmp_path)
 
@@ -590,7 +529,6 @@ def test_event_open_failure_after_publish_resolves_to_fixed_not_error_through_pr
 
     assert rec["result"] == "FIXED"
     assert rec.get("event_fallback_used") is True
-    assert str(video.resolve()) in sf._load_placements(sf.SUB_FALLBACK_PLACEMENTS_FILE)
 
 
 # --- _video_identity -------------------------------------------------------
@@ -761,66 +699,24 @@ _ENGLISH_SIDECAR_TEXT = (
     "Look, this situation feels impossible, but we have to move now.\n"
 )
 
-def test_our_recorded_placement_alone_triggers_retrigger(tmp_path):
-    """Retrigger only with exactly one main sidecar that is this script's own recorded placement for this exact video (same path and content)."""
+@pytest.mark.parametrize("names", [
+    (".en.srt",), (".en.generated.srt",), (".en.srt", ".en.generated.srt"),
+], ids=["plain", "generated", "two-main-sidecars"])
+def test_an_existing_main_sidecar_is_always_skipped(tmp_path, names):
+    """Whoever placed it (Bazarr, a user, an earlier run of this script), a video with a main sidecar gets SIDECAR_PRESENT and NO action, not even a consolidate nudge: the watcher and the 05:00 scan own it."""
     video = _media(tmp_path)
-    sidecar = video.with_name(video.stem + ".en.srt")
-    sidecar.write_text(_ENGLISH_SIDECAR_TEXT)
-    sf._record_placement(video, sidecar, _ENGLISH_SIDECAR_TEXT, "whisper")
-    cfg = _cfg()
-    rec, mocks = _candidate(
-        tmp_path, video=video, base="sidecar", cfg=cfg,
-        find_sidecar_subs={"return_value": [(sidecar, False, False)]},
-        _run_consolidate_subs_directly={"return_value": (True, "FIXED: some/path.mkv")},
-        wait_for_pipeline={"return_value": (True, 5)})
-
-    assert rec["result"] == "PIPELINE_RETRIGGERED"
-    assert rec["pipeline_retrigger_ran_ok"] is True
-    assert rec["pipeline_retrigger_tag_landed"] is True
-    mocks["_run_consolidate_subs_directly"].assert_called_once_with(
-        video, cfg.pipeline_timeout_min * 60, tmp_path / "work")
-    mocks["wait_for_pipeline"].assert_called_once()
-    mocks["fetch_via_subliminal"].assert_not_called()
-    mocks["_transcribe_in_subprocess"].assert_not_called()
-
-
-def _record_our_placement(video, sidecar):
-    sf._record_placement(video, sidecar, _ENGLISH_SIDECAR_TEXT, "whisper")
-
-
-def _scenario_no_record(video, sidecar):
-    """Bazarr's or a user's sidecar: never episode-verified, so never retriggered."""
-    return [(sidecar, False, False)]
-
-
-def _scenario_video_replaced(video, sidecar):
-    _record_our_placement(video, sidecar)
-    video.write_bytes(_MKV + b"replaced content")
-    os.utime(video, (1_700_000_000, 1_700_000_000))
-    return [(sidecar, False, False)]
-
-
-def _scenario_corrupt_placements_file(video, sidecar):
-    sf.SUB_FALLBACK_PLACEMENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    sf.SUB_FALLBACK_PLACEMENTS_FILE.write_text("{not valid json")
-    return [(sidecar, False, False)]
-
-
-@pytest.mark.parametrize("scenario", [
-    _scenario_no_record, _scenario_video_replaced, _scenario_corrupt_placements_file,
-], ids=["no-record", "video-replaced-since-placement", "corrupt-placements-file"])
-def test_process_candidate_without_proof_the_sidecar_is_ours_gives_sidecar_present(tmp_path, scenario):
-    """No retrigger or other action; the watcher and the 05:00 sweep own it. A corrupt placements file never breaks the run."""
-    video = _media(tmp_path)
-    sidecar = video.with_name(video.stem + ".en.srt")
-    sidecar.write_text(_ENGLISH_SIDECAR_TEXT)
-    entries = scenario(video, sidecar)
-    rec, mocks = _candidate(tmp_path, video=video, base="sidecar", find_sidecar_subs={"return_value": entries})
+    sidecars = [video.with_name(video.stem + name) for name in names]
+    for sidecar in sidecars:
+        sidecar.write_text(_ENGLISH_SIDECAR_TEXT)
+    rec, mocks = _candidate(tmp_path, video=video, base="sidecar",
+                            find_sidecar_subs={"return_value": [(sc, False, False) for sc in sidecars]},
+                            wait_for_pipeline={})
     assert rec["result"] == "SIDECAR_PRESENT"
     _assert_nothing_attempted(mocks)
+    mocks["wait_for_pipeline"].assert_not_called()
 
 
-def test_already_tagged_file_does_not_trigger_pipeline_retrigger(tmp_path):
+def test_already_tagged_file_short_circuits_before_the_sidecar_check(tmp_path):
     """A tagged file short-circuits at ALREADY_CONSOLIDATED before the sidecar-exists check."""
     rec, mocks = _candidate(tmp_path, base="sidecar", already_processed={"return_value": True},
                             find_sidecar_subs={})
@@ -844,91 +740,8 @@ def test_main_sidecars_excludes_forced_entries_and_has_forced_sidecar_sees_any(t
         assert sf._has_forced_sidecar(video) is has_forced
 
 
-# --- placements: _record_placement / _load_placements / _clear_placement / _sidecar_matches_our_placement ---
-
-def test_record_placement_then_load_round_trips(tmp_path):
-    video = _media(tmp_path)
-    dest = video.with_name(video.stem + ".en.srt")
-    sf._record_placement(video, dest, "hello world", "subliminal")
-    placements = sf._load_placements(sf.SUB_FALLBACK_PLACEMENTS_FILE)
-    record = placements[str(video.resolve())]
-    assert record["sidecar"] == str(dest)
-    assert record["source"] == "subliminal"
-    assert record["sha256"] == hashlib.sha256(b"hello world").hexdigest()
-    assert "placed_at" in record
-    # the video's own identity at publish time: four fields, the last its ctime
-    assert record["video_identity"] == sf._video_identity_sans_dev(video)
-    assert len(record["video_identity"]) == 4
-    assert record["video_identity"][3] == video.stat().st_ctime_ns
-
-
-def test_load_placements_missing_file_is_empty_dict(tmp_path):
-    assert sf._load_placements(tmp_path / "nope.json") == {}
-
-
-def test_load_placements_unusable_file_is_empty_dict_with_warning(tmp_path, capsys):
-    p = tmp_path / "bad.json"
-    p.write_text("{not json")
-    assert sf._load_placements(p) == {}
-    assert "WARNING" in capsys.readouterr().out
-
-
-def test_record_placement_write_failure_is_logged_and_swallowed(tmp_path, capsys):
-    video = _media(tmp_path)
-    dest = video.with_name(video.stem + ".en.srt")
-    with patch.object(sf, "mutate_state", side_effect=OSError("disk full")):
-        sf._record_placement(video, dest, "text", "whisper")  # must not raise
-    assert "WARNING" in capsys.readouterr().out
-
-
-def test_clear_placement_removes_the_entry(tmp_path):
-    video = _media(tmp_path)
-    dest = video.with_name(video.stem + ".en.srt")
-    sf._record_placement(video, dest, "text", "whisper")
-    key = str(video.resolve())
-    assert key in sf._load_placements(sf.SUB_FALLBACK_PLACEMENTS_FILE)
-    sf._clear_placement(key)
-    assert key not in sf._load_placements(sf.SUB_FALLBACK_PLACEMENTS_FILE)
-
-
-def _recorded(tmp_path, *, record=True):
-    video = _media(tmp_path)
-    sidecar = video.with_name(video.stem + ".en.srt")
-    sidecar.write_text(_ENGLISH_SIDECAR_TEXT)
-    if record:
-        sf._record_placement(video, sidecar, _ENGLISH_SIDECAR_TEXT, "whisper")
-    return video, sidecar
-
-
-def _edit_sidecar(video, sidecar):
-    sidecar.write_text(_ENGLISH_SIDECAR_TEXT + "\nedited\n")
-    return sidecar
-
-
-def _replace_video(video, sidecar):
-    """New content and mtime, whatever the filesystem's inode reuse (a remux); the sidecar is untouched."""
-    video.write_bytes(_MKV + b"replaced content")
-    os.utime(video, (1_700_000_000, 1_700_000_000))
-    return sidecar
-
-
-def test_sidecar_matches_our_placement_true_for_exact_record(tmp_path):
-    video, sidecar = _recorded(tmp_path)
-    assert sf._sidecar_matches_our_placement(video, sidecar) is True
-
-
-@pytest.mark.parametrize("record, mutate", [
-    (False, lambda video, sidecar: sidecar), (True, _edit_sidecar), (True, _replace_video),
-], ids=["no-record", "hash-mismatch", "video-replaced"])
-def test_sidecar_matches_our_placement_false_once_anything_it_binds_changes(tmp_path, record, mutate):
-    video, sidecar = _recorded(tmp_path, record=record)
-    if record:
-        assert sf._sidecar_matches_our_placement(video, sidecar) is True
-    assert sf._sidecar_matches_our_placement(video, mutate(video, sidecar)) is False
-
-
 def test_process_candidate_forced_sidecar_present_blocks_everything(tmp_path):
-    """ANY forced English sidecar gives FORCED_SIDECAR_PRESENT with nothing fetched, transcribed, placed or retriggered (consolidate-subs.py handles forced-pattern sidecars itself)."""
+    """ANY forced English sidecar gives FORCED_SIDECAR_PRESENT with nothing fetched, transcribed or placed (consolidate-subs.py handles forced-pattern sidecars itself)."""
     video = _media(tmp_path)
     forced = video.with_name(video.stem + ".en.forced.srt")
     forced.write_text(_ENGLISH_SIDECAR_TEXT)
@@ -938,7 +751,6 @@ def test_process_candidate_forced_sidecar_present_blocks_everything(tmp_path):
     assert rec["result"] == "FORCED_SIDECAR_PRESENT"
     _assert_nothing_attempted(mocks)
     assert forced.read_text() == _ENGLISH_SIDECAR_TEXT  # untouched
-    assert sf._load_placements(sf.SUB_FALLBACK_PLACEMENTS_FILE) == {}  # nothing recorded
 
 
 def test_probe_failure_is_recorded(tmp_path):
@@ -991,14 +803,13 @@ def test_whisper_result_is_published_as_a_generated_sidecar(tmp_path):
 
 
 def test_place_sidecar_publishes_a_generated_sidecar_that_discovery_sees_as_a_plain_main_one(tmp_path):
-    """The generated name publishes, is found as one non-forced main sidecar, and later no-clobber/retrigger checks treat it like any other."""
+    """The generated name publishes and is found as one non-forced main sidecar, like any other."""
     video = _media(tmp_path)
     dest = sf._sidecar_dest(video, "whisper")
-    assert _place(tmp_path, video, dest, "subtitle content", "whisper", sidecars=None) is None
+    assert _place(tmp_path, video, dest, "subtitle content", sidecars=None) is None
     assert dest.read_text() == "subtitle content"
     assert sf._main_sidecars(video) == [(dest, False, False)]
     assert sf._has_forced_sidecar(video) is False
-    assert sf._sidecar_matches_our_placement(video, dest) is True
 
 
 def test_place_sidecar_blocks_when_a_real_sidecar_exists_under_the_other_name(tmp_path):
@@ -1007,7 +818,7 @@ def test_place_sidecar_blocks_when_a_real_sidecar_exists_under_the_other_name(tm
     real = video.with_name(video.stem + ".en.srt")
     real.write_text("real subtitle")
     gen = sf._sidecar_dest(video, "whisper")
-    assert _place(tmp_path, video, gen, "generated", "whisper", sidecars=None) == "SIDECAR_APPEARED"
+    assert _place(tmp_path, video, gen, "generated", sidecars=None) == "SIDECAR_APPEARED"
     assert not gen.exists()
     assert real.read_text() == "real subtitle"
 
@@ -1018,7 +829,7 @@ def test_place_sidecar_published_sidecar_is_world_readable_0644(tmp_path):
     dest = sf._sidecar_dest(video, "whisper")
     old_umask = os.umask(0o077)  # the mode must not depend on the umask
     try:
-        assert _place(tmp_path, video, dest, "subtitle content", "whisper", sidecars=None) is None
+        assert _place(tmp_path, video, dest, "subtitle content", sidecars=None) is None
     finally:
         os.umask(old_umask)
     assert stat.S_IMODE(dest.stat().st_mode) == 0o644
@@ -1212,8 +1023,10 @@ def test_transcribe_in_subprocess_success_returns_stdout(tmp_path):
 
 
 @pytest.mark.parametrize("runner, wait", [
-    ("transcribe", "exits"), ("transcribe", "times-out"), ("transcribe", "interrupted"), ("consolidate", "times-out"),
-], ids=["transcribe-exits", "transcribe-times-out", "transcribe-interrupted", "consolidate-times-out"])
+    ("transcribe", "exits"), ("transcribe", "times-out"), ("transcribe", "interrupted"),
+    ("consolidate", "exits"), ("consolidate", "times-out"), ("consolidate", "interrupted"),
+], ids=["transcribe-exits", "transcribe-times-out", "transcribe-interrupted",
+        "consolidate-exits", "consolidate-times-out", "consolidate-interrupted"])
 def test_the_child_process_group_is_killed_on_every_exit_path(tmp_path, runner, wait):
     """The child exiting does not prove its process group is empty, so killpg(pid) runs once on every path."""
     proc = _fake_proc(returncode=0)
@@ -1342,20 +1155,17 @@ def test_main_exit_code_with_and_without_a_jellyfin_key(argv, key, rc):
     assert _run_main(*argv, cfg=_cfg(jellyfin_key=key))[0] == rc
 
 
-def test_main_clears_placements_for_stale_entries(tmp_path):
-    """A placement record for a gone or already-consolidated video (the stale classification needs-english.json uses) is cleared, so state does not leak."""
-    gone_video = tmp_path / "gone.mkv"  # never actually created on disk
-    gone_key = str(gone_video.resolve())
+def test_main_drops_stale_tracker_entries(tmp_path):
+    """An entry whose file is gone is removed from needs-english.json so the tracker does not leak."""
+    gone_key = str((tmp_path / "gone.mkv").resolve())  # never actually created on disk
     _seed_needs_english(sf.NEEDS_ENGLISH_STATE_FILE, {
         gone_key: {"first_seen": "2026-10-01T00:00:00Z", "last_seen": "2026-10-01T00:00:00Z"},
     })
-    sf._record_placement(gone_video, gone_video.with_suffix(".en.srt"), "text", "whisper")
-    assert gone_key in sf._load_placements(sf.SUB_FALLBACK_PLACEMENTS_FILE)
 
     rc, _ = _run_main(_has_consolidated_tag={"return_value": False})
 
     assert rc == 0
-    assert gone_key not in sf._load_placements(sf.SUB_FALLBACK_PLACEMENTS_FILE)
+    assert json.loads(sf.NEEDS_ENGLISH_STATE_FILE.read_text()) == {}
 
 
 @pytest.mark.parametrize("cfg_overrides, pause_s, raises, started", [

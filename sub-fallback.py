@@ -24,7 +24,9 @@ NO-CLOBBER PLACEMENT (`_place_sidecar`): right before writing, the file is re-pr
 CONSOLIDATED_SUBS appeared or any English sidecar now exists, this run backs off
 (ALREADY_CONSOLIDATED / SIDECAR_APPEARED). The sidecar goes to a hidden, UNIQUE-per-attempt
 temp file (`tempfile.mkstemp`) and is published with `os.link()`, never a rename, so an
-existing file is never touched and no truncated subtitle reaches the library.
+existing file is never touched and no truncated subtitle reaches the library. A video that
+already has a main English sidecar is skipped outright (SIDECAR_PRESENT): the watcher or
+the 05:00 `consolidate-subs.py --scan` owns it.
 
 SAME-STEM SIBLING VIDEOS: with `Episode.mp4` and `Episode.mkv` both present, a sidecar is
 ambiguous (`consolidate-watch.sh` tries `.mkv` first). Such a candidate is skipped
@@ -56,7 +58,6 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import signal
@@ -67,7 +68,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -98,8 +99,6 @@ from media_stack.subverify import (  # noqa: E402
 ensure_var_dirs()  # writer: lock file + jsonl log
 
 NEEDS_ENGLISH_STATE_FILE = VAR_STATE / "needs-english.json"   # written by consolidate-subs.py
-# Sidecars this script placed (and so verified); see `_sidecar_matches_our_placement`.
-SUB_FALLBACK_PLACEMENTS_FILE = VAR_STATE / "sub-fallback-placements.json"
 LOCK_FILE = VAR_RUN / "sub-fallback.lock"
 JSONL_FILE = VAR_LOG / "sub-fallback.jsonl"
 
@@ -310,36 +309,33 @@ def _wait_for_exit_unreaped(pid: int, timeout_s: float) -> bool:
         time.sleep(SUBPROCESS_EXIT_POLL_S)
 
 
-def _transcribe_in_subprocess(video: Path, audio_idx: int, cfg: Config,
-                              budget: PlaybackWaitBudget, workdir: Path,
-                              timeout_s: float) -> str:
-    """Run the transcribe child (`TMPDIR=workdir`) under a hard wall-clock timeout.
+class _ChildOutcome(NamedTuple):
+    returncode: int
+    timed_out: bool
+    stdout: str
+    stderr: str
 
-    The child gets `cfg`'s key/URL and `SUB_FALLBACK_MAX_WAIT_MIN` = `budget`'s CURRENT
-    remaining allowance; the seconds it spent waiting are deducted from `budget` on EVERY
-    exit path. Exit 2 maps to `PlaybackWaitTimeout`, exit 3 to `MissingJellyfinKey`.
 
-    `start_new_session=True` puts the child and its ffmpeg in one process group, which the
-    `finally` ALWAYS kills (timeout, Ctrl-C, SIGTERM's `SystemExit`, clean exit); only a
-    timeout becomes `ASRTimeout`. stdout/stderr go to FILES, never PIPEs, and the wait uses
-    `_wait_for_exit_unreaped`: kill the group FIRST, reap SECOND, leader unreaped between,
-    which makes `killpg` safe against pid reuse.
+def _run_child_in_own_group(
+    cmd: list[str], workdir: Path, role: str, timeout_s: float, *,
+    cwd: str | None = None, env: dict[str, str] | None = None,
+    after_exit: Callable[[], None] = lambda: None,
+) -> _ChildOutcome:
+    """Run `cmd` in its own session under a hard wall-clock timeout; never raises for the
+    child's own status (the caller maps `returncode`).
+
+    `start_new_session=True` puts the child and everything it spawns in one process group,
+    which the `finally` ALWAYS kills (timeout, Ctrl-C, SIGTERM's `SystemExit`, clean exit).
+    stdout/stderr go to FILES (`<role>.stdout`/`.stderr` in `workdir`), never PIPEs, and the
+    wait uses `_wait_for_exit_unreaped`: kill the group FIRST, reap SECOND, leader unreaped
+    between, which makes `killpg` safe against pid reuse. `after_exit` runs last in that
+    `finally`, after the output is read, on EVERY exit path.
     """
-    cmd = [sys.executable, "-m", "media_stack.subverify", "transcribe",
-           str(video), str(audio_idx), cfg.whisper_model, str(cfg.whisper_threads)]
-    remaining_wait_min = max(0.0, budget.remaining_s) / 60.0
-    env = {
-        **os.environ,
-        "TMPDIR": str(workdir),
-        "JELLYFIN_API_KEY": cfg.jellyfin_key,
-        "JELLYFIN_URL": cfg.jellyfin_url,
-        "SUB_FALLBACK_MAX_WAIT_MIN": f"{remaining_wait_min:g}",
-    }
-    stdout_path = workdir / "_transcribe.stdout"
-    stderr_path = workdir / "_transcribe.stderr"
+    stdout_path = workdir / f"{role}.stdout"
+    stderr_path = workdir / f"{role}.stderr"
     with open(stdout_path, "wb") as out_fh, open(stderr_path, "wb") as err_fh:
         proc = subprocess.Popen(
-            cmd, cwd=str(MEDIA_STACK_ROOT), env=env,
+            cmd, cwd=cwd, env=env,
             stdout=out_fh, stderr=err_fh,
             start_new_session=True,
         )
@@ -355,18 +351,45 @@ def _transcribe_in_subprocess(video: Path, audio_idx: int, cfg: Config,
         proc.wait()
         stdout = stdout_path.read_text(errors="replace")
         stderr = stderr_path.read_text(errors="replace")
-        budget.spend(_read_child_playback_wait_report(workdir))
-    if timed_out:
+        after_exit()
+    return _ChildOutcome(proc.returncode, timed_out, stdout, stderr)
+
+
+def _transcribe_in_subprocess(video: Path, audio_idx: int, cfg: Config,
+                              budget: PlaybackWaitBudget, workdir: Path,
+                              timeout_s: float) -> str:
+    """Run the transcribe child (`TMPDIR=workdir`) under a hard wall-clock timeout.
+
+    The child gets `cfg`'s key/URL and `SUB_FALLBACK_MAX_WAIT_MIN` = `budget`'s CURRENT
+    remaining allowance; the seconds it spent waiting are deducted from `budget` on EVERY
+    exit path. Only a timeout becomes `ASRTimeout`; exit 2 maps to `PlaybackWaitTimeout`,
+    exit 3 to `MissingJellyfinKey`. Process-group discipline: `_run_child_in_own_group`.
+    """
+    cmd = [sys.executable, "-m", "media_stack.subverify", "transcribe",
+           str(video), str(audio_idx), cfg.whisper_model, str(cfg.whisper_threads)]
+    remaining_wait_min = max(0.0, budget.remaining_s) / 60.0
+    env = {
+        **os.environ,
+        "TMPDIR": str(workdir),
+        "JELLYFIN_API_KEY": cfg.jellyfin_key,
+        "JELLYFIN_URL": cfg.jellyfin_url,
+        "SUB_FALLBACK_MAX_WAIT_MIN": f"{remaining_wait_min:g}",
+    }
+    outcome = _run_child_in_own_group(
+        cmd, workdir, "_transcribe", timeout_s, cwd=str(MEDIA_STACK_ROOT), env=env,
+        after_exit=lambda: budget.spend(_read_child_playback_wait_report(workdir)))
+    if outcome.timed_out:
         raise ASRTimeout(f"transcription exceeded {timeout_s:g}s: {video}")
-    if proc.returncode == 2:
+    if outcome.returncode == 2:
         raise PlaybackWaitTimeout(
             f"transcription subprocess hit its own playback-wait bound: {video}")
-    if proc.returncode == 3:
+    if outcome.returncode == 3:
         raise MissingJellyfinKey(
             f"transcription subprocess had no JELLYFIN_API_KEY: {video}")
-    if proc.returncode != 0:
-        raise RuntimeError(f"transcribe subprocess failed ({video}): {(stderr or '').strip()[:300]}")
-    return stdout
+    if outcome.returncode != 0:
+        raise RuntimeError(
+            f"transcribe subprocess failed ({video}): {(outcome.stderr or '').strip()[:300]}")
+    return outcome.stdout
 
 
 def _pipeline_lock_is_free(path: Path) -> bool:
@@ -410,9 +433,8 @@ def _video_identity(video: Path) -> tuple[int, int, int, int, int] | None:
 
 
 def _video_identity_sans_dev(video: Path) -> list[int] | None:
-    """`_video_identity` minus `st_dev`, as a list, for the placement record. A legacy
-    three-field record (no ctime) counts as changed (no retrigger); the tracker identity
-    means only "same release" (see `media_stack.fileid.identity_matches`)."""
+    """`_video_identity` minus `st_dev`, as a list, to compare with the tracker's stored
+    identity, which means only "same release" (see `media_stack.fileid.identity_matches`)."""
     identity = _video_identity(video)
     return list(identity[1:]) if identity else None
 
@@ -458,118 +480,22 @@ def _has_forced_sidecar(video: Path) -> bool:
     return any(is_forced for _, is_forced, _ in find_sidecar_subs(video))
 
 
-def _load_placements(path: Path) -> dict:
-    """`{}` on any failure (warning unless missing). Not blinding: no record means no
-    retrigger (`SIDECAR_PRESENT`)."""
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text())
-    except Exception as exc:
-        log(f"WARNING: {path} unreadable ({type(exc).__name__}: {exc}); "
-            f"treating as no known placements this run")
-        return {}
-    if not isinstance(data, dict):
-        log(f"WARNING: {path} has an unexpected shape (not a JSON object); "
-            f"treating as no known placements this run")
-        return {}
-    return data
-
-
-def _record_placement(video: Path, dest: Path, text: str, source: str) -> None:
-    """Record that this script placed (and verified) `dest`, bound to the video's identity
-    (catches a replacement under an untouched sidecar), to authorize a later retrigger.
-    Failures are logged and swallowed so a placement is never reported as failed."""
-    key = str(video.resolve())
-    record = {
-        "sidecar": str(dest),
-        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-        "source": source,
-        "placed_at": _utc_now_iso(),
-        "video_identity": _video_identity_sans_dev(video),
-    }
-
-    def _upsert(state: dict) -> dict:
-        state[key] = record
-        return state
-
-    try:
-        mutate_state(SUB_FALLBACK_PLACEMENTS_FILE, _upsert)
-    except Exception as exc:
-        log(f"WARNING: {SUB_FALLBACK_PLACEMENTS_FILE} upsert failed for "
-            f"{video} ({type(exc).__name__}: {exc}); placement not recorded")
-
-
-def _clear_placement(key: str) -> None:
-    """Drop `key` from the placements file; failures are logged and swallowed."""
-    def _drop(state: dict) -> dict:
-        state.pop(key, None)
-        return state
-
-    try:
-        mutate_state(SUB_FALLBACK_PLACEMENTS_FILE, _drop)
-    except Exception as exc:
-        log(f"WARNING: {SUB_FALLBACK_PLACEMENTS_FILE} clear failed for {key} "
-            f"({type(exc).__name__}: {exc})")
-
-
-def _sidecar_matches_our_placement(video: Path, sidecar: Path) -> bool:
-    """`sidecar` is the one this script placed for `video` (same path and sha256) AND
-    `video` is unchanged since; any other sidecar or a swapped video must not be
-    retriggered onto."""
-    record = _load_placements(SUB_FALLBACK_PLACEMENTS_FILE).get(str(video.resolve()))
-    if not isinstance(record, dict):
-        return False
-    recorded_sidecar = record.get("sidecar")
-    recorded_sha256 = record.get("sha256")
-    recorded_video_identity = record.get("video_identity")
-    if not isinstance(recorded_sidecar, str) or not isinstance(recorded_sha256, str):
-        return False
-    if Path(recorded_sidecar) != sidecar:
-        return False
-    current = _video_identity_sans_dev(video)
-    if not identity_matches(recorded_video_identity, current, allow_legacy=False):
-        return False
-    try:
-        current_bytes = sidecar.read_bytes()
-    except OSError:
-        return False
-    return hashlib.sha256(current_bytes).hexdigest() == recorded_sha256
-
-
 def _run_consolidate_subs_directly(video: Path, timeout_s: float, workdir: Path) -> tuple[bool, str]:
     """Run `consolidate-subs.py` as the watcher's inotify trigger would, when the
     `close_write` event could not be generated. Safe alongside a real watcher run (the
     per-file flock makes the loser a harmless SKIP).
 
-    Same process-group discipline as `_transcribe_in_subprocess`. Returns
-    `(ran_ok, detail)`, informational only: `wait_for_pipeline` verifies the tag landed.
+    Same process-group discipline as `_transcribe_in_subprocess`
+    (`_run_child_in_own_group`). Returns `(ran_ok, detail)`, informational only:
+    `wait_for_pipeline` verifies the tag landed.
     """
     script = MEDIA_STACK_ROOT / "consolidate-subs.py"
-    stdout_path = workdir / "_consolidate_direct.stdout"
-    stderr_path = workdir / "_consolidate_direct.stderr"
-    with open(stdout_path, "wb") as out_fh, open(stderr_path, "wb") as err_fh:
-        proc = subprocess.Popen(
-            [sys.executable, str(script), str(video)],
-            stdout=out_fh, stderr=err_fh,
-            start_new_session=True,
-        )
-    pgid = proc.pid  # new session: pgid == pid
-    timed_out = False
-    try:
-        timed_out = _wait_for_exit_unreaped(pgid, timeout_s)
-    finally:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        proc.wait()
-        stdout = stdout_path.read_text(errors="replace")
-        stderr = stderr_path.read_text(errors="replace")
-    if timed_out:
+    outcome = _run_child_in_own_group(
+        [sys.executable, str(script), str(video)], workdir, "_consolidate_direct", timeout_s)
+    if outcome.timed_out:
         return False, f"timed out after {timeout_s:g}s"
-    detail = (stdout or stderr or "").strip()[-300:]
-    return proc.returncode == 0, detail
+    detail = (outcome.stdout or outcome.stderr or "").strip()[-300:]
+    return outcome.returncode == 0, detail
 
 
 def _sidecar_dest(video: Path, source: str) -> Path:
@@ -595,7 +521,7 @@ def _cleanup_stale_sidecar_temps(dest: Path) -> None:
         pass
 
 
-def _place_sidecar(video: Path, dest: Path, text: str, source: str,
+def _place_sidecar(video: Path, dest: Path, text: str,
                    *, video_identity: tuple[int, int, int, int, int] | None,
                    pipeline_timeout_s: float, rec: dict, workdir: Path) -> str | None:
     """Publish `text` as `dest` atomically, never exposing partial content or clobbering.
@@ -615,11 +541,10 @@ def _place_sidecar(video: Path, dest: Path, text: str, source: str,
     `OSError` is `PLACE_FAILED`, NEVER a fallback to a clobbering rename.
 
     After the link, `dest` is opened `O_WRONLY|O_APPEND` and closed unwritten: `os.link()`
-    fires only `IN_CREATE`, so this generates the `close_write` the watcher reacts to. The
-    placement is recorded IMMEDIATELY after the link, before the nudge, so a nudge failure
-    cannot skip it (`_record_placement` itself logs and swallows a failed state write). A failing nudge is recoverable: fall
-    back to `_run_consolidate_subs_directly` (bounded by `pipeline_timeout_s`), record
-    `rec["event_fallback_*"]`, still return `None`; `wait_for_pipeline` verifies the outcome.
+    fires only `IN_CREATE`, so this generates the `close_write` the watcher reacts to. A failing
+    nudge is recoverable: fall back to `_run_consolidate_subs_directly` (bounded by
+    `pipeline_timeout_s`), record `rec["event_fallback_*"]`, still return `None`;
+    `wait_for_pipeline` verifies the outcome.
     """
     _cleanup_stale_sidecar_temps(dest)
     tmp_fd, tmp_name = tempfile.mkstemp(
@@ -654,8 +579,6 @@ def _place_sidecar(video: Path, dest: Path, text: str, source: str,
             return "SIDECAR_APPEARED"
         except OSError:
             return "PLACE_FAILED"
-
-        _record_placement(video, dest, text, source)
 
         try:
             append_fd = os.open(dest, os.O_WRONLY | os.O_APPEND)
@@ -803,23 +726,9 @@ def process_candidate(video: Path, cfg: Config, jellyfin: JellyfinClient,
             rec["result"] = "FORCED_SIDECAR_PRESENT"
             return rec
 
-        main_sidecars = _main_sidecars(video)
-        if main_sidecars:
-            # Untagged video with a main sidecar: the close_write was probably missed.
-            # Retrigger ONLY for exactly one sidecar that is our recorded placement for this
-            # exact video (language alone can't tell the right episode from a wrong one);
-            # anything else is `SIDECAR_PRESENT`, no action.
-            if len(main_sidecars) == 1 and _sidecar_matches_our_placement(
-                    video, main_sidecars[0][0]):
-                ran_ok, detail = _run_consolidate_subs_directly(
-                    video, cfg.pipeline_timeout_min * 60, workdir)
-                reached, waited_s = wait_for_pipeline(video, cfg.pipeline_timeout_min * 60)
-                rec["result"] = "PIPELINE_RETRIGGERED"
-                rec["pipeline_retrigger_ran_ok"] = ran_ok
-                rec["pipeline_retrigger_detail"] = detail
-                rec["pipeline_retrigger_tag_landed"] = reached
-                rec["pipeline_retrigger_wait_s"] = waited_s
-                return rec
+        if _main_sidecars(video):
+            # Never touch an existing sidecar. If the watcher missed its close_write, the
+            # 05:00 `consolidate-subs.py --scan` picks it up.
             rec["result"] = "SIDECAR_PRESENT"
             return rec
 
@@ -881,7 +790,7 @@ def process_candidate(video: Path, cfg: Config, jellyfin: JellyfinClient,
         rec["source"] = source
         wait_while_playing(jellyfin, cfg, budget)  # ASR/subliminal take minutes; re-check before placing
         dest = _sidecar_dest(video, source)
-        block_reason = _place_sidecar(video, dest, chosen_text, source,
+        block_reason = _place_sidecar(video, dest, chosen_text,
                                       video_identity=initial_identity,
                                       pipeline_timeout_s=cfg.pipeline_timeout_min * 60,
                                       rec=rec, workdir=workdir)
@@ -962,9 +871,6 @@ def main() -> int:
         if kept:
             msg += f"; {kept} re-recorded since the snapshot and kept"
         log(msg)
-        # Every stale key, even one kept above: losing a retrigger in that race is harmless.
-        for key in stale:
-            _clear_placement(key)
 
     if not candidates:
         log("nothing to do (0 candidates past the age threshold)")
