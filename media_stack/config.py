@@ -28,6 +28,11 @@ ENG_SIDECAR_SUFFIXES: tuple[str, ...] = (
 # this fraction of the video's duration (margin for long silent endings/credits).
 SUBLIMINAL_MIN_COVERAGE: float = 0.70
 
+# A processed output may run at most max(OUTPUT_DURATION_SLACK_S, OUTPUT_DURATION_SLACK_FRAC *
+# source) shorter than its source before it may replace it (probe.duration_shortfall).
+OUTPUT_DURATION_SLACK_S: float = 2.0
+OUTPUT_DURATION_SLACK_FRAC: float = 0.01
+
 
 ASS_OVERRIDE_RE = re.compile(r"\{\\[^}]*\}")
 HTML_FONT_RE    = re.compile(r"</?font[^>]*>", re.IGNORECASE)

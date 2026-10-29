@@ -117,6 +117,7 @@ class Harness:
         self.extractions = []   # indices of the embedded tracks the pass tried to extract
         self.window_failure = window_failure
         self.out_edit = None    # edits the remuxed file's probed streams (to fake a bad mux)
+        self.out_duration = DURATION  # the remuxed file's probed container duration
         self.last_keep = []     # source subtitle indices the remux was told to keep
         self.on_sync = None     # called inside ffsubsync (before the remux)
         self.on_verify = None   # called when the remux output is probed (the verify)
@@ -146,7 +147,7 @@ class Harness:
                         "disposition": {"default": 1, "forced": 0}})
         if self.out_edit:
             self.out_edit(streams)
-        return {"streams": streams, "format": {"duration": str(DURATION), "tags": {}}}
+        return {"streams": streams, "format": {"duration": str(self.out_duration), "tags": {}}}
 
     def _probe(self, p):
         p = Path(p)
@@ -360,6 +361,30 @@ def test_a_remux_that_is_not_the_source_plus_the_new_subtitle_fails_and_leaves_t
     assert h.normalize_calls == []
 
 
+def test_an_upgrade_whose_remux_is_shorter_than_the_source_fails_and_leaves_the_original(
+        tmp_path, monkeypatch):
+    """Right streams and flags but a truncated mux (2400 s in, 400 s out): the duration guard refuses the swap."""
+    h = _upgrade_ready(tmp_path, monkeypatch)
+    h.out_duration = 400.0
+    result = h.run()
+
+    assert result["status"] == "FAIL" and result["detail"].startswith("duration verify: ")
+    assert h.media.read_bytes() == MEDIA_BYTES                  # original untouched
+    assert not list(tmp_path.glob("*.tmp.mkv"))                 # tmp output removed
+    assert h.sidecars_left() == ["Movie (2024).en.srt"]         # nothing consumed
+    h.set_tag.assert_not_called()
+    assert h.normalize_calls == []
+
+
+@pytest.mark.parametrize("out_duration", [DURATION, DURATION - 20.0, DURATION + 5.0],
+                         ids=["equal", "within-one-percent", "longer"])
+def test_an_upgrade_whose_remux_is_as_long_as_the_source_swaps(tmp_path, monkeypatch, out_duration):
+    h = _upgrade_ready(tmp_path, monkeypatch)
+    h.out_duration = out_duration
+    assert h.run()["status"] == "FIXED"
+    assert h.media.read_bytes() == b"MUXED"
+
+
 def test_only_the_verified_sidecar_is_a_candidate(tmp_path, monkeypatch):
     """A longer wrong-episode sidecar would out-score the right one; it is not verified, so not a candidate."""
     right, asr = _episode(1)
@@ -383,8 +408,9 @@ def test_an_upgrade_never_runs_loudness_normalization(tmp_path, monkeypatch, nor
     assert h.normalize_calls == []
     h.set_tag.assert_called_once()
     assert result["detail"].startswith("UPGRADE generated->real ")
-    # the gate's probe of the file, then the verify's probe of the remux output
-    assert [p.name.endswith(".tmp.mkv") for p in h.probes] == [False, True]
+    # the gate's probe of the file, the verify's probe of the remux output, then the duration guard's
+    # probes of the file and the output right before the swap
+    assert [p.name.endswith(".tmp.mkv") for p in h.probes] == [False, True, False, True]
     assert not hasattr(cs, "_ensure_normalized_tag") and not hasattr(cs, "set_normalized_tag")
 
 
@@ -643,7 +669,8 @@ def test_no_sidecar_means_no_extra_probe_and_no_window_read(tmp_path, monkeypatc
 
 
 def test_unprocessed_file_with_a_real_sidecar_takes_the_ordinary_full_pass(tmp_path, monkeypatch):
-    """No CONSOLIDATED_SUBS tag: not an upgrade, so the audio policy and normalization run, with one probe."""
+    """No CONSOLIDATED_SUBS tag: not an upgrade, so the audio policy and normalization run, with no probe
+    beyond the first and the duration guard's pair (file, output) before the swap."""
     srt_text, asr = _episode(1)
     h = Harness(tmp_path, monkeypatch, sidecars=[(".en.srt", srt_text)], asr=asr,
                 info=_info(tagged=False, normalized=False, subs=()))
@@ -653,7 +680,7 @@ def test_unprocessed_file_with_a_real_sidecar_takes_the_ordinary_full_pass(tmp_p
     assert h.window_reads == []
     assert h.audio_policy_calls == (1, 1, 1)
     assert len(h.normalize_calls) == 1
-    assert len(h.probes) == 1
+    assert [p.name.endswith(".tmp.mkv") for p in h.probes] == [False, False, True]
     assert "upgraded" not in h.state()
 
 

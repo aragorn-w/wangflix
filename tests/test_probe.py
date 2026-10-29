@@ -11,8 +11,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from media_stack.probe import (
-    already_normalized, already_processed, audio_stream_duration, file_key, parse_duration,
-    primary_audio_stream, probe, probe_duration, real_video_streams,
+    already_normalized, already_processed, audio_stream_duration, duration_shortfall, file_key,
+    parse_duration, primary_audio_stream, probe, probe_duration, real_video_streams,
 )
 
 
@@ -233,3 +233,62 @@ def test_probe_duration_restriction_still_allows_the_container_value():
     payload = {"format": {"duration": "900"}, "streams": [_PROGRAM_NO_DURATION, _COMMENTARY]}
     with patch("media_stack.probe.subprocess.run", return_value=_ffprobe_returns(payload)):
         assert probe_duration(Path("/v.mkv"), audio_index=1, allowed_indices={1}) == 900.0
+
+
+# --- duration_shortfall: a processed output must not run shorter than its source ---
+
+def _dur(seconds):
+    return {"format": {"duration": seconds}}
+
+
+@pytest.mark.parametrize("src, out", [
+    ("1320.0", "1320.0"),       # equal
+    ("1320.0", "1325.5"),       # longer
+    ("1320.0", "1307.0"),       # 13 s short: inside 1% of a 22-minute episode
+    ("100.0", "98.0"),          # exactly the 2 s floor on a short source
+    ("9000.0", "8911.0"),       # 89 s short: inside 1% of a 2.5-hour film
+], ids=["equal", "longer", "within-one-percent", "exactly-the-floor", "long-film-within-one-percent"])
+def test_duration_shortfall_accepts_equal_longer_and_within_tolerance(src, out):
+    logged = []
+    assert duration_shortfall(_dur(src), _dur(out), logged.append) is None
+    assert logged == []
+
+
+@pytest.mark.parametrize("src, out", [
+    ("1320.0", "169.0"),        # Family Guy S19E01: 22 min in, 2:49 out
+    ("1380.0", "438.0"),        # Solar Opposites S04E01: 23 min in, 7:18 out
+    ("1320.0", "1306.0"),       # 14 s short: just over 1% of 22 minutes
+    ("100.0", "97.9"),          # just over the 2 s floor
+], ids=["family-guy", "solar-opposites", "just-over-one-percent", "just-over-the-floor"])
+def test_duration_shortfall_rejects_a_short_output(src, out):
+    reason = duration_shortfall(_dur(src), _dur(out), lambda m: None)
+    assert reason is not None and f"{float(out):.1f}s" in reason
+
+
+@pytest.mark.parametrize("src_info", [
+    {}, {"format": {}}, _dur("N/A"), _dur("0"), _dur("0.000000"), _dur(None), _dur("garbage"),
+], ids=["no-format", "empty-format", "n-a", "zero", "zero-float", "none", "garbage"])
+def test_duration_shortfall_skips_when_the_source_duration_is_unknown(src_info):
+    logged = []
+    assert duration_shortfall(src_info, _dur("5.0"), logged.append) is None
+    assert len(logged) == 1 and "SKIPPED" in logged[0]
+
+
+@pytest.mark.parametrize("out_info", [
+    {}, {"format": {}}, _dur("N/A"), _dur("0"),
+], ids=["no-format", "empty-format", "n-a", "zero"])
+def test_duration_shortfall_fails_when_only_the_output_duration_is_unreadable(out_info):
+    reason = duration_shortfall(_dur("1320.0"), out_info, lambda m: None)
+    assert reason is not None and "unreadable" in reason
+
+
+@pytest.mark.parametrize("src_info, out_info, who", [
+    (None, _dur("1320.0"), "source"),
+    (_dur("1320.0"), None, "output"),
+    ({"format": {}}, None, "output"),     # an unknown source duration never excuses an unprobeable output
+    (None, None, "source"),
+], ids=["source-probe-failed", "output-probe-failed", "output-probe-failed-source-duration-unknown",
+        "both-probes-failed"])
+def test_duration_shortfall_fails_when_a_file_cannot_be_probed_at_all(src_info, out_info, who):
+    reason = duration_shortfall(src_info, out_info, lambda m: None)
+    assert reason == f"{who} could not be probed"

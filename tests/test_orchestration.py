@@ -29,6 +29,13 @@ def _isolate_needs_english_state(tmp_path, monkeypatch):
     monkeypatch.setattr(cs, "NEEDS_ENGLISH_STATE_FILE", tmp_path / "needs-english.json")
 
 
+@pytest.fixture(autouse=True)
+def _no_real_ffprobe(monkeypatch):
+    """The swap helper probes the source and the output for the duration guard: never the real ffprobe
+    (a readable file with no duration, so the guard skips)."""
+    monkeypatch.setattr(cs, "probe", lambda p: {"streams": []})
+
+
 def _media(tmp_path: Path) -> Path:
     p = tmp_path / "Movie (2024).mkv"
     p.write_bytes(b"\x1a\x45\xdf\xa3")
@@ -181,6 +188,132 @@ def test_expose_tag_normalize_collision_under_lock_fails(tmp_path):
     assert early is not None and early["status"] == "FAIL"
     assert replacement.read_bytes() == b"SIBLING"    # not overwritten
     assert norm.call_count == 0                       # never reached normalize
+
+
+# --- duration guard: the swap helper refuses an output shorter than the source ---
+
+def _timed(src_duration, out_duration):
+    """A `probe` fake: the temp output (`*.tmp.mkv`) gets `out_duration`, any other file `src_duration`
+    (None = ffprobe reported no duration)."""
+    def fake(p):
+        d = out_duration if Path(p).name.endswith(".tmp.mkv") else src_duration
+        return {"streams": [], "format": {} if d is None else {"duration": d}}
+    return fake
+
+
+@pytest.mark.parametrize("suffix", [".mkv", ".mp4"])
+def test_expose_tag_normalize_refuses_an_output_shorter_than_the_source(tmp_path, suffix):
+    out, path, replacement = _mux_and_dest(tmp_path, suffix)
+    with patch.object(cs, "probe", side_effect=_timed("1320.0", "169.0")), \
+         patch.object(cs, "set_consolidated_tag") as tag, \
+         patch.object(cs, "_normalize_audio_inline") as norm:
+        early, tag_written = cs._expose_tag_normalize(out, path, replacement, str(path))
+    assert early is not None and early["status"] == "FAIL"
+    assert early["detail"].startswith("duration verify: ")
+    assert tag_written is False
+    assert path.read_bytes() == b"ORIGINAL"                # original untouched
+    assert replacement.exists() == (replacement == path)   # no .mkv created beside an .mp4
+    assert not out.exists()                                # temp output removed
+    assert tag.call_count == 0 and norm.call_count == 0
+
+
+@pytest.mark.parametrize("src_duration, out_duration", [
+    ("1320.0", "1320.0"),    # equal
+    ("1320.0", "1307.0"),    # within 1%
+    ("100.0", "98.0"),       # exactly the 2 s floor
+    (None, "169.0"),         # source duration unknown: skipped, not a block
+], ids=["equal", "within-tolerance", "exactly-the-floor", "source-duration-missing"])
+def test_expose_tag_normalize_swaps_an_output_within_tolerance_or_unchecked(
+        tmp_path, src_duration, out_duration):
+    out, path, replacement = _mux_and_dest(tmp_path, ".mp4")
+    with patch.object(cs, "probe", side_effect=_timed(src_duration, out_duration)), \
+         patch.object(cs, "set_consolidated_tag", return_value=True), \
+         patch.object(cs, "_normalize_audio_inline"):
+        early, tag_written = cs._expose_tag_normalize(out, path, replacement, str(path))
+    assert early is None and tag_written is True
+    assert replacement.read_bytes() == b"MUXED"
+    assert not path.exists()                                # the .mp4 original is replaced by the .mkv
+
+
+@pytest.mark.parametrize("failing", ["source", "output"])
+def test_expose_tag_normalize_refuses_when_a_file_cannot_be_probed(tmp_path, failing):
+    """A transient ffprobe failure at the swap is not a licence to skip the check."""
+    out, path, replacement = _mux_and_dest(tmp_path, ".mkv")
+
+    def fake(p):
+        unprobeable = out if failing == "output" else path
+        return None if Path(p) == unprobeable else {"streams": [], "format": {"duration": "1320.0"}}
+
+    with patch.object(cs, "probe", side_effect=fake), \
+         patch.object(cs, "set_consolidated_tag") as tag, \
+         patch.object(cs, "_normalize_audio_inline") as norm:
+        early, tag_written = cs._expose_tag_normalize(out, path, replacement, str(path))
+    assert early is not None and early["status"] == "FAIL"
+    assert early["detail"] == f"duration verify: {failing} could not be probed"
+    assert path.read_bytes() == b"ORIGINAL" and not out.exists()
+    assert tag.call_count == 0 and norm.call_count == 0
+
+
+_ENGLISH_SRT = ("1\n00:00:01,000 --> 00:00:03,000\nI don't know what you want from me.\n\n"
+                "2\n00:00:04,000 --> 00:00:06,000\nWe should get out of here before they come back.\n")
+
+
+def _full_pass(tmp_path, src_duration, out_duration):
+    """The ordinary full pass through `_process_locked` (English sidecar muxed in), every external tool faked;
+    the fake remux writes `MUXED` and the probes report the given container durations."""
+    media = _media(tmp_path)
+    sidecar = tmp_path / "Movie (2024).en.srt"
+    sidecar.write_text(_ENGLISH_SRT)
+    streams = [{"index": 0, "codec_type": "video", "codec_name": "h264"},
+               {"index": 1, "codec_type": "audio", "codec_name": "ac3", "tags": {"language": "eng"}}]
+
+    def fake_probe(p):
+        d = out_duration if Path(p).name.endswith(".tmp.mkv") else src_duration
+        return {"streams": streams, "format": {} if d is None else {"duration": d}}
+
+    def fake_remux(src, dst, *a, **k):
+        Path(dst).write_bytes(b"MUXED")
+        return True, "ok"
+
+    with patch.object(cs, "load_state", return_value={}), \
+         patch.object(cs, "probe", side_effect=fake_probe), \
+         patch.object(cs, "already_processed", return_value=False), \
+         patch.object(cs, "find_sidecar_subs", return_value=[(sidecar, False, False)]), \
+         patch.object(cs, "run_ffsubsync", return_value=False), \
+         patch.object(cs, "original_language_for", return_value=None), \
+         patch.object(cs, "get_audio_lang_pref", return_value=({"eng"}, "eng", False)), \
+         patch.object(cs, "select_keep_audio", return_value=[1]), \
+         patch.object(cs, "remux", side_effect=fake_remux), \
+         patch.object(cs, "set_consolidated_tag", return_value=True) as tag, \
+         patch.object(cs, "_normalize_audio_inline") as norm, \
+         patch.object(cs, "update_state_entry") as state:
+        result = cs._process_locked(media, str(media), dry_run=False)
+    return result, media, sidecar, tag, norm, state
+
+
+def test_full_pass_remux_shorter_than_the_source_fails_and_leaves_the_original(tmp_path):
+    """The Family Guy S19E01 case: 22 min in, a 2:49 mux out. The pass FAILs with the file, its sidecar and the
+    state cache exactly as they were."""
+    result, media, sidecar, tag, norm, state = _full_pass(tmp_path, "1320.0", "169.0")
+
+    assert result["status"] == "FAIL" and result["detail"].startswith("duration verify: ")
+    assert media.read_bytes() == b"\x1a\x45\xdf\xa3"           # original untouched
+    assert not list(tmp_path.glob("*.tmp.mkv"))                  # tmp output removed
+    assert sidecar.exists()                                      # subtitle not consumed
+    assert tag.call_count == 0 and norm.call_count == 0
+    state.assert_not_called()
+
+
+@pytest.mark.parametrize("src_duration, out_duration", [
+    ("1320.0", "1320.0"), ("1320.0", "1307.0"), (None, "169.0"),
+], ids=["equal", "within-one-percent", "source-duration-missing"])
+def test_full_pass_remux_as_long_as_the_source_or_unchecked_swaps(tmp_path, src_duration, out_duration):
+    result, media, sidecar, tag, norm, _ = _full_pass(tmp_path, src_duration, out_duration)
+
+    assert result["status"] == "FIXED"
+    assert media.read_bytes() == b"MUXED"
+    assert not sidecar.exists()                                  # consumed as usual
+    tag.assert_called_once()
 
 
 # --- _normalize_audio_inline: size-scaled timeout + process-group kill -------

@@ -37,6 +37,7 @@ Never-weaken rules; symbols are in `consolidate-subs.py` unless a file is named.
 - **Audio:** English primary; Japanese for anime or `/anime/` paths; Korean for Korean cinema; drop commentary, audio-description, non-primary dubs. `DUAL_AUDIO_KEYWORDS` is checked BEFORE the anime rule. `select_keep_audio` membership is FAMILY-based (`canonical_lang`), never raw alias strings.
 - **Original language** (`media_stack/arrlang.py`): `eng`/`jpn`/`kor` else `None`, never a made-up code; beats the Matroska `default` flag. With `None`: `original` before EITHER's `default` for BOTH jpn and kor; `default` alone neither promotes a language nor drops the foreign track. Index an Arr record only when its path's PARENT is `ARR_MOVIES_ROOT`/`ARR_TV_ROOT`; 2+ records sharing a basename are ambiguous -> `None`.
 - **Container:** final mux is mkvmerge, never ffmpeg (zero-cue files). Cover-art removal is by CODEC NAME, so genuine MJPEG motion video is dropped too (deliberate; silent beside a real video stream).
+- **Duration guard:** `_expose_tag_normalize` (the one swap, shared by the full, cleanup and upgrade passes) compares container durations via `probe.duration_shortfall` right before `os.replace`: output < source - max(`OUTPUT_DURATION_SLACK_S`, `OUTPUT_DURATION_SLACK_FRAC` x source) is FAIL "duration verify: ...", tmp deleted, original untouched. A readable source with an unknown or zero duration skips (logged); an unprobeable source or output, or an output with no duration, fails. Two episodes were once truncated by a short remux.
 - **Idempotency:** `var/state/consolidate-subs.state.json` + mkv tag `CONSOLIDATED_SUBS=v2`; bump `PIPELINE_VERSION` to re-flow.
 - **File identity includes `st_ctime_ns`** at every trust boundary; a persisted three-field placement record counts as changed. Three-field `[ino, size, mtime_ns]` stays DELIBERATELY for `needs-english.json` (`identity_matches(..., allow_legacy=True)`) and `audio-lang-check.py` (ctime moves on Arr hardlink changes).
 - **Working files** only via `_workfile(workdir, role, suffix)` (`mkstemp`), never names derived from the video, a sidecar or another working file.
@@ -86,6 +87,7 @@ Four `_process_locked` call sites (NEEDS_BAZARR/FAIL variants, incl. a sublimina
 ### normalize-audio.py (EBU R128 -23 LUFS)
 
 - Two-pass `loudnorm`, tag `NORMALIZED_AUDIO=v1`. Pass 2 maps real motion video only (`probe.real_video_streams`; a bare `-map 0:v` carried cover art and stalled Jellyfin Android TV) and preserves EVERY audio track: only the primary is re-encoded, the rest stream-copied with per-stream specifiers (`-c:a:N`/`-filter:a:N`/`-ac:a:N`, never bare).
+- Before the swap `duration_shortfall` (same rule as consolidate's duration guard) compares the remux output with the source: short = `RuntimeError` -> FAIL "duration regressed", temps removed, original untouched.
 - Inline run (`_normalize_audio_inline`): the outer cap is `loudness.normalize_budget_s(size)`, never fixed; the child runs in its own session and its whole process group is killed on expiry or interrupt. No separate sweep or cron job: only inline from the full pass.
 
 ### Triggers (schedules: `ops/cron.d/media-stack.crontab`)

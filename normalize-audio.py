@@ -16,8 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from media_stack.paths import VAR_LOG, ensure_var_dirs  # noqa: E402
 ensure_var_dirs()
 from media_stack.probe import (  # noqa: E402
-    ffprobe_strict as ffprobe, already_normalized, primary_audio_stream,
-    real_video_streams,
+    ffprobe_strict as ffprobe, already_normalized, duration_shortfall,
+    primary_audio_stream, real_video_streams,
 )
 from media_stack.loudness import (  # noqa: E402
     AAC_BITRATE, DEFAULT_AAC_BITRATE, TARGET_I, TARGET_LRA, TARGET_TP,
@@ -236,6 +236,10 @@ def _process_file_inner_locked(src: Path, path_str: str, dry_run: bool) -> dict:
 
         new_info = ffprobe(remux_out)
         _check_stream_regression(info, new_info)
+        # A short remux output once replaced full episodes.
+        problem = duration_shortfall(info, new_info, log)
+        if problem:
+            raise RuntimeError(f"duration regressed: {problem}")
 
         if not _replace_and_tag(src, remux_out, final_path, backup_path):
             return {"path": path_str, "status": "TAG_FAIL",

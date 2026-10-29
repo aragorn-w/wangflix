@@ -30,7 +30,8 @@ from media_stack.lang import (  # noqa: E402
     ENG_AUDIO_LANGS, JPN_AUDIO_LANGS, KOR_AUDIO_LANGS, canonical_lang, is_english_tag,
 )
 from media_stack.probe import (  # noqa: E402
-    already_processed, file_key, parse_duration, probe, real_video_streams,
+    already_processed, duration_shortfall, file_key, parse_duration, probe,
+    real_video_streams,
 )
 from media_stack.fileid import (  # noqa: E402
     Identity, file_identity, identity_from_stat, identity_matches,
@@ -289,7 +290,8 @@ def _expose_tag_normalize(out: Path, path: Path, replacement: Path,
     default, bypassing `confident_default_audio`.
 
     Returns `(early_result, tag_written)`; `early_result` is a SKIP (destination locked) or
-    FAIL (sibling .mkv appeared) dict for the caller to return, else None. A failed tag is
+    FAIL (sibling .mkv appeared, or `out` is shorter than the source) dict for the caller to
+    return, else None. A failed tag is
     logged, not rolled back (state.json backstops idempotency).
     """
     from media_stack.locking import acquire_file_lock
@@ -309,6 +311,13 @@ def _expose_tag_normalize(out: Path, path: Path, replacement: Path,
             return ({"path": path_str, "status": "FAIL",
                      "detail": f"collision: sibling .mkv appeared for {path.name}"},
                     False)
+        # A short remux output once replaced full episodes: compare durations before the swap.
+        problem = duration_shortfall(probe(path), probe(out), log)
+        if problem:
+            if out.exists():
+                out.unlink()
+            return ({"path": path_str, "status": "FAIL",
+                     "detail": f"duration verify: {problem}"}, False)
         # atomic same-filesystem rename: readers see the old file or the finished mux, never a partial one
         os.replace(out, replacement)
         if replacement != path and path.exists():

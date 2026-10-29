@@ -183,6 +183,47 @@ def test_only_forced_english_branch_also_cleans_without_dropping_audio(tmp_path)
     assert r.tag.call_count == 0
 
 
+def _timed_probe(media, streams, verify, src_duration, out_duration):
+    """A `probe` fake giving the source `streams` a container duration and `verify` (the cleanup output) its own."""
+    def fake(p):
+        if Path(p) == media:
+            return {"streams": streams, "format": {"duration": src_duration}}
+        return {**verify, "format": {"duration": out_duration}}
+    return fake
+
+
+_DUB_STREAMS = [_v(), _a(1, "fre", default=1), _a(2, "eng", "aac"), _s(3, "fre")]
+
+
+def _run_timed_cleanup(tmp_path, src_duration, out_duration):
+    media = tmp_path / "Movie (2024).mkv"
+    return _run(tmp_path, _DUB_STREAMS, arr_lang="eng",
+                probe=dict(side_effect=_timed_probe(
+                    media, _DUB_STREAMS, _verify_streams(audio_defaults=(False, True)),
+                    src_duration, out_duration)))
+
+
+def test_cleanup_remux_shorter_than_the_source_fails_and_leaves_the_original(tmp_path):
+    """A truncated cleanup mux (22 min in, 2:49 out) with otherwise correct counts and flags: FAIL, nothing swapped."""
+    r = _run_timed_cleanup(tmp_path, "1320.0", "169.0")
+
+    assert r.result["status"] == "FAIL" and r.result["detail"].startswith("duration verify: ")
+    assert r.media.read_bytes() == b"\x1a\x45\xdf\xa3"           # original untouched
+    assert not list(tmp_path.glob("*.tmp.mkv"))                  # tmp output removed
+    assert r.tag.call_count == 0
+    r.norm.assert_not_called()
+
+
+@pytest.mark.parametrize("src_duration, out_duration", [
+    ("1320.0", "1320.0"), ("1320.0", "1307.0"), (None, "169.0"),
+], ids=["equal", "within-one-percent", "source-duration-missing"])
+def test_cleanup_remux_as_long_as_the_source_or_unchecked_swaps(tmp_path, src_duration, out_duration):
+    r = _run_timed_cleanup(tmp_path, src_duration, out_duration)
+
+    assert r.result["status"] == "NEEDS_BAZARR" and "cleaned" in r.result["detail"]
+    assert r.media.read_bytes() == b"CLEANED"
+
+
 @pytest.mark.parametrize("name, streams, status, detail_prefix", [
     ("Movie (2024).mkv", [_v(), _a(1, "eng")], "NEEDS_BAZARR", ""),
     ("Movie (2024).mkv", [_v(), _v(1, "mjpeg"), _a(2, "eng", default=1)], "NEEDS_BAZARR", ""),

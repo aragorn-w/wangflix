@@ -114,3 +114,72 @@ def test_guard_allows(before, after):
 def test_guard_rejects(before, after, match):
     with pytest.raises(RuntimeError, match=match):
         na._check_stream_regression({"streams": before}, {"streams": after})
+
+
+# --- duration guard: a processed output shorter than its source never replaces it ---
+
+def _info_with_duration(duration):
+    info = {"streams": [_vid("h264"), {"codec_type": "audio", "codec_name": "ac3", "channels": 2}],
+            "format": {"tags": {}}}
+    if duration is not None:
+        info["format"]["duration"] = duration
+    return info
+
+
+def _normalize(tmp_path, monkeypatch, src_duration, out_duration):
+    """`process_file` over `Movie (2024).mkv` with every external tool faked; returns (result, src, tag mock)."""
+    monkeypatch.setattr(na, "LOG_FILE", tmp_path / "normalize-audio.log")
+    src = tmp_path / "Movie (2024).mkv"
+    src.write_bytes(b"ORIGINAL")
+    src_info, out_info = _info_with_duration(src_duration), _info_with_duration(out_duration)
+
+    def fake_ffprobe(p):
+        return out_info if Path(p).name.endswith(".remux.mkv") else src_info
+
+    def fake_render(src_, dst, *a, **k):
+        Path(dst).write_bytes(b"PASS2")
+
+    def fake_remux(src_, dst):
+        Path(dst).write_bytes(b"NORMALIZED")
+
+    measured = {"input_i": "-30.0", "input_tp": "-5.0", "input_lra": "6.0",
+                "input_thresh": "-40.0", "target_offset": "7.0"}
+    with patch.object(na, "ffprobe", side_effect=fake_ffprobe), \
+         patch.object(na, "measure_loudness", return_value=measured), \
+         patch.object(na, "render_normalized", side_effect=fake_render), \
+         patch.object(na, "mkvmerge_remux", side_effect=fake_remux), \
+         patch.object(na, "set_normalized_tag", return_value=True) as tag:
+        result = na.process_file(str(src))
+    return result, src, tag
+
+
+@pytest.mark.parametrize("src_duration, out_duration", [
+    ("1320.0", "169.0"),     # Family Guy S19E01: 22 min in, 2:49 out
+    ("1320.0", "1306.0"),    # just over 1% short
+    ("1320.0", None),        # output with no readable duration
+], ids=["truncated", "just-over-tolerance", "output-duration-missing"])
+def test_short_normalize_output_is_rejected_and_the_original_is_untouched(
+        tmp_path, monkeypatch, src_duration, out_duration):
+    result, src, tag = _normalize(tmp_path, monkeypatch, src_duration, out_duration)
+    assert result["status"] == "FAIL"
+    assert "duration regressed" in result["detail"]
+    assert src.read_bytes() == b"ORIGINAL"                 # never swapped
+    assert not src.with_suffix(".mkv.pre-norm.bak").exists()
+    assert not (tmp_path / ".normalize-tmp").exists()      # pass-2 and remux temps removed
+    tag.assert_not_called()
+
+
+@pytest.mark.parametrize("src_duration, out_duration", [
+    ("1320.0", "1320.0"),    # equal
+    ("1320.0", "1307.0"),    # within 1%
+    ("100.0", "98.0"),       # exactly the 2 s floor
+    (None, "169.0"),         # source duration unknown: the check is skipped, not a block
+    ("0.000000", "169.0"),   # source duration zero: same
+], ids=["equal", "within-tolerance", "exactly-the-floor", "source-duration-missing",
+        "source-duration-zero"])
+def test_normalize_output_within_tolerance_or_unchecked_replaces_the_original(
+        tmp_path, monkeypatch, src_duration, out_duration):
+    result, src, tag = _normalize(tmp_path, monkeypatch, src_duration, out_duration)
+    assert result["status"] == "FIXED"
+    assert src.read_bytes() == b"NORMALIZED"
+    tag.assert_called_once()

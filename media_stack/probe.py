@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 import math
 import subprocess
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from pathlib import Path
 
-from media_stack.config import PIPELINE_VERSION, STILL_IMAGE_VIDEO_CODECS
+from media_stack.config import (
+    OUTPUT_DURATION_SLACK_FRAC, OUTPUT_DURATION_SLACK_S, PIPELINE_VERSION,
+    STILL_IMAGE_VIDEO_CODECS,
+)
 
 
 CONSOLIDATED_TAG = "CONSOLIDATED_SUBS"
@@ -45,6 +48,30 @@ def parse_duration(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return d if math.isfinite(d) and d > 0 else None
+
+
+def duration_shortfall(
+    src_info: dict | None, out_info: dict | None, log: Callable[[str], None],
+) -> str | None:
+    """Why `out_info` may not replace `src_info` (both `probe()` results), else None: either
+    file unprobeable, or the output's container duration shorter than the source's by more than
+    the config slack (a remux that stopped early once replaced full episodes). A readable source
+    with an unknown or zero duration skips the check (logged); an output with none fails it."""
+    if src_info is None:
+        return "source could not be probed"
+    if out_info is None:
+        return "output could not be probed"
+    src = parse_duration((src_info.get("format") or {}).get("duration"))
+    if src is None:
+        log("duration check SKIPPED: source duration unknown")
+        return None
+    out = parse_duration((out_info.get("format") or {}).get("duration"))
+    if out is None:
+        return f"output duration unreadable (source is {src:.1f}s)"
+    slack = max(OUTPUT_DURATION_SLACK_S, OUTPUT_DURATION_SLACK_FRAC * src)
+    if out < src - slack:
+        return f"output is {out:.1f}s, source {src:.1f}s (over {slack:.1f}s shorter)"
+    return None
 
 
 def audio_stream_duration(
