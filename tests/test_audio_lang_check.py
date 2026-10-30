@@ -1729,7 +1729,7 @@ def _minutes(field: str) -> set[int]:
 
 def test_cron_entry_start_minute_collides_with_no_other_job():
     lines = [ln for ln in (PROJECT_ROOT / "ops/cron.d/media-stack.crontab").read_text().splitlines()
-             if ln.strip() and not ln.startswith("#")]
+             if ln.strip() and not ln.startswith("#") and "=" not in ln.split()[0]]  # jobs, not PATH=
     ours = [ln for ln in lines if "audio-lang-check.py" in ln]
     assert len(ours) == 1
     fields = ours[0].split()

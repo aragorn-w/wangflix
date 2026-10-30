@@ -12,7 +12,7 @@ Usage (read secrets without echo, to keep them out of shell history and `ps` arg
     read -rsp 'JELLYFIN_VERIFY_USER: ' JELLYFIN_VERIFY_USER && echo
     read -rsp 'JELLYFIN_VERIFY_PW: '   JELLYFIN_VERIFY_PW   && echo
     export JELLYFIN_API_KEY JELLYFIN_VERIFY_USER JELLYFIN_VERIFY_PW
-    python3 jellyfin-mint-api-key.py [--dry-run] <new-key-name>
+    uv run ./jellyfin-mint-api-key.py [--dry-run] <new-key-name>
     unset JELLYFIN_API_KEY JELLYFIN_VERIFY_USER JELLYFIN_VERIFY_PW
 
 Env:

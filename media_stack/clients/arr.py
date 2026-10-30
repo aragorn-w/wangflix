@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import requests
 
 
@@ -205,7 +207,7 @@ class ArrClient:
     def movies(self) -> list[dict] | None:
         return self._get_list("/api/v3/movie")
 
-    def run_command(self, name: str, **fields: object) -> int | None:
+    def run_command(self, name: str, **fields: Any) -> int | None:
         """The queued command's id, or None on any failure (including a non-int id). Asynchronous."""
         try:
             r = requests.post(

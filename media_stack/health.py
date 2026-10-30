@@ -689,7 +689,26 @@ class HealthCheck:
             self.fail("ops drift",
                       "live cron or systemd differs from ops/ snapshot — run ops/audit.sh")
 
+    def probe_python_env(self) -> None:
+        """This check must run on the repo's uv venv (`<repo>/.venv`) and the venv must match
+        uv.lock. The hourly check runs from cron, so it also proves cron's PATH reaches the venv.
+        sys.prefix, not sys.executable: the venv's python is a symlink into the base interpreter.
+        """
+        venv = self.repo_root / ".venv"
+        if Path(sys.prefix).resolve() != venv.resolve():
+            self.fail("python-env", f"running {sys.executable}, not {venv}/bin/python: the "
+                      "caller's PATH does not reach the venv (crontab PATH line not installed?)")
+            return
+        if not _which("uv"):
+            self.warn("python-env", "uv not on PATH, so the venv was not compared with uv.lock")
+            return
+        rc, _, _ = _run(["uv", "sync", "--check", "--locked", "--offline",
+                         "--project", str(self.repo_root)], timeout=30)
+        self._verdict(rc == 0, "python-env .venv matches uv.lock", "python-env",
+                      "the venv differs from uv.lock (or the check timed out): run `uv sync`")
+
     def run_all(self) -> int:
+        self.probe_python_env()
         self.probe_mounts()
         self.probe_gluetun()
         self.probe_containers()

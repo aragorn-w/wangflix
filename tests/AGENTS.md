@@ -3,8 +3,8 @@
 Fast (<3 s, dominated by the multiprocessing flock tests), isolated (no real ffmpeg / mkvmerge / Docker / network) and deterministic (no lingering temp files, no cwd dependence). Behaviors are specified in the root `AGENTS.md`; tests pin them.
 
 ```bash
-python3 -m pytest tests/ -q                           # all cases must pass on every commit (/review-loop)
-python3 -m pytest tests/ --collect-only -q | tail -1  # authoritative count; `--collect-only -q` is the file list
+uv run pytest                                         # all cases must pass on every commit (/review-loop); `-q` is in pyproject addopts
+uv run pytest --collect-only -q | tail -1             # authoritative count; `--collect-only -q` is the file list
 ```
 
 Don't hardcode the test count in docs. `ls tests/` is authoritative: `test_<module>.py` covers `media_stack/<module>.py` (`test_media_lang.py` covers `media_stack/lang.py`), `test_<script>.py` covers a root script.

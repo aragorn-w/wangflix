@@ -6,7 +6,7 @@ Canonical agent guidance. Home-server policy is in `$HOME/.claude/CLAUDE.md` (ma
 docker compose ps  # status
 docker compose restart <svc>
 docker compose logs -f --tail 100 <svc>
-python3 $HOME/media-stack/nuke_stalled.py  # one-shot stall-killer
+(cd $HOME/media-stack && uv run ./nuke_stalled.py)  # one-shot stall-killer
 bash $HOME/media-stack/consolidate-status.sh  # pipeline snapshot
 nvidia-smi  # NVIDIA GPU visible?
 ```
@@ -17,6 +17,7 @@ nvidia-smi  # NVIDIA GPU visible?
 - **Media rules:** Radarr/Sonarr block AV1 and 12-bit HEVC; Tdarr/Bazarr English only. Keep Radarr/Sonarr **hardlinks** ENABLED and Docker DNS forced to 8.8.8.8/Cloudflare.
 - **Host-side API calls** use `MEDIA_LAN_IP` (`.env`, default `10.0.0.10`), not `localhost` (Gluetun resets loopback); shell sources `lib/paths.sh`, Python imports `media_stack.paths`.
 - **Perimeter:** UFW must stay OFF (locks out SSH); the box listens only on Tailscale + its LAN subnet (`FIREWALL_OUTBOUND_SUBNETS`); no public exposure.
+- **Python:** ONE uv-managed environment, `.venv` in the repo root (Python 3.14, pinned by `uv.lock`; deps and dev tools in `pyproject.toml`), runs everything: cron, `consolidate-watch.service` and the shell entry points put `.venv/bin` first on `PATH`, so `python3`, `ffsubsync` and `subliminal` resolve into it. Add a dependency with `uv add <pkg>`, update with `uv lock --upgrade && uv sync` (the nightly job does this and pushes `uv.lock` only when the tests pass). Never `pip install` into system Python for this stack; `healthcheck.sh` (`python-env`) FAILs when it runs outside the venv or the venv differs from `uv.lock`.
 - **Credentials:** never put live secrets in `AGENTS.md`, scripts, code, docs or commits; use `.env` (gitignored; keys listed in `.env.example`) and variable names.
 
 ## Services
@@ -99,7 +100,7 @@ Four `_process_locked` call sites (NEEDS_BAZARR/FAIL variants, incl. a sublimina
 
 ### sub-fallback.py (hourly ASR fallback)
 
-Mechanics: the module docstring and `media_stack/subverify.py`. `faster_whisper` is optional (don't assume it is installed); workdirs are per-file under `WORKDIR_ROOT` (local `var/`, never the media pool) with fixed per-role names, never derived from a stem; `--dry-run` mutates nothing.
+Mechanics: the module docstring and `media_stack/subverify.py`. `faster_whisper` is a hard dependency installed by `uv sync` (still imported lazily); workdirs are per-file under `WORKDIR_ROOT` (local `var/`, never the media pool) with fixed per-role names, never derived from a stem; `--dry-run` mutates nothing.
 
 - **Stale tracker entries:** `drop_stale_entries` re-checks each key's CURRENT entry under `mutate_state`'s lock against the SNAPSHOT that judged it stale; never pop from the snapshot unconditionally.
 - **Never weaken the verification gates (ratios, word count, language) to speed it up:** a `fetch_via_subliminal` result is accepted ONLY if `sublang` scores it English AND `subverify.overlap` on a short ASR window of the file's own audio passes word ratio >= 0.60 AND ordered-bigram ratio >= 0.40. An untagged/`und` audio stream must first pass whisper language-ID with a MULTILINGUAL model (never `.en`; `english_audio_stream` reuses `audio.is_commentary_audio`), else `AUDIO_LANGUAGE_UNVERIFIED`.
@@ -148,7 +149,7 @@ REPORT-ONLY drift check of the Shield TV units against `ops/shield/profile.json`
 ## Validation
 
 - Probes: `bash healthcheck.sh` (exit 0/1/2; `--verbose`, `--json`); `bash preflight.sh` (dependencies; at install and after host upgrades); `bash ops/audit.sh` (live cron + systemd vs `ops/` snapshots; fails on drift); `docker exec gluetun wget -qO- https://ifconfig.co` (VPN egress, must NOT be the host IP); `tail -20 var/log/stall_killer.log`.
-- **Python:** syntax `python3 -c "import ast; ast.parse(open('FILE').read())"`; `python3 -m pytest tests/ -q` (all must pass); `ruff check media_stack/ *.py` and `mypy` (`pyproject.toml`; must stay clean); smoke `python3 FILE --help` or `--dry-run`.
+- **Python** (from the repo root; `uv run` uses `.venv`): syntax `uv run python -c "import ast; ast.parse(open('FILE').read())"`; `uv run pytest` (all must pass); `uv run ruff check .` and `uv run mypy` (`pyproject.toml`; must stay clean); smoke `uv run ./FILE --help` or `--dry-run`.
 - **Shell:** `bash -n FILE`; `shellcheck FILE` if installed. **Compose:** `docker compose config`, `docker compose up -d <svc>`, `bash healthcheck.sh`.
 - **Cron / systemd:** update the live state AND the snapshot under `ops/`, then `bash ops/audit.sh`.
-- **Pipeline runs:** before sweeping, `python3 consolidate-subs.py --dry-run <one-file.mkv>`, eyeball the plan, then run for real on that one file.
+- **Pipeline runs:** before sweeping, `uv run ./consolidate-subs.py --dry-run <one-file.mkv>`, eyeball the plan, then run for real on that one file.

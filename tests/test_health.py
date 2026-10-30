@@ -399,6 +399,29 @@ def test_probe_vpn_country(tmp_path, country, iso, matches, expected):
     _assert_results(hc, [expected])
 
 
+# ---------------- python env (uv venv) ----------------
+
+@pytest.mark.parametrize("in_venv, uv_on_path, run_rc, expected", [
+    (False, True, 0, ("FAIL", "python-env")),
+    (True, False, 0, ("WARN", "python-env")),
+    (True, True, 1, ("FAIL", "python-env")),
+    (True, True, 0, ("OK", "python-env .venv matches uv.lock")),
+], ids=["outside-venv-fails", "no-uv-warns", "out-of-sync-fails", "in-sync-ok"])
+def test_probe_python_env(tmp_path, monkeypatch, in_venv, uv_on_path, run_rc, expected):
+    (tmp_path / ".venv").mkdir()
+    monkeypatch.setattr(health.sys, "prefix", str(tmp_path / ".venv" if in_venv else tmp_path))
+    hc = _hc(tmp_path)
+    with patch.object(health, "_which", return_value=uv_on_path), \
+         patch.object(health, "_run", return_value=(run_rc, "", "")) as run:
+        hc.probe_python_env()
+    _assert_results(hc, [expected])
+    if in_venv and uv_on_path:
+        assert run.call_args.args[0][:4] == ["uv", "sync", "--check", "--locked"]
+        assert str(tmp_path) in run.call_args.args[0]
+    else:
+        run.assert_not_called()
+
+
 def test_ops_audit_not_executable_skips(tmp_path):
     hc = _hc(tmp_path)
     hc.probe_ops_audit()  # tmp_path has no ops/audit.sh

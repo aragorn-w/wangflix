@@ -21,15 +21,17 @@ End-to-end path from a fresh Ubuntu 22.04 box to a running stack. Each step is i
    $EDITOR .env
    ```
    `.env.example` flags every variable as `[REQUIRED]` or `[OPTIONAL]`. At minimum: `WIREGUARD_PRIVATE_KEY`, `WIREGUARD_ADDRESS`, `SONARR_API_KEY`, `RADARR_API_KEY`, `QBIT_USER`, `QBIT_PASS`. `VPN_COUNTRY` defaults to Switzerland.
-3. **Install Python dependencies** BEFORE `preflight.sh` (it checks that `requests`, `pysubs2` and `srt` import cleanly, so it fails on a clean machine otherwise).
+3. **Install system packages and the Python environment** BEFORE `preflight.sh`. Every Python dependency (including `subliminal`, `ffsubsync` and `faster-whisper`) lives in ONE uv-managed environment, `.venv` in the repo root on Python 3.14, pinned by `uv.lock`. Nothing is installed with system `pip`.
    ```bash
-   pip3 install --user -r requirements.txt
+   sudo apt install ffmpeg mkvtoolnix inotify-tools curl jq   # plus Docker Engine with the compose plugin
+   curl -LsSf https://astral.sh/uv/install.sh | sh            # uv; open a new shell so it is on PATH
+   uv sync                                                    # creates .venv from uv.lock (fetches Python 3.14 if missing)
    ```
 4. **Verify host dependencies.**
    ```bash
    bash preflight.sh --verbose
    ```
-   Required binaries: `ffmpeg`, `ffprobe`, `mkvmerge`, `mkvpropedit`, `mkvextract`, `python3`, `docker`, `inotifywait`, `curl`, `flock`, `subliminal`, `ffsubsync`. Optional: `nvidia-smi` for HW transcode. Exit 0 = ready; exit 1 = fix the missing piece first.
+   Required binaries: `ffmpeg`, `ffprobe`, `mkvmerge`, `mkvpropedit`, `mkvextract`, `docker`, `inotifywait`, `curl`, `flock`, `uv`; plus `.venv` present and matching `uv.lock` (`uv sync --check`). Optional: `nvidia-smi` for HW transcode. Exit 0 = ready; exit 1 = fix the missing piece first.
 5. **Bring up the Docker stack.**
    ```bash
    docker compose up -d
@@ -39,7 +41,7 @@ End-to-end path from a fresh Ubuntu 22.04 box to a running stack. Each step is i
    bash ops/install.sh                # dry-run preview
    bash ops/install.sh --apply        # actually install
    ```
-   It substitutes `MEDIA_STACK_ROOT` (from `.env`) for the path placeholder and the invoking user/group for `mediauser`, renders into a per-run `mktemp -d` directory, then `crontab` + `sudo install`s the result. Re-runnable; same inputs give identical output. `consolidate-watch.service` and `malware-guard.service` are stack-mandatory; `realtek-fix.service` is specific to one NIC model and is skipped unless `INCLUDE_HOST_SPECIFIC=1`.
+   It substitutes `MEDIA_STACK_ROOT` (from `.env`) for the path placeholder and the invoking user/group for `mediauser`, renders into a per-run `mktemp -d` directory, then `crontab` + `sudo install`s the result. The crontab and `consolidate-watch.service` both put `<repo>/.venv/bin` first on `PATH`, which is how cron and the watcher end up on the venv (the shell entry points do the same for themselves). Re-runnable; same inputs give identical output. `consolidate-watch.service` and `malware-guard.service` are stack-mandatory; `realtek-fix.service` is specific to one NIC model and is skipped unless `INCLUDE_HOST_SPECIFIC=1`.
 7. **Verify everything's healthy.**
    ```bash
    bash healthcheck.sh --verbose
@@ -47,7 +49,7 @@ End-to-end path from a fresh Ubuntu 22.04 box to a running stack. Each step is i
    Exit 0 = all green; exit 1 = real failure listed; exit 2 = warnings only. The hourly cron entry runs this automatically afterward.
 8. **Run the test suite** (optional but recommended on first install).
    ```bash
-   python3 -m pytest tests/ -q
+   uv run pytest
    ```
 
 **Replicators on a different host:** uncomment and override these in `.env` BEFORE step 5:
@@ -67,8 +69,10 @@ docker compose ps                          # health
 docker compose logs -f --tail 100 [svc]    # tail
 docker compose restart [svc]               # bounce
 bash consolidate-status.sh                 # pipeline snapshot
-python3 nuke_stalled.py                    # one-shot stall reap
+uv run ./nuke_stalled.py                   # one-shot stall reap
 ```
+
+Run any Python script by hand with `uv run ./script.py`; nothing needs activating. (`uv run` also puts `.venv/bin` first on `PATH`, which the scripts need to find `ffsubsync` and `subliminal` by name; a bare `.venv/bin/python script.py` does not.) To move to newer dependency versions: `uv lock --upgrade && uv sync`, run the tests, commit `uv.lock`.
 
 ## Cron orchestration
 
@@ -91,8 +95,8 @@ The main jobs; the versioned snapshot `ops/cron.d/media-stack.crontab` is the fu
 Turn on network debugging on each Shield, then set `SHIELD_DEVICES` in `.env` (see `.env.example`); unset, the check does nothing. Device addresses live only there, never in tracked files.
 
 ```bash
-python3 shield-check.py --no-notify                  # print findings and hints; send and write nothing
-python3 shield-check.py --device living --no-notify  # one unit only
+uv run ./shield-check.py --no-notify                  # print findings and hints; send and write nothing
+uv run ./shield-check.py --device living --no-notify  # one unit only
 ```
 
 ## Safety notes

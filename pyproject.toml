@@ -1,11 +1,36 @@
-# Tooling config for the media-stack helper package + entry scripts.
-# This project is NOT pip-installed — it runs in place. This file exists
-# only to give ruff / mypy / pytest a shared, conservative baseline so
-# regressions are catchable before runtime. Dev tools: requirements-dev.txt.
+# One uv-managed environment (.venv in the repo root, Python 3.14) runs the whole stack: cron,
+# the systemd watcher, the shell entry points and the tests.  The repo runs in place and is NOT an
+# installable package (package = false), so this table only declares dependencies for `uv sync`.
+# Also gives ruff / mypy / pytest a shared, conservative baseline so regressions are catchable
+# before runtime.
+
+[project]
+name = "wangflix"
+version = "0"
+description = "Self-hosted Linux DVR + media normalization pipeline"
+requires-python = ">=3.14"
+dependencies = [
+    "requests>=2.31",
+    "pysubs2>=1.7",
+    "srt>=3.5",
+    "faster-whisper>=1.2",
+    "subliminal>=2.8",
+    "ffsubsync>=0.5",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15",
+    "mypy>=1.11",
+    "pytest>=7.4",
+]
+
+[tool.uv]
+package = false
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py314"
 
 [tool.ruff.lint]
 # Conservative baseline: pyflakes (F — real bugs: unused/undefined names)
@@ -28,7 +53,7 @@ addopts = "-q"
 [tool.mypy]
 # Permissive baseline scoped to the package first (codex: "ratchet
 # media_stack/ first"). No disallow_untyped_defs / strict yet.
-python_version = "3.10"
+python_version = "3.14"
 files = ["media_stack"]
 ignore_missing_imports = true
 warn_unused_ignores = true

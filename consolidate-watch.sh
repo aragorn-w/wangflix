@@ -3,6 +3,7 @@
 # video when a sidecar .srt/.ass/.vtt arrives.
 set -u
 _here="$(cd "$(dirname "$0")" && pwd)"
+PATH="$_here/.venv/bin:$PATH"  # the stack runs from the repo venv
 # shellcheck source=lib/paths.sh
 . "$_here/lib/paths.sh"
 

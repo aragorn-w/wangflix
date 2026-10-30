@@ -2,8 +2,14 @@
 # source of truth: after changing it, re-install and run `bash ops/audit.sh`.
 #
 # Install with `bash ops/install.sh --apply`, which renders the `$HOME/media-stack`
-# placeholder to MEDIA_STACK_ROOT.  A raw `crontab ops/cron.d/media-stack.crontab` also
-# works for a checkout at `$HOME/media-stack` (cron's /bin/sh expands `$HOME` at run time).
+# placeholder to MEDIA_STACK_ROOT.  Cron does not expand variables in an assignment, so do not
+# install this file raw: the PATH line below must be rendered to an absolute path.
+
+# The repo's uv environment first, so every `python3` below (and `ffsubsync`/`subliminal`, which
+# media_stack/subtitles.py runs by name) resolves into <repo>/.venv.  Create it with `uv sync`.
+# ~/.local/bin goes LAST so that `uv` (the health check runs `uv sync --check`) is found without
+# letting user-site scripts shadow system tools.
+PATH=$HOME/media-stack/.venv/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin
 
 # m h  dom mon dow   command
 

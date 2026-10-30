@@ -17,6 +17,7 @@ for arg in "$@"; do
 done
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+PATH="$REPO_ROOT/.venv/bin:$PATH"  # the stack runs from the repo venv
 fail=0
 optfail=0
 
@@ -66,28 +67,18 @@ require_cmd inotifywait "consolidate-watch.service file event source" \
 require_cmd curl        "ad-hoc API probes in shell scripts"    -- curl --version
 require_cmd flock       "cron-driver mutual exclusion"
 
-if command -v python3 >/dev/null 2>&1; then
-  for mod in requests pysubs2 srt; do
-    if ! python3 -c "import ${mod}" 2>/dev/null; then
-      printf 'MISSING py: %s (pip install -r requirements.txt)\n' "$mod"
-      fail=$((fail + 1))
-    else
-      [[ $verbose -eq 1 ]] && printf 'OK py:   %s\n' "$mod"
-    fi
-  done
-  if ! python3 -c "import pytest" 2>/dev/null; then
-    printf 'OPT py:  pytest (run unit tests under tests/)\n'
-    optfail=$((optfail + 1))
+# Python deps live in ONE uv-managed venv (<repo>/.venv, pinned by uv.lock); PATH above puts it first.
+# uv sync --check exits 1 when the venv is missing, stale or has extra packages.
+require_cmd uv "manages the Python venv (install: https://docs.astral.sh/uv/)" -- uv --version
+if command -v uv >/dev/null 2>&1; then
+  if [[ ! -x "$REPO_ROOT/.venv/bin/python" ]]; then
+    printf 'MISSING: .venv/bin/python (run: uv sync)\n'
+    fail=$((fail + 1))
+  elif sync_out=$(uv sync --check --locked --offline --project "$REPO_ROOT" 2>&1); then
+    [[ $verbose -eq 1 ]] && printf 'OK py:   .venv matches uv.lock\n'
   else
-    [[ $verbose -eq 1 ]] && printf 'OK py:   pytest\n'
-  fi
-  # faster_whisper is deliberately OPTIONAL: subverify.py imports it lazily, so a host without the
-  # ASR fallback need not install a multi-GB whisper.
-  if ! python3 -c "import faster_whisper" 2>/dev/null; then
-    printf 'OPT py:  faster_whisper (sub-fallback.py ASR verification + transcription)\n'
-    optfail=$((optfail + 1))
-  else
-    [[ $verbose -eq 1 ]] && printf 'OK py:   faster_whisper\n'
+    printf 'BROKEN:  .venv does not match uv.lock (run: uv sync): %s\n' "$(tail -n 1 <<<"$sync_out")"
+    fail=$((fail + 1))
   fi
 fi
 

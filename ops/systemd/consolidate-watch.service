@@ -14,6 +14,7 @@ Wants=docker.service
 Type=simple
 User=mediauser
 Group=mediauser
+Environment=PATH=$HOME/media-stack/.venv/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/bin/bash $HOME/media-stack/consolidate-watch.sh
 Restart=on-failure
 RestartSec=10

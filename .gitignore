@@ -15,6 +15,7 @@ data/
 *.db
 *.db-journal
 *.lock
+!uv.lock
 *.pid
 
 # --- Logs & generated output ---

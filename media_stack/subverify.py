@@ -154,7 +154,7 @@ def _get_model(model: str, threads: int):
     cached = _MODEL_CACHE.get(key)
     if cached is not None:
         return cached
-    from faster_whisper import WhisperModel  # lazy: optional dependency
+    from faster_whisper import WhisperModel  # lazy: heavy import, only needed to transcribe
     inst = WhisperModel(model, device="cpu", compute_type="int8", cpu_threads=threads)
     _MODEL_CACHE[key] = inst
     return inst
