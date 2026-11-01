@@ -7,11 +7,13 @@ and (in CLI-mode tests) `JellyfinClient` are mocked.
 import itertools
 import subprocess
 import sys
+import wave
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
+import numpy as np
 import pytest
 
 from media_stack import subverify as sv
@@ -274,10 +276,17 @@ def test_srt_timestamp(seconds, expected):
 _FakeSegment = SimpleNamespace
 
 
+def _write_wav(path: Path, samples: list[int], rate: int = 16000) -> Path:
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(np.array(samples, dtype="<i2").tobytes())
+    return path
+
+
 def _fake_wav(tmp_path: Path) -> Path:
-    p = tmp_path / "fake.wav"
-    p.write_bytes(b"RIFF....WAVEfmt ")
-    return p
+    return _write_wav(tmp_path / "fake.wav", [0, 0, 0, 0])
 
 
 def _model(segments=(), info=None):
@@ -299,6 +308,21 @@ def _srt_of(tmp_path, segments):
         srt = sv.transcribe_to_srt(Path("/video.mkv"), 1, "medium.en", 6)
     assert not wav.exists()
     return srt
+
+
+def test_wav_samples_scales_s16_to_float32_in_unit_range(tmp_path):
+    wav = _write_wav(tmp_path / "t.wav", [0, 16384, -16384, 32767, -32768])
+    samples = sv._wav_samples(wav)
+
+    assert samples.dtype == np.float32
+    assert samples.tolist() == [0.0, 0.5, -0.5, 32767 / 32768, -1.0]
+
+
+def test_wav_samples_rejects_a_wav_that_is_not_16_khz(tmp_path):
+    wav = _write_wav(tmp_path / "t.wav", [0, 1, 2], rate=44100)
+    with pytest.raises(RuntimeError) as exc:
+        sv._wav_samples(wav)
+    assert str(wav) in str(exc.value)
 
 
 def test_asr_window_concatenates_segment_text_and_cleans_up_wav(tmp_path):
@@ -441,8 +465,8 @@ def test_detect_language_returns_info_fields_and_does_not_force_a_language(tmp_p
     wav = _fake_wav(tmp_path)
     seen = {}
 
-    def _transcribe(path, **kw):
-        seen.update(kw)
+    def _transcribe(audio, **kw):
+        seen.update(kw, audio=audio)
         return [], SimpleNamespace(language=language, language_probability=probability)
 
     with _mocked_asr(wav, SimpleNamespace(transcribe=_transcribe)) as (mock_extract, mock_get_model):
@@ -450,6 +474,8 @@ def test_detect_language_returns_info_fields_and_does_not_force_a_language(tmp_p
 
     assert result == (language, probability)
     assert "language" not in seen
+    # faster-whisper's own file decoder is broken on PyAV 19, so it must get decoded samples.
+    assert isinstance(seen["audio"], np.ndarray) and seen["audio"].dtype == np.float32
     mock_get_model.assert_called_once_with("small", 4)
     mock_extract.assert_called_once_with(
         Path("/video.mkv"), 1, 150.0, 30.0, workdir=tmp_path, should_abort=None)

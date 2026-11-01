@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import wave
 from pathlib import Path
 from typing import Callable
 
@@ -160,6 +161,19 @@ def _get_model(model: str, threads: int):
     return inst
 
 
+def _wav_samples(wav: Path):
+    """Float32 samples in [-1, 1] of a mono 16 kHz s16 wav (what `_extract_wav` writes).
+    faster-whisper's own decoder passes PyAV a kwarg PyAV 19 removed, so hand it an array."""
+    import numpy as np  # lazy: faster-whisper's dependency, only needed to transcribe
+    with wave.open(str(wav), "rb") as w:
+        if (w.getnchannels(), w.getsampwidth(), w.getframerate()) != (1, 2, 16000):
+            raise RuntimeError(
+                f"unexpected wav format (want mono s16 16 kHz): {wav}: "
+                f"{w.getnchannels()} ch, {w.getsampwidth()} B, {w.getframerate()} Hz")
+        frames = w.readframes(w.getnframes())
+    return np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+
+
 def asr_window(video: Path, audio_index: int, start_s: float | None, dur_s: float | None,
                 model: str, threads: int, workdir: Path, *,
                 should_abort: Callable[[], bool] | None = None) -> str:
@@ -170,7 +184,7 @@ def asr_window(video: Path, audio_index: int, start_s: float | None, dur_s: floa
     try:
         whisper = _get_model(model, threads)
         segments, _ = whisper.transcribe(
-            str(wav), language="en", vad_filter=True,
+            _wav_samples(wav), language="en", vad_filter=True,
             condition_on_previous_text=False,
         )
         return " ".join(seg.text for seg in segments)
@@ -187,7 +201,7 @@ def detect_language(video: Path, audio_index: int, start_s: float, dur_s: float,
                        workdir=workdir, should_abort=should_abort)
     try:
         whisper = _get_model(model, threads)
-        _, info = whisper.transcribe(str(wav), vad_filter=True)
+        _, info = whisper.transcribe(_wav_samples(wav), vad_filter=True)
         return info.language, info.language_probability
     finally:
         wav.unlink(missing_ok=True)
@@ -314,7 +328,7 @@ def transcribe_to_srt(video: Path, audio_index: int, model: str, threads: int, *
     try:
         whisper = _get_model(model, threads)
         segments, _ = whisper.transcribe(
-            str(wav), language="en", vad_filter=True,
+            _wav_samples(wav), language="en", vad_filter=True,
             condition_on_previous_text=False,
             initial_prompt=_WHISPER_INITIAL_PROMPT, word_timestamps=True,
         )
