@@ -16,6 +16,7 @@ from media_stack.config import (
     ASS_CODECS, ASS_OVERRIDE_RE, ENG_SIDECAR_SUFFIXES, HTML_FONT_RE, HTML_OTHER_RE,
     LITERAL_NH_RE, MULTI_BLANK_RE, SIDECAR_EXTS, TEXT_CODECS, TRAIL_WS_RE,
 )
+from media_stack.lang import is_english_tag
 
 
 def is_forced_track(s: dict) -> bool:
@@ -49,6 +50,27 @@ def is_sdh_track(s: dict) -> bool:
     if (s.get("disposition") or {}).get("hearing_impaired"):
         return True
     return is_hi_text((s.get("tags") or {}).get("title") or "")
+
+
+# Whole token, like `_HI_RE`: "dub", "dubs", "dubtitle(s)", and the "English (dub)" title we mux.
+_DUB_RE = re.compile(r"(?<![a-z0-9])dub(?:title)?s?(?![a-z0-9])")
+
+
+def is_dub_track(s: dict) -> bool:
+    """An unforced subtitle that follows the English DUB audio rather than translating the
+    original: titled dub/dubtitles (including our own "English (dub)"), or hearing-impaired/CC
+    (a release's CC track is timed to the dub)."""
+    if is_forced_track(s):
+        return False
+    title = (s.get("tags") or {}).get("title") or ""
+    return is_sdh_track(s) or _DUB_RE.search(title.lower()) is not None
+
+
+def has_dub_subtitle(info: dict) -> bool:
+    """`info` (a `probe()` result) has an English TEXT subtitle for which `is_dub_track` holds."""
+    return any(s.get("codec_type") == "subtitle" and s.get("codec_name") in TEXT_CODECS
+               and is_english_tag((s.get("tags") or {}).get("language")) and is_dub_track(s)
+               for s in info.get("streams", []))
 
 
 def score_text_track(s: dict, line_count: int) -> int:
@@ -205,6 +227,27 @@ def clean_srt_text(text: str) -> str:
     return text
 
 
+_HI_SPAN_RE = re.compile(r"\[[^\[\]]{0,200}\]|\([^()]{0,200}\)")
+_EMPTY_LINE_RE = re.compile(r"^[\s\-\u2013\u2014]*$")   # blank, or a dash with nothing after it
+
+
+def strip_hi_annotations(srt_text: str) -> str:
+    """Remove `[...]` and `(...)` sound/speaker tags from every cue of an SRT, then the lines
+    and cues left empty; renumbered. Unparseable input comes back unchanged."""
+    import srt
+    try:
+        subs = list(srt.parse(srt_text))
+    except srt.SRTParseError:
+        return srt_text
+    kept = []
+    for sub in subs:
+        lines = [" ".join(ln.split()) for ln in _HI_SPAN_RE.sub("", sub.content).split("\n")]
+        sub.content = "\n".join(ln for ln in lines if not _EMPTY_LINE_RE.match(ln))
+        if sub.content:
+            kept.append(sub)
+    return srt.compose(kept)
+
+
 _VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".m4v")
 
 
@@ -223,16 +266,8 @@ def _english_sidecar_tags(name: str, stem: str) -> list[str] | None:
     return tags
 
 
-def find_sidecar_subs(media: Path) -> list[tuple[Path, bool, bool]]:
-    """English sidecars next to `media` as `[(path, is_forced, is_sdh)]`.
-
-    A `generated` tag (sub-fallback.py Whisper output) counts as plain English; see
-    `is_generated_sidecar`. A sidecar must start with the stem plus a dot (`Movie2.en.srt`
-    is not `Movie.mkv`'s). A sidecar that is a valid English sidecar of a longer-stemmed
-    sibling video (`Movie.2020.mkv`) belongs to that video, and only then
-    (`Show.en.generated.srt` stays `Show.mkv`'s beside `Show.en.mkv`; `consolidate-watch.sh`
-    applies the same rule). Bare `Movie.srt` is accepted as English.
-    """
+def _owned_sidecars(media: Path) -> list[tuple[Path, list[str]]]:
+    """English sidecars `media` owns as `[(path, tags)]` (rules in `find_sidecar_subs`)."""
     base = media.stem
     entries = list(media.parent.iterdir())
     longer_stems = [e.stem for e in entries
@@ -247,6 +282,30 @@ def find_sidecar_subs(media: Path) -> list[tuple[Path, bool, bool]]:
             continue
         if any(_english_sidecar_tags(entry.name, longer) is not None for longer in longer_stems):
             continue  # the longer-stemmed sibling video owns it
+        out.append((entry, tags))
+    return out
+
+
+def _is_dub_tags(tags: list[str]) -> bool:
+    """A `dub` tag, unless a forced tag is also present (forced wins: `.en.dub.forced.srt`)."""
+    return "dub" in tags and not any("forced" in t for t in tags)
+
+
+def find_sidecar_subs(media: Path) -> list[tuple[Path, bool, bool]]:
+    """English sidecars next to `media` as `[(path, is_forced, is_sdh)]`.
+
+    A `generated` tag (sub-fallback.py Whisper output) counts as plain English; see
+    `is_generated_sidecar`. A `dub` tag marks a subtitle for the English dub audio, not a main
+    one: `find_dub_sidecars` returns those, this never does. A sidecar must start with the stem
+    plus a dot (`Movie2.en.srt` is not `Movie.mkv`'s). A sidecar that is a valid English sidecar
+    of a longer-stemmed sibling video (`Movie.2020.mkv`) belongs to that video, and only then
+    (`Show.en.generated.srt` stays `Show.mkv`'s beside `Show.en.mkv`; `consolidate-watch.sh`
+    applies the same rule). Bare `Movie.srt` is accepted as English.
+    """
+    out = []
+    for entry, tags in _owned_sidecars(media):
+        if _is_dub_tags(tags):
+            continue
         if not tags:
             out.append((entry, False, False))
             continue
@@ -254,6 +313,11 @@ def find_sidecar_subs(media: Path) -> list[tuple[Path, bool, bool]]:
         is_sdh = is_hi_text(" ".join(tags))
         out.append((entry, is_forced, is_sdh))
     return out
+
+
+def find_dub_sidecars(media: Path) -> list[Path]:
+    """English sidecars with a `dub` tag (`<stem>.en.dub.srt`), sorted by name."""
+    return sorted(entry for entry, tags in _owned_sidecars(media) if _is_dub_tags(tags))
 
 
 def is_generated_sidecar(media: Path, sidecar: Path) -> bool:

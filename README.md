@@ -5,7 +5,7 @@ Self-hosted Linux DVR + media normalization pipeline. Designed for a small home-
 ## What's inside
 
 - **Docker stack** (`docker-compose.yml`): Gluetun (ProtonVPN/WireGuard) + qBittorrent + Radarr + Sonarr + Bazarr + Prowlarr + Jellyfin + Jellyseerr + Tdarr + Watchtower + Unpackerr + flaresolverr.
-- **Media pipeline**: `consolidate-subs.py` (subs + audio + container repair) + `normalize-audio.py` (EBU R128 -23 LUFS loudness), driven by `consolidate-watch.service` (inotify) and cron sweeps.
+- **Media pipeline**: `consolidate-subs.py` (subs + audio + container repair) + `normalize-audio.py` (EBU R128 -23 LUFS loudness), driven by `consolidate-watch.service` (inotify) and cron sweeps. An anime episode keeps its Japanese audio with a full English subtitle AND the English dub with a matching "English (dub)" subtitle (a `<name>.en.dub.srt` sidecar, a CC track, or `sub-fallback.py --dub`'s Whisper transcript).
 - **Operational scripts**: `nuke_stalled.py` (qBit/Arr stall reaper), `consolidate-status.sh` (pipeline snapshot), `jellyfin-mint-api-key.py` (safety-verified Jellyfin admin API key minting).
 
 Agent-targeted documentation, including the pipeline's rules and invariants, is in `AGENTS.md`.
@@ -82,6 +82,7 @@ The main jobs; the versioned snapshot `ops/cron.d/media-stack.crontab` is the fu
 | :--- | :--- |
 | every minute | `nuke_stalled.py`: reaps stalled qBit/Arr torrents |
 | `0 *` | `healthcheck.sh`: hourly aggregate health probe |
+| `20 *` / `52 *` | `sub-fallback.py` (ASR fallback for files with no English subtitle) / `sub-fallback.py --dub` (transcribes the English dub of dual-audio files) |
 | `05:00` daily | `consolidate-subs.py --scan`: full library sweep |
 | `04:30` daily | `bazarr-profile-audit.py`: fixes silent `profileId=None` items |
 | `04:00` daily | `nightly-upgrade.sh`: host package updates |

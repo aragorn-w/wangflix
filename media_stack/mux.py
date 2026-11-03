@@ -18,6 +18,8 @@ from pathlib import Path
 # "(generated)" lets a Whisper transcript be told apart from a real subtitle later.
 ENG_TRACK_NAME = "English"
 ENG_GENERATED_TRACK_NAME = "English (generated)"
+# Subtitle that follows the English dub audio (the main track translates the Japanese).
+ENG_DUB_TRACK_NAME = "English (dub)"
 
 
 def remux_timeout_s(size_bytes: int) -> int:
@@ -36,14 +38,15 @@ def remux(
     cleanup_flags: dict[int, dict[str, bool]] | None = None,
     eng_track_name: str = ENG_TRACK_NAME,
     kept_source_subs: dict[int, dict[str, bool]] | None = None,
+    dub_srt: Path | None = None,
 ) -> tuple[bool, str]:
     """Build a new MKV from `src`; returns `(success, detail)`.
 
     Full path (`cleanup_flags` None): only the given video/audio indices are kept, source
-    subtitles are dropped, and `eng_srt` is attached as default with an optional
-    `forced_srt` second. `kept_source_subs` ({track id: {"default", "forced"}}, full path
-    only) stream-copies those source subtitles ahead of `eng_srt` instead of
-    `--no-subtitles`. Cleanup mode: see the module docstring.
+    subtitles are dropped, and `eng_srt` is attached as default, then an optional `dub_srt`
+    ("English (dub)", not default) and an optional `forced_srt`. `kept_source_subs`
+    ({track id: {"default", "forced"}}, full path only) stream-copies those source subtitles
+    ahead of `eng_srt` instead of `--no-subtitles`. Cleanup mode: see the module docstring.
     """
     cmd = ["mkvmerge", "--quiet", "--output", str(dst)]
     if video_indices:
@@ -94,6 +97,12 @@ def remux(
                 "--default-track", "0:yes",
                 "--forced-track", "0:no",
                 str(eng_srt)]
+        if dub_srt:
+            cmd += ["--language", "0:eng",
+                    "--track-name", f"0:{ENG_DUB_TRACK_NAME}",
+                    "--default-track", "0:no",
+                    "--forced-track", "0:no",
+                    str(dub_srt)]
         if forced_srt:
             cmd += ["--language", "0:eng",
                     "--track-name", "0:Forced",
@@ -125,3 +134,23 @@ def mkvmerge_remux_simple(src: Path, dst: Path) -> None:
         raise RuntimeError(f"mkvmerge remux failed: {tail[0][:200]}")
     if not dst.exists() or dst.stat().st_size < 100_000:
         raise RuntimeError("mkvmerge output too small")
+
+
+def add_dub_subtitle(src: Path, dst: Path, srt: Path) -> tuple[bool, str]:
+    """Copy `src` unchanged (every track, attachment, chapter and global tag, none of their
+    flags touched) plus `srt` as a new "English (dub)" subtitle that is neither default nor
+    forced; returns `(success, detail)`."""
+    cmd = ["mkvmerge", "--quiet", "--output", str(dst), str(src),
+           "--language", "0:eng", "--track-name", f"0:{ENG_DUB_TRACK_NAME}",
+           "--default-track", "0:no", "--forced-track", "0:no", str(srt)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=remux_timeout_s(src.stat().st_size))
+    except subprocess.TimeoutExpired:
+        return False, "mkvmerge timeout"
+    if r.returncode > 1:  # 1 = warnings-only, output still valid
+        tail = (r.stderr or r.stdout or "").strip().splitlines()[-1:] or [""]
+        return False, tail[0][:300]
+    if not dst.exists() or dst.stat().st_size < 1_000_000:
+        return False, "output too small"
+    return True, "ok"

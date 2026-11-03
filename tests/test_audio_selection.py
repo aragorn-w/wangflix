@@ -1,8 +1,8 @@
 """Unit tests for consolidate-subs.py's audio-selection policy.
 
-Covers canonical-language alias normalization, multi_keep gating (anime/Korean keyword
-paths stay single-track; only DUAL_AUDIO_KEYWORDS and the canonical-disposition path
-multi-keep), the Hollywood-with-side-dub false-positive guard, and canonical-family dedup.
+Covers canonical-language alias normalization, multi_keep gating (the Korean keyword path
+stays single-track; anime, DUAL_AUDIO_KEYWORDS and the canonical-disposition path multi-keep),
+the Hollywood-with-side-dub false-positive guard, and canonical-family dedup.
 
 `consolidate-subs.py` is a hyphenated entry script, so it is loaded via importlib.
 """
@@ -22,7 +22,8 @@ _spec = importlib.util.spec_from_file_location(
 cs = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(cs)
 
-from media_stack.audio import confident_default_audio  # noqa: E402
+from media_stack import audio  # noqa: E402
+from media_stack.audio import confident_default_audio, is_anime, is_dual_audio  # noqa: E402
 from media_stack.lang import ENG_AUDIO_LANGS, JPN_AUDIO_LANGS, KOR_AUDIO_LANGS  # noqa: E402
 
 
@@ -75,8 +76,8 @@ def test_default_english_no_audios():
 
 
 @pytest.mark.parametrize("path, audios, kwargs, primary, multi, allowed", [
-    pytest.param("/movies/anime/Akira (1988)/x.mkv", JPN_ENG, {}, "jpn", False, None,
-                 id="anime-path-single-jpn-dub-pruned"),
+    pytest.param("/movies/anime/Akira (1988)/x.mkv", JPN_ENG, {}, "jpn", True, None,
+                 id="anime-path-keeps-jpn-primary-and-the-english-dub"),
     pytest.param(GODZILLA, JPN_ENG, {}, "jpn", True, None,
                  id="dual-audio-keyword-multi-keep"),
     pytest.param("/movies/Parasite (2019)/x.mkv", [_stream(1, "kor"), _stream(2, "eng")], {},
@@ -98,9 +99,9 @@ def test_default_english_no_audios():
                  id="other-original-language-falls-back"),
     pytest.param("/m/tv/May I Ask for One Final Thing!/Season 1/ep.mkv", DUAL_AUDIO_STREAMS, {},
                  "jpn", True, None, id="dual-audio-optin-beats-anime-rule"),
-    # Japanese-DEFAULT stream: anime pruning must still win over default-disposition inference.
+    # Japanese-DEFAULT stream: the anime rule still wins over default-disposition inference.
     pytest.param("/m/tv/Aggretsuko/Season 1/ep.mkv", DUAL_AUDIO_STREAMS, {},
-                 "jpn", False, None, id="plain-anime-jpn-default-still-prunes-the-dub"),
+                 "jpn", True, None, id="plain-anime-jpn-default-keeps-the-dub"),
 ])
 def test_get_audio_lang_pref(path, audios, kwargs, primary, multi, allowed):
     got_allowed, got_primary, got_multi = cs.get_audio_lang_pref(Path(path), audios, **kwargs)
@@ -129,6 +130,41 @@ def test_arr_fetch_failure_on_japanese_original_style_file_keeps_both_tracks():
     allowed, primary, multi = cs.get_audio_lang_pref(Path(FOREIGN), audios, original_language=None)
     kept = cs.select_keep_audio(audios, allowed, primary, multi)
     assert set(kept) == {1, 2}, "both tracks must survive an Arr fetch failure"
+
+
+def test_anime_keeps_the_english_dub_behind_the_japanese_original():
+    """Aggretsuko-style release: the dub is flagged `dub`, yet both tracks stay, jpn first (default)."""
+    audios = [_stream(1, "eng", dub=True, default=True), _stream(2, "jpn")]
+    allowed, primary, multi = cs.get_audio_lang_pref(
+        Path("/m/tv/Aggretsuko/Season 1/ep.mkv"), audios, original_language=None)
+    assert cs.select_keep_audio(audios, allowed, primary, multi) == [2, 1]
+
+
+@pytest.mark.parametrize("sonarr, path, expected", [
+    pytest.param(True, "/m/tv/Some Show/ep.mkv", True, id="sonarr-says-anime-without-a-keyword"),
+    pytest.param(False, "/m/tv/Aggretsuko/ep.mkv", False, id="sonarr-standard-beats-the-keyword"),
+    pytest.param(False, "/m/movies/anime/Akira (1988)/x.mkv", False, id="a-radarr-movie-is-never-anime"),
+    pytest.param(None, "/m/tv/Aggretsuko/ep.mkv", True, id="no-answer-title-keyword"),
+    pytest.param(None, "/library/anime/Some Show/ep.mkv", True, id="no-answer-anime-folder"),
+    pytest.param(None, "/m/tv/Some Show/ep.mkv", False, id="no-answer-no-keyword"),
+])
+def test_is_anime(monkeypatch, sonarr, path, expected):
+    monkeypatch.setattr(audio, "anime_series", lambda p: sonarr)
+    assert is_anime(Path(path)) is expected
+
+
+@pytest.mark.parametrize("audios, expected", [
+    pytest.param([_stream(1, "jpn"), _stream(2, "eng")], True, id="jpn-and-eng"),
+    pytest.param([_stream(1, "ja-JP"), _stream(2, "en-US")], True, id="regional-tags"),
+    pytest.param([_stream(1, "jpn")], False, id="jpn-only"),
+    pytest.param([_stream(2, "eng")], False, id="eng-only"),
+    pytest.param([_stream(1, "jpn"), _stream(2, None)], False, id="untagged-is-not-explicit-english"),
+    pytest.param([_stream(1, "jpn"), _stream(2, "und")], False, id="und-is-not-explicit-english"),
+    pytest.param([_stream(1, "jpn"), _stream(2, "eng", title="Director's Commentary")], False,
+                 id="commentary-does-not-count"),
+])
+def test_is_dual_audio(audios, expected):
+    assert is_dual_audio(audios) is expected
 
 
 def test_select_keep_audio_family_based_matching_ja_jp_with_jpn_allowed():

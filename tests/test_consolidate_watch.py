@@ -1,7 +1,7 @@
 """`consolidate-watch.sh` sidecar-arrival block (run under bash, `log`/`trigger` stubbed): sidecar -> video mapping.
 
-Up to 3 trailing lang/forced/sdh/generated tags are peeled off the stem; a video named exactly like the
-remaining stem wins, but only if `find_sidecar_subs` would give it the sidecar.
+Up to 3 trailing lang/forced/sdh/generated/dub tags are peeled off the stem; a video named exactly like the
+remaining stem wins, but only if `find_sidecar_subs` (or `find_dub_sidecars`) would give it the sidecar.
 """
 
 import re
@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from media_stack.subtitles import find_sidecar_subs  # noqa: E402
+from media_stack.subtitles import find_dub_sidecars, find_sidecar_subs  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parent.parent / "consolidate-watch.sh"
 
@@ -47,7 +47,7 @@ def test_existing_tag_peeling_is_unchanged(tmp_path):
 
 def test_a_sidecar_with_tags_but_no_english_one_triggers_nothing(tmp_path):
     """`find_sidecar_subs` ignores these for `Show.mkv` (no English tag), so the watcher must not fire."""
-    for sidecar in ("Show.hi.srt", "Show.forced.srt", "Show.generated.srt"):
+    for sidecar in ("Show.hi.srt", "Show.forced.srt", "Show.generated.srt", "Show.dub.srt"):
         assert _triggered(tmp_path, sidecar, ["Show.mkv"]) == [], sidecar
 
 
@@ -55,6 +55,9 @@ def test_a_sidecar_with_tags_but_no_english_one_triggers_nothing(tmp_path):
 CROSS_CHECK_CASES = [
     # (sidecar, videos present, expected video or None)
     ("Show.S01E01.en.generated.srt", ["Show.S01E01.mkv"], "Show.S01E01.mkv"),
+    ("Show.S01E01.en.dub.srt", ["Show.S01E01.mkv"], "Show.S01E01.mkv"),
+    ("Show.S01E01.eng.dub.srt", ["Show.S01E01.mp4"], "Show.S01E01.mp4"),
+    ("Show.dub.srt", ["Show.mkv"], None),
     ("Show.S01E01.en.srt", ["Show.S01E01.mp4"], "Show.S01E01.mp4"),
     ("Show.S01E01.en.srt", ["Other.mkv"], None),
     ("Show.Hi.srt", ["Show.mkv", "Show.Hi.mkv"], "Show.Hi.mkv"),
@@ -75,7 +78,8 @@ def test_the_watchers_choice_agrees_with_find_sidecar_subs(tmp_path, sidecar, vi
     (tmp_path / sidecar).write_text("x")
     chosen = _triggered(tmp_path, sidecar, videos)
     accepting = [v for v in videos
-                 if (tmp_path / sidecar) in [p for p, _, _ in find_sidecar_subs(tmp_path / v)]]
+                 if (tmp_path / sidecar) in [*(p for p, _, _ in find_sidecar_subs(tmp_path / v)),
+                                             *find_dub_sidecars(tmp_path / v)]]
     assert chosen == ([expected] if expected else [])
     if accepting:
         # longest stem first; for the same stem the watcher tries mkv before mp4

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Consolidate English subtitles in a media file: pick the best text track, ffsubsync it,
-clean it, and remux it as the only English subtitle (a real Forced track is kept).
+clean it, and remux it as the only English subtitle (a real Forced track is kept; a file
+keeping both Japanese and English audio, if anime, also gets an "English (dub)" subtitle).
 
 Usage: consolidate-subs.py <file> | --scan <dir> [--jobs N]
 Exit codes: 0 ok/skip, 1 hard fail.
@@ -32,18 +33,18 @@ from media_stack.fileid import (  # noqa: E402
 )
 from media_stack.state import load_state, mutate_state, update_state_entry  # noqa: E402
 from media_stack.audio import (  # noqa: E402
-    confident_default_audio, get_audio_lang_pref, select_keep_audio,
+    confident_default_audio, get_audio_lang_pref, is_anime, is_dual_audio, select_keep_audio,
 )
 from media_stack.arrlang import original_language_for  # noqa: E402
 from media_stack.subtitles import (  # noqa: E402
     ass_to_srt, clean_srt_text, count_subtitle_lines, extract_track,
-    decode_subtitle_bytes, decode_subtitle_text, fetch_via_subliminal, find_sidecar_subs,
-    is_forced_track, is_generated_sidecar, is_generated_track, is_sdh_track,
-    run_ffsubsync, score_text_track,
+    decode_subtitle_bytes, decode_subtitle_text, fetch_via_subliminal, find_dub_sidecars,
+    find_sidecar_subs, has_dub_subtitle, is_dub_track, is_forced_track, is_generated_sidecar,
+    is_generated_track, is_sdh_track, run_ffsubsync, score_text_track, strip_hi_annotations,
 )
 from media_stack.sublang import classify_candidate  # noqa: E402
 from media_stack.mux import (  # noqa: E402
-    ENG_GENERATED_TRACK_NAME, ENG_TRACK_NAME, remux,
+    ENG_DUB_TRACK_NAME, ENG_GENERATED_TRACK_NAME, ENG_TRACK_NAME, add_dub_subtitle, remux,
 )
 from media_stack.loudness import normalize_budget_s  # noqa: E402
 from media_stack.locking import acquire_file_lock  # noqa: E402
@@ -618,11 +619,13 @@ _LATE_FOREIGN_REASON = "late sidecar beside already-processed file"
 
 
 def _embedded_english_text_tracks(info: dict | None) -> list[dict]:
-    """Embedded TEXT subtitle streams tagged English."""
+    """Embedded TEXT subtitle streams tagged English, except dub ones (they follow the dub
+    audio and never stand in for a main track)."""
     return [s for s in (info or {}).get("streams", [])
             if s.get("codec_type") == "subtitle"
             and s.get("codec_name") in TEXT_CODECS
-            and is_english_tag((s.get("tags") or {}).get("language"))]
+            and is_english_tag((s.get("tags") or {}).get("language"))
+            and not is_dub_track(s)]
 
 
 def _eligible_embedded(tracks: list[dict], is_forced: bool) -> list[dict]:
@@ -1051,6 +1054,192 @@ class _SubCandidate(NamedTuple):
         return (not self.generated, not self.sdh, self.score)
 
 
+def _embedded_candidate(path: Path, s: dict,
+                        workdir: Path) -> tuple[_SubCandidate | None, str]:
+    """Extract embedded text track `s`, content-gate it and convert it to SRT. Returns
+    `(candidate, outcome)`; outcome is "ok", "failed" (could not be extracted, read or
+    converted) or "rejected" (the content gate proved it foreign)."""
+    ext = ".ass" if s.get("codec_name") in ASS_CODECS else ".srt"
+    tmp = _workfile(workdir, f"embedded{s['index']}", ext)
+    if not extract_track(path, s["index"], s.get("codec_name"), tmp):
+        return None, "failed"
+    # Gate the extracted file before any ASS/SSA conversion.
+    try:
+        is_eng, verdict_info = _gate_local_file(tmp)
+    except OSError as exc:
+        if isinstance(exc, _Unclassifiable):
+            log(f"content-gate SKIP embedded track {s['index']} in {path}: cannot be "
+                f"classified ({exc}); not a candidate")
+        return None, "failed"
+    if not is_eng:
+        log(f"content-gate REJECT embedded track {s['index']} in {path}: "
+            f"tagged English, text scored {verdict_info.get('verdict')} "
+            f"(reason={verdict_info.get('reason')}) -- treated as foreign")
+        return None, "rejected"
+    if tmp.suffix == ".ass":
+        srt_p = _workfile(workdir, f"embedded{s['index']}-srt", ".srt")
+        if not ass_to_srt(tmp, srt_p):
+            return None, "failed"
+        tmp = srt_p
+    lc = count_subtitle_lines(tmp)
+    return (_SubCandidate(score_text_track(s, lc), tmp, "embedded",
+                          is_generated_track(s), is_sdh_track(s)), "ok")
+
+
+# "English (dub)": the subtitle that matches the English DUB audio of a file that keeps both
+# Japanese and English audio (the main track translates the Japanese). Never ffsubsync'd: a
+# release's CC track is timed to its release and a Whisper one to the dub audio itself.
+
+def _finish_dub(srt: Path) -> bool:
+    """Clean the UTF-8 SRT `srt` in place and strip its hearing-impaired annotations; False
+    (file unchanged) if no cue is left."""
+    try:
+        text = strip_hi_annotations(
+            clean_srt_text(srt.read_text(encoding="utf-8", errors="replace")))
+        if "-->" not in text:
+            return False
+        srt.write_text(text, encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _dub_from_sidecar(sc_path: Path, workdir: Path) -> tuple[Path, Identity] | None:
+    """Read the `.en.dub.srt` `sc_path` ONCE, content-gate it and return its cleaned SRT
+    working copy with the identity it was read at. A foreign one is quarantined; one that
+    cannot be read or converted, or has no dialogue left, stays in place. None then."""
+    try:
+        snap, text = _snapshot_text(sc_path)
+        is_eng, verdict_info = classify_candidate(text)
+        if not is_eng:
+            log(f"content-gate REJECT dub sidecar {sc_path}: named English, text scored "
+                f"{verdict_info.get('verdict')} (reason={verdict_info.get('reason')}) "
+                f"-- quarantining")
+            _quarantine_sidecar(sc_path, snap, verdict_info,
+                                "dub sidecar rejected during consolidation")
+            return None
+        local = _sidecar_as_srt(sc_path, workdir, data=text.encode("utf-8"))
+    except (OSError, subprocess.SubprocessError) as exc:   # _Unclassifiable is an OSError
+        log(f"dub sidecar {sc_path} left in place: {exc}")
+        return None
+    if local is None or not _finish_dub(local):
+        log(f"dub sidecar {sc_path} left in place: could not be converted to SRT "
+            f"or has no dialogue")
+        return None
+    return local, snap.identity
+
+
+def _dub_srt(workdir: Path, sidecars: list[Path], embedded: list[_SubCandidate],
+             consumed: dict[Path, Identity]) -> Path | None:
+    """The cleaned working SRT for the dub track, else None: the first usable `.en.dub.srt`
+    (recorded in `consumed`), otherwise the best-scoring dub-like embedded candidate."""
+    for sc_path in sidecars:
+        got = _dub_from_sidecar(sc_path, workdir)
+        if got is not None:
+            consumed[sc_path] = got[1]
+            return got[0]
+    best = max(embedded, key=lambda c: c.score, default=None)
+    return best.path if best is not None and _finish_dub(best.path) else None
+
+
+def _verify_added_dub(out: Path, src_info: dict) -> str | None:
+    """Re-probe `out` of a dub add; the first mismatch with the source plus one new subtitle,
+    else None: video, audio and the existing subtitles unchanged in count and default/forced
+    flags, the CONSOLIDATED_SUBS tag kept, and the new "English (dub)" subtitle last
+    (English, neither default nor forced)."""
+    info = probe(out)
+    if not info:
+        return "probe of the remuxed file failed"
+
+    def of(i: dict, kind: str) -> list[dict]:
+        return [s for s in i.get("streams", []) if s.get("codec_type") == kind]
+
+    def flags(ss: list[dict]) -> list[tuple[bool, bool]]:
+        return [(bool((s.get("disposition") or {}).get("default")),
+                 bool((s.get("disposition") or {}).get("forced"))) for s in ss]
+
+    for kind in ("video", "audio"):
+        if flags(of(info, kind)) != flags(of(src_info, kind)):
+            return f"{kind} streams or their flags changed"
+    out_subs, src_subs = of(info, "subtitle"), of(src_info, "subtitle")
+    if len(out_subs) != len(src_subs) + 1 or flags(out_subs[:-1]) != flags(src_subs):
+        return "the existing subtitles changed"
+    new = out_subs[-1]
+    if (not is_english_tag((new.get("tags") or {}).get("language"))
+            or (new.get("tags") or {}).get("title") != ENG_DUB_TRACK_NAME
+            or flags([new]) != [(False, False)]):
+        return "the new subtitle is not an English dub track that is neither default nor forced"
+    if already_processed(src_info) and not already_processed(info):
+        return "the CONSOLIDATED_SUBS tag was lost"
+    return None
+
+
+def _add_late_dub(path: Path, path_str: str, dry_run: bool, info: dict | None,
+                  prev: dict | None, video_identity: Identity | None) -> dict | None:
+    """An ALREADY-PROCESSED anime file that keeps both Japanese and English audio and has no dub
+    subtitle yet takes a `.en.dub.srt` as a new "English (dub)" track: a plain mkvmerge copy
+    of the file plus that track, nothing else reprocessed. Verified before the swap, state
+    updated, the consumed sidecar removed. Returns the result, or None when there is nothing
+    to do (no dub sidecar, not dual anime, a dub track already there, the sidecar unusable) so the
+    late-sidecar sweep goes on. No playback gate: like every swap here it is an atomic
+    `os.replace`, and a session playing the old file keeps its open inode."""
+    sidecars = find_dub_sidecars(path)
+    if not sidecars or path.suffix.lower() != ".mkv":
+        return None
+    if info is None:
+        info = probe(path)
+    if not info:
+        return None
+    if not (is_dual_audio([s for s in info.get("streams", []) if s.get("codec_type") == "audio"])
+            and is_anime(path)):
+        return None
+    if has_dub_subtitle(info):
+        log(f"dub sidecar {sidecars[0]} left in place: {path.name} already has a dub subtitle")
+        return None
+    if dry_run:
+        return {"path": path_str, "status": "SKIP",
+                "detail": f"dry-run: would add dub subtitle ({sidecars[0].name})"}
+    workdir = Path(tempfile.mkdtemp(prefix=f"consolsub_{os.getpid()}_", dir=path.parent))
+    out = path.with_suffix(path.suffix + f".consol.{os.getpid()}.tmp.mkv")
+    try:
+        got = None
+        for sc_path in sidecars:
+            got = _dub_from_sidecar(sc_path, workdir)
+            if got is not None:
+                break
+        if got is None:
+            return None
+        dub_srt, sc_ident = got
+        out.unlink(missing_ok=True)
+        ok, detail = add_dub_subtitle(path, out, dub_srt)
+        if not ok:
+            return {"path": path_str, "status": "FAIL", "detail": f"dub remux: {detail}"}
+        problem = _verify_added_dub(out, info)
+        if problem:
+            return {"path": path_str, "status": "FAIL", "detail": f"dub verify: {problem}"}
+        if file_identity(path) != video_identity:
+            log(f"{path.name} changed while its dub subtitle was added; original kept")
+            return {"path": path_str, "status": "SKIP",
+                    "detail": "dub: the video changed, original kept"}
+        early_result, _tag_written = _expose_tag_normalize(
+            out, path, path, path_str, tag=False, normalize=False)
+        if early_result is not None:
+            return early_result
+        if file_identity(sc_path) == sc_ident:
+            sc_path.unlink(missing_ok=True)
+        else:
+            log(f"WARNING: dub sidecar {sc_path} changed since it was read; left in place")
+        size, mtime = file_key(path)
+        update_state_entry(STATE_FILE, str(path.resolve()),
+                           {**(prev or {"status": "skip-tag"}),
+                            "size": size, "mtime": mtime, "v": PIPELINE_VERSION})
+        return {"path": path_str, "status": "FIXED",
+                "detail": f"dub subtitle added from {sc_path.name}"}
+    finally:
+        out.unlink(missing_ok=True)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 # Generated -> real subtitle upgrade. A file consolidated with only a Whisper transcript
 # ("English (generated)") promises a real subtitle will replace it. Runs under the per-file
 # lock BEFORE the state-cache / tag-present skips. A sidecar is used only once proven the
@@ -1085,10 +1274,12 @@ class _Upgrade(NamedTuple):
 _KEEPABLE_SUB_CODECS = TEXT_CODECS | IMAGE_CODECS
 
 
-def _forced_english_tracks(sub_streams: list[dict]) -> list[dict]:
-    """Every forced English subtitle track (text or image); an upgrade carries each over."""
+def _upgrade_kept_tracks(sub_streams: list[dict]) -> list[dict]:
+    """Every forced English subtitle track (text or image) and every English dub track; an
+    upgrade carries each over."""
     return [s for s in sub_streams
-            if is_english_tag((s.get("tags") or {}).get("language")) and is_forced_track(s)]
+            if is_english_tag((s.get("tags") or {}).get("language"))
+            and (is_forced_track(s) or is_dub_track(s))]
 
 
 def _read_snapshot(p: Path) -> _Snapshot | None:
@@ -1221,16 +1412,17 @@ def _generated_upgrade_check(path: Path, cur: tuple[int, int], prev: dict | None
     gen_tracks = [s for s in info.get("streams", [])
                   if s.get("codec_type") == "subtitle"
                   and is_english_tag((s.get("tags") or {}).get("language"))
-                  and s.get("codec_name") in TEXT_CODECS and not is_forced_track(s)]
+                  and s.get("codec_name") in TEXT_CODECS and not is_forced_track(s)
+                  and not is_dub_track(s)]
     if not gen_tracks or not all(is_generated_track(s) for s in gen_tracks):
         return None, info, None
     gen = gen_tracks[0]
     subs_src = [s for s in info.get("streams", []) if s.get("codec_type") == "subtitle"]
-    unkeepable = [s for s in _forced_english_tracks(subs_src)
+    unkeepable = [s for s in _upgrade_kept_tracks(subs_src)
                   if s.get("codec_name") not in _KEEPABLE_SUB_CODECS]
     if unkeepable:
-        # The upgrade rebuilds subtitles, so it must carry every forced English track over.
-        log(f"UPGRADE-SKIP: {path.name}: forced English subtitle track(s) it cannot keep "
+        # The upgrade rebuilds subtitles, so it must carry every forced and dub track over.
+        log(f"UPGRADE-SKIP: {path.name}: forced or dub English subtitle track(s) it cannot keep "
             f"(codec {', '.join(str(s.get('codec_name')) for s in unkeepable)}); "
             f"keeping the generated subtitle")
         return None, info, None
@@ -1315,8 +1507,8 @@ def _verify_upgrade_output(out: Path, video_streams: list[dict], audio_streams: 
                            ) -> str | None:
     """Re-probe `out`; the first mismatch with what an upgrade must produce, else None:
     every source video/audio stream in order with its flags; then every kept forced English
-    track (source codec, English tag, flags); then the new main English subtitle (English,
-    default, not forced)."""
+    or dub track (source codec, English tag, flags); then the new main English subtitle
+    (English, default, not forced)."""
     info = probe(out)
     if not info:
         return "probe of the remuxed file failed"
@@ -1347,13 +1539,13 @@ def _verify_upgrade_output(out: Path, video_streams: list[dict], audio_streams: 
     for pos, src in enumerate(kept_subs):
         got = out_s[pos]
         if got.get("codec_name") != src.get("codec_name"):
-            return (f"kept forced subtitle #{pos + 1} changed codec: "
+            return (f"kept subtitle #{pos + 1} changed codec: "
                     f"{src.get('codec_name')} -> {got.get('codec_name')}")
         if not _english(got):
-            return f"kept forced subtitle #{pos + 1} is not tagged English"
+            return f"kept subtitle #{pos + 1} is not tagged English"
         want = (flags[src["index"]]["default"], flags[src["index"]]["forced"])
         if got_subs[pos] != want:
-            return (f"kept forced subtitle #{pos + 1} flags changed: default/forced "
+            return (f"kept subtitle #{pos + 1} flags changed: default/forced "
                     f"expected={want} got={got_subs[pos]}")
     main = out_s[-1]
     main_default, main_forced = got_subs[-1]
@@ -1366,10 +1558,11 @@ def _verify_upgrade_output(out: Path, video_streams: list[dict], audio_streams: 
 
 
 def _verify_kept_source_subs(out: Path, n_video: int, n_audio: int, src: "dict | None",
-                             kept: dict[int, dict[str, bool]]) -> str | None:
+                             kept: dict[int, dict[str, bool]], dub: bool = False) -> str | None:
     """Re-probe `out` of a full pass that stream-copied an unreadable embedded forced
     English track (`kept`); the first mismatch, else None. Expects the source track (codec,
-    English tag, exact flags), then the new main English subtitle (default, not forced)."""
+    English tag, exact flags), then the new main English subtitle (default, not forced), then
+    with `dub` the "English (dub)" one (neither)."""
     if src is None:
         return "no source track to compare with"
     info = probe(out)
@@ -1379,15 +1572,16 @@ def _verify_kept_source_subs(out: Path, n_video: int, n_audio: int, src: "dict |
     out_v = [s for s in streams if s.get("codec_type") == "video"]
     out_a = [s for s in streams if s.get("codec_type") == "audio"]
     out_s = [s for s in streams if s.get("codec_type") == "subtitle"]
-    if (len(out_v), len(out_a), len(out_s)) != (n_video, n_audio, 2):
-        return (f"expected video={n_video} audio={n_audio} subs=2, got "
+    n_subs = 3 if dub else 2
+    if (len(out_v), len(out_a), len(out_s)) != (n_video, n_audio, n_subs):
+        return (f"expected video={n_video} audio={n_audio} subs={n_subs}, got "
                 f"video={len(out_v)} audio={len(out_a)} subs={len(out_s)}")
 
     def _flags(s: dict) -> tuple[bool, bool]:
         d = s.get("disposition") or {}
         return bool(d.get("default")), bool(d.get("forced"))
 
-    first, main = out_s
+    first, main = out_s[:2]
     want = kept[src["index"]]
     if first.get("codec_name") != src.get("codec_name"):
         return (f"the kept forced track changed codec: {src.get('codec_name')} -> "
@@ -1401,6 +1595,9 @@ def _verify_kept_source_subs(out: Path, n_video: int, n_audio: int, src: "dict |
         return "the new main subtitle is not tagged English"
     if _flags(main) != (True, False):
         return f"the new main subtitle must be default and not forced, got {_flags(main)}"
+    if dub and (not is_english_tag((out_s[2].get("tags") or {}).get("language"))
+                or _flags(out_s[2]) != (False, False)):
+        return "the dub subtitle must be English, neither default nor forced"
     return None
 
 
@@ -1446,6 +1643,9 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
         if prev and prev.get("size") == cur[0] and prev.get("mtime") == cur[1] and prev.get("v") == PIPELINE_VERSION:
             if rejected and not dry_run:
                 _record_upgrade_rejected(key, prev, rejected)
+            added = _add_late_dub(path, path_str, dry_run, info, prev, video_identity)
+            if added is not None:
+                return added
             foreign, redundant = _late_sidecar_sweep(path, dry_run, info, remembered,
                                                      video_identity)
             return {"path": path_str, "status": "SKIP",
@@ -1457,6 +1657,9 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
             return {"path": path_str, "status": "FAIL", "detail": "probe failed"}
 
         if already_processed(info):
+            added = _add_late_dub(path, path_str, dry_run, info, None, video_identity)
+            if added is not None:
+                return added
             if not dry_run:
                 entry = {"size": cur[0], "mtime": cur[1],
                          "v": PIPELINE_VERSION, "status": "skip-tag"}
@@ -1546,6 +1749,38 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
         keep_video_idx = [s["index"] for s in video_streams_all]
         dropped_video = 0
 
+    # `original_language_for` (Radarr/Sonarr) detects foreign-original films without
+    # trusting the Matroska `default` flag, which release groups routinely set on a DUB.
+    # multi_keep: anime, per-title opt-ins and foreign-original films keep the original track
+    # AND the English dub; the Korean keyword path keeps a single best track.
+    upgrade_flags: dict[int, dict[str, bool]] | None = None
+    kept_subs: list[dict] = []
+    if upgrade is None:
+        allowed_langs, primary_lang, multi_keep = get_audio_lang_pref(
+            path, audio_streams, original_language=original_language_for(path))
+        keep_audio_idx = select_keep_audio(audio_streams, allowed_langs, primary_lang, multi_keep)
+    else:
+        # An upgrade changes only the subtitle: audio, forced English and dub tracks stay
+        # as they are, with their source flags (via remux's cleanup_flags).
+        primary_lang = "unchanged"
+        keep_audio_idx = [s["index"] for s in audio_streams]
+        kept_subs = _upgrade_kept_tracks(sub_streams)
+        upgrade_flags = _upgrade_track_flags(video_streams_all, audio_streams, kept_subs)
+    dropped_audio = max(0, len(audio_streams) - len(keep_audio_idx))
+
+    # An ANIME file that keeps Japanese AND English audio gets a second English subtitle
+    # matching the dub: a `.en.dub.srt`, else an embedded dub/CC/SDH track, which then stays
+    # out of the main ranking (unless nothing else is a candidate: see below). An upgrade keeps
+    # the dub track it already has.
+    dual = (upgrade is None
+            and is_dual_audio([s for s in audio_streams if s["index"] in keep_audio_idx])
+            and is_anime(path))
+    dub_sidecars = find_dub_sidecars(path) if upgrade is None else []
+    dub_idx = {s["index"] for s in main_candidates if is_dub_track(s)} if dual else set()
+    if dub_sidecars and not dual:
+        log(f"dub sidecar(s) {', '.join(p.name for p in dub_sidecars)} left in place: "
+            f"{path.name} is not anime keeping both Japanese and English audio")
+
     if not main_candidates and not eng_image and not sidecar_main:
         if sidecar_forced or forced_text:
             return _cleanup_no_main_english(
@@ -1585,6 +1820,7 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
         chosen_srt: Path | None = None
 
         scored: list[_SubCandidate] = []
+        dub_cands: list[_SubCandidate] = []   # the dub-like embedded ones among `scored`
         # content_rejected: TEXT scored non-English despite an English tag/name.
         # extraction_failed: could not be extracted/read/converted (tooling, kept visible).
         # rejected_embedded: embedded tracks proven non-English (the cleanup drops them).
@@ -1594,36 +1830,16 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
             {rejected_forced_idx} if rejected_forced_idx is not None else set())
 
         for s in main_candidates:
-            ext = ".ass" if s.get("codec_name") in ASS_CODECS else ".srt"
-            tmp = _workfile(workdir, f"embedded{s['index']}", ext)
-            if not extract_track(path, s["index"], s.get("codec_name"), tmp):
-                extraction_failed += 1
-                continue
-            # Gate the extracted file before any ASS/SSA conversion.
-            try:
-                is_eng, verdict_info = _gate_local_file(tmp)
-            except OSError as exc:
-                if isinstance(exc, _Unclassifiable):
-                    log(f"content-gate SKIP embedded track {s['index']} in {path}: cannot be "
-                        f"classified ({exc}); not a candidate")
-                extraction_failed += 1
-                continue
-            if not is_eng:
+            candidate, outcome = _embedded_candidate(path, s, workdir)
+            if candidate is not None:
+                scored.append(candidate)
+                if s["index"] in dub_idx:
+                    dub_cands.append(candidate)
+            elif outcome == "rejected":
                 content_rejected += 1
                 rejected_embedded.add(s["index"])
-                log(f"content-gate REJECT embedded track {s['index']} in {path}: "
-                    f"tagged English, text scored {verdict_info.get('verdict')} "
-                    f"(reason={verdict_info.get('reason')}) -- treated as foreign")
-                continue
-            if tmp.suffix == ".ass":
-                srt_p = _workfile(workdir, f"embedded{s['index']}-srt", ".srt")
-                if not ass_to_srt(tmp, srt_p):
-                    extraction_failed += 1
-                    continue
-                tmp = srt_p
-            lc = count_subtitle_lines(tmp)
-            scored.append(_SubCandidate(score_text_track(s, lc), tmp, "embedded",
-                                        is_generated_track(s), is_sdh_track(s)))
+            else:
+                extraction_failed += 1
 
         consumed_from: dict[Path, Path] = {}  # working file -> its sidecar (upgrade)
         for n, (sc_path, is_sdh, sc_generated) in enumerate(sidecar_main):
@@ -1759,6 +1975,13 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
                 forced_text, eng_image, dry_run, proven_foreign,
             )
 
+        # Dub-like candidates leave the main ranking only when another candidate can be the main;
+        # a sole CC/SDH track stays the main, as before.
+        mains = [c for c in scored if c not in dub_cands]
+        if mains:
+            scored = mains
+        else:
+            dub_cands = []
         scored.sort(key=lambda c: c.rank, reverse=True)
         chosen = scored[0]
         chosen_srt, chosen_generated = chosen.path, chosen.generated
@@ -1792,6 +2015,8 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
                     log(f"WARNING: forced sidecar {fside} could not be embedded: "
                         f"{type(exc).__name__}: {exc}; left in place, trying the next one")
 
+        dub_srt = _dub_srt(workdir, dub_sidecars, dub_cands, consumed) if dual else None
+
         try:
             txt = chosen_srt.read_text(encoding="utf-8", errors="replace")
             cleaned = clean_srt_text(txt)
@@ -1802,25 +2027,6 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
         synced_srt = _workfile(workdir, "synced", ".srt")
         sync_ok = run_ffsubsync(path, chosen_srt, synced_srt)
         final_srt = synced_srt if sync_ok else chosen_srt
-
-        # `original_language_for` (Radarr/Sonarr) detects foreign-original films without
-        # trusting the Matroska `default` flag, which release groups routinely set on a DUB.
-        # multi_keep is True only for live-action foreign-original films; the anime/Korean
-        # keyword paths keep a single best track.
-        upgrade_flags: dict[int, dict[str, bool]] | None = None
-        kept_forced: list[dict] = []
-        if upgrade is None:
-            allowed_langs, primary_lang, multi_keep = get_audio_lang_pref(
-                path, audio_streams, original_language=original_language_for(path))
-            keep_audio_idx = select_keep_audio(audio_streams, allowed_langs, primary_lang, multi_keep)
-        else:
-            # An upgrade changes only the subtitle: audio and forced English tracks stay
-            # as they are, with their source flags (via remux's cleanup_flags).
-            primary_lang = "unchanged"
-            keep_audio_idx = [s["index"] for s in audio_streams]
-            kept_forced = _forced_english_tracks(sub_streams)
-            upgrade_flags = _upgrade_track_flags(video_streams_all, audio_streams, kept_forced)
-        dropped_audio = max(0, len(audio_streams) - len(keep_audio_idx))
 
         out = path.with_suffix(path.suffix + f".consol.{os.getpid()}.tmp.mkv")
         out.unlink(missing_ok=True)
@@ -1839,19 +2045,24 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
                 "default": bool(disp.get("default")), "forced": bool(disp.get("forced"))}}
             log(f"keeping the unreadable embedded forced track "
                 f"{unreadable_forced_stream['index']} of {path} unchanged")
+        extra: dict = {}
+        if kept_source_subs:
+            extra["kept_source_subs"] = kept_source_subs
+        if dub_srt:
+            extra["dub_srt"] = dub_srt
         ok, detail = remux(
             path, out, keep_video_idx, keep_audio_idx, final_srt, forced_srt_final,
-            keep_subtitle_indices=[s["index"] for s in kept_forced] or None,
+            keep_subtitle_indices=[s["index"] for s in kept_subs] or None,
             cleanup_flags=upgrade_flags,
             eng_track_name=ENG_GENERATED_TRACK_NAME if chosen_generated else ENG_TRACK_NAME,
-            **({"kept_source_subs": kept_source_subs} if kept_source_subs else {}))
+            **extra)
         if not ok:
             out.unlink(missing_ok=True)
             return {"path": path_str, "status": "FAIL", "detail": f"remux: {detail}"}
         if kept_source_subs is not None:
             problem = _verify_kept_source_subs(
                 out, len(keep_video_idx), len(keep_audio_idx), unreadable_forced_stream,
-                kept_source_subs)
+                kept_source_subs, dub=dub_srt is not None)
             if problem:
                 out.unlink(missing_ok=True)
                 return {"path": path_str, "status": "FAIL",
@@ -1859,7 +2070,7 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
         if upgrade is not None:
             assert upgrade_flags is not None
             problem = _verify_upgrade_output(
-                out, video_streams_all, audio_streams, kept_forced, upgrade_flags)
+                out, video_streams_all, audio_streams, kept_subs, upgrade_flags)
             if problem:
                 out.unlink(missing_ok=True)
                 return {"path": path_str, "status": "FAIL",
@@ -1935,15 +2146,16 @@ def _process_locked(path: Path, path_str: str, dry_run: bool = False) -> dict:
         _clear_needs_english(replacement, dry_run)
 
         dropped_embedded = max(0, len(sub_streams) - (
-            1 + (len(kept_forced) if upgrade else (1 if forced_srt_final else 0))
-            + (1 if kept_source_subs else 0)))
+            1 + (len(kept_subs) if upgrade else (1 if forced_srt_final else 0))
+            + (1 if kept_source_subs else 0) + (1 if dub_srt else 0)))
         return {"path": str(replacement), "status": "FIXED",
                 "detail": (f"{'UPGRADE generated->real ' if upgrade else ''}"
                            f"synced={sync_ok} dropped_subs={dropped_embedded} "
                            f"dropped_audio={dropped_audio} "
                            f"dropped_video={dropped_video} "
                            f"dropped_sidecars={dropped_sidecars} "
-                           f"audio_lang={primary_lang}")}
+                           f"audio_lang={primary_lang}"
+                           f"{' dub_subtitle=1' if dub_srt else ''}")}
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

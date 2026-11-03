@@ -49,6 +49,17 @@ ONE FILE AT A TIME: `consolidate-watch.sh` has no concurrency cap on sidecar arr
 this places one sidecar, waits for that file's pipeline run to finish or time out, then
 starts the next.
 
+`--dub` MODE (own cron line and lock file, so a long dub backlog never blocks the NEEDS_BAZARR
+run; same budget, playback gate and logs): a different job.
+A CONSOLIDATED_SUBS anime file (`is_anime`: Sonarr `seriesType`, else the path keywords) that
+keeps both Japanese and English audio (`is_dual_audio`) but has no dub-like English text
+subtitle (`has_dub_subtitle`) and no `.en.dub.srt` gets a whole-file Whisper transcript of its
+English audio, published as `<stem>.en.dub.srt` (same no-clobber placement); consolidate-subs.py
+then adds it as the "English (dub)" track. Targets come from walking `MEDIA_ROOT`'s `tv/`
+`.mkv` files (a Radarr movie is never anime); a file whose tag, audio and subtitles settle it
+as no target is remembered by `[ino, size, mtime_ns]` in `var/state/sub-fallback-dub.json` so
+the next run skips the probe.
+
 Exit codes:
   0  ok, including nothing to do, a second instance finding the lock held, and a
      playback wait that exceeded SUB_FALLBACK_MAX_WAIT_MIN
@@ -72,6 +83,7 @@ from typing import Callable, NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from media_stack.audio import is_anime, is_dual_audio  # noqa: E402
 from media_stack.clients.jellyfin import JellyfinClient  # noqa: E402
 from media_stack.envconfig import env_float, env_int  # noqa: E402
 from media_stack.fileid import identity_matches  # noqa: E402
@@ -79,7 +91,7 @@ from media_stack.locking import (  # noqa: E402
     acquire_file_lock, acquire_singleton_lock, handle_sigterm as _handle_sigterm,
 )
 from media_stack.paths import (  # noqa: E402
-    MEDIA_LAN_IP, MEDIA_STACK_ROOT, VAR_DIR, VAR_LOG, VAR_RUN, VAR_STATE,
+    MEDIA_LAN_IP, MEDIA_ROOT, MEDIA_STACK_ROOT, VAR_DIR, VAR_LOG, VAR_RUN, VAR_STATE,
     ensure_var_dirs, load_env_file,
 )
 from media_stack.playback import (  # noqa: E402
@@ -87,9 +99,11 @@ from media_stack.playback import (  # noqa: E402
     wait_while_playing as _shared_wait_while_playing,
 )
 from media_stack.probe import already_processed, probe  # noqa: E402
-from media_stack.state import load_state_locked, mutate_state  # noqa: E402
+from media_stack.state import load_state, load_state_locked, mutate_state  # noqa: E402
 from media_stack.sublang import score as sublang_score  # noqa: E402
-from media_stack.subtitles import fetch_via_subliminal, find_sidecar_subs  # noqa: E402
+from media_stack.subtitles import (  # noqa: E402
+    fetch_via_subliminal, find_dub_sidecars, find_sidecar_subs, has_dub_subtitle,
+)
 from media_stack.subverify import (  # noqa: E402
     CHILD_PLAYBACK_WAIT_REPORT_FILENAME, MIN_ASR_WORDS, MIN_BIGRAM_RATIO,
     MIN_WORD_RATIO, asr_window, detect_language, english_audio_stream,
@@ -99,7 +113,9 @@ from media_stack.subverify import (  # noqa: E402
 ensure_var_dirs()  # writer: lock file + jsonl log
 
 NEEDS_ENGLISH_STATE_FILE = VAR_STATE / "needs-english.json"   # written by consolidate-subs.py
+DUB_CHECKED_FILE = VAR_STATE / "sub-fallback-dub.json"        # --dub: settled non-targets
 LOCK_FILE = VAR_RUN / "sub-fallback.lock"
+DUB_LOCK_FILE = VAR_RUN / "sub-fallback-dub.lock"
 JSONL_FILE = VAR_LOG / "sub-fallback.jsonl"
 
 # Local disk: a temp file on the pool would compete for the I/O the playback gate protects.
@@ -124,6 +140,8 @@ SIDECAR_MODE = 0o644
 # consolidate-watch.sh treat it as a tag beside ".en".
 PLAIN_SIDECAR_SUFFIX = ".en.srt"
 GENERATED_SIDECAR_SUFFIX = ".en.generated.srt"
+# The subtitle for the English dub audio (consolidate-subs.py muxes it as "English (dub)").
+DUB_SIDECAR_SUFFIX = ".en.dub.srt"
 
 
 class ASRTimeout(Exception):
@@ -499,8 +517,10 @@ def _run_consolidate_subs_directly(video: Path, timeout_s: float, workdir: Path)
 
 
 def _sidecar_dest(video: Path, source: str) -> Path:
-    """`<stem>.en.generated.srt` for Whisper, `<stem>.en.srt` otherwise."""
-    suffix = GENERATED_SIDECAR_SUFFIX if source == "whisper" else PLAIN_SIDECAR_SUFFIX
+    """`<stem>.en.generated.srt` for Whisper, `<stem>.en.dub.srt` for a dub transcript,
+    `<stem>.en.srt` otherwise."""
+    suffix = {"whisper": GENERATED_SIDECAR_SUFFIX,
+              "dub": DUB_SIDECAR_SUFFIX}.get(source, PLAIN_SIDECAR_SUFFIX)
     return video.with_name(video.stem + suffix)
 
 
@@ -523,7 +543,8 @@ def _cleanup_stale_sidecar_temps(dest: Path) -> None:
 
 def _place_sidecar(video: Path, dest: Path, text: str,
                    *, video_identity: tuple[int, int, int, int, int] | None,
-                   pipeline_timeout_s: float, rec: dict, workdir: Path) -> str | None:
+                   pipeline_timeout_s: float, rec: dict, workdir: Path,
+                   dub: bool = False) -> str | None:
     """Publish `text` as `dest` atomically, never exposing partial content or clobbering.
 
     On this mergerfs pool `renameat2(RENAME_NOREPLACE)` returns `EINVAL` but `os.link()`
@@ -537,6 +558,8 @@ def _place_sidecar(video: Path, dest: Path, text: str,
     Right before the link: re-probe (`ALREADY_CONSOLIDATED`), any forced sidecar
     (`FORCED_SIDECAR_PRESENT`), any main sidecar (`SIDECAR_APPEARED`), `video_identity`
     (`VIDEO_CHANGED`), same-stem sibling (`SIBLING_COLLISION`); any leaves `dest` untouched.
+    With `dub` the file must instead BE consolidated (`NOT_CONSOLIDATED`) with no dub subtitle
+    (`DUB_PRESENT`) and no dub sidecar (`SIDECAR_APPEARED`); the rest is the same.
     `FileExistsError` is the real no-clobber guarantee (`SIDECAR_APPEARED`); any other
     `OSError` is `PLACE_FAILED`, NEVER a fallback to a clobbering rename.
 
@@ -562,12 +585,20 @@ def _place_sidecar(video: Path, dest: Path, text: str,
         info = probe(video)
         if info is None:
             return "PROBE_FAILED"
-        if already_processed(info):
-            return "ALREADY_CONSOLIDATED"
-        if _has_forced_sidecar(video):
-            return "FORCED_SIDECAR_PRESENT"
-        if _main_sidecars(video):
-            return "SIDECAR_APPEARED"
+        if dub:
+            if not already_processed(info):
+                return "NOT_CONSOLIDATED"
+            if has_dub_subtitle(info):
+                return "DUB_PRESENT"
+            if find_dub_sidecars(video):
+                return "SIDECAR_APPEARED"
+        else:
+            if already_processed(info):
+                return "ALREADY_CONSOLIDATED"
+            if _has_forced_sidecar(video):
+                return "FORCED_SIDECAR_PRESENT"
+            if _main_sidecars(video):
+                return "SIDECAR_APPEARED"
         if _video_identity(video) != video_identity:
             return "VIDEO_CHANGED"
         if _sibling_video_collision(video) is not None:
@@ -813,6 +844,187 @@ def process_candidate(video: Path, cfg: Config, jellyfin: JellyfinClient,
         rec["elapsed_s"] = round(time.monotonic() - t0, 1)
 
 
+# --- --dub mode: a transcript of the English dub for dual-audio files ---------------------
+
+# Settled by the file's own contents, so remembered per identity; a pending dub sidecar is not.
+_DUB_SETTLED = frozenset({"NOT_CONSOLIDATED", "NOT_DUAL_AUDIO", "DUB_PRESENT"})
+# Neither logged nor recorded in the jsonl. NOT_ANIME comes from Sonarr, not the file, so it is
+# never remembered (a series type can change) but is cheap: it is judged before any probe.
+_DUB_QUIET = _DUB_SETTLED | {"DUB_SIDECAR_PRESENT", "NOT_ANIME"}
+
+
+def _dub_skip_reason(video: Path, info: dict) -> str | None:
+    """Why `video` (its `probe()` result) needs no dub transcript, else None."""
+    if not already_processed(info):
+        return "NOT_CONSOLIDATED"
+    if not is_dual_audio([s for s in info.get("streams", []) if s.get("codec_type") == "audio"]):
+        return "NOT_DUAL_AUDIO"
+    if has_dub_subtitle(info):
+        return "DUB_PRESENT"
+    if find_dub_sidecars(video):
+        return "DUB_SIDECAR_PRESENT"
+    return None
+
+
+def _dub_files(media_root: Path) -> list[tuple[Path, list[int]]]:
+    """`.mkv` files under `tv/` (a Radarr movie is never anime; hidden names skipped; only
+    Matroska carries the pipeline tag) as `(path, [ino, size, mtime_ns])`, newest first."""
+    found: list[tuple[Path, list[int]]] = []
+    for dirpath, dirnames, filenames in os.walk(media_root / "tv"):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for name in filenames:
+            lower = name.lower()
+            if name.startswith(".") or not lower.endswith(".mkv") or lower.endswith(".tmp.mkv"):
+                continue
+            path = Path(dirpath) / name
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            found.append((path, [st.st_ino, st.st_size, st.st_mtime_ns]))
+    found.sort(key=lambda t: t[1][2], reverse=True)
+    return found
+
+
+def wait_for_dub(video: Path, dest: Path, timeout_s: float) -> tuple[bool, int]:
+    """Poll until consolidate-subs.py has taken (or quarantined) the sidecar `dest` AND
+    released `video`'s lock. Returns `(reached, waited_seconds)`."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout_s:
+        if not dest.exists() and _pipeline_lock_is_free(video):
+            return True, int(time.monotonic() - t0)
+        time.sleep(PIPELINE_POLL_S)
+    return False, int(time.monotonic() - t0)
+
+
+def process_dub_candidate(video: Path, cfg: Config, jellyfin: JellyfinClient,
+                          workdir: Path, budget_deadline: float) -> dict:
+    """Give the dual-audio `video` a Whisper transcript of its English audio as
+    `<stem>.en.dub.srt`. `rec["result"]` is a `_dub_skip_reason` for a non-target, else the
+    outcome. Raises only `PlaybackWaitTimeout`, which ends the run cleanly."""
+    rec: dict = {"path": str(video), "mode": "dub"}
+    t0 = time.monotonic()
+    try:
+        if _sibling_video_collision(video) is not None:
+            rec["result"] = "SIBLING_COLLISION"
+            return rec
+        if not is_anime(video):
+            rec["result"] = "NOT_ANIME"
+            return rec
+        initial_identity = _video_identity(video)
+        budget = PlaybackWaitBudget(cfg.max_wait_min)
+        wait_while_playing(jellyfin, cfg, budget)   # before ANY read of the file
+
+        info = probe(video)
+        if info is None:
+            rec["result"] = "PROBE_FAILED"
+            return rec
+        reason = _dub_skip_reason(video, info)
+        if reason is not None:
+            rec["result"] = reason
+            return rec
+        # `is_dual_audio` guarantees an explicitly English stream, so no language-ID pass.
+        audio_idx = english_audio_stream(info)
+        if audio_idx is None:
+            rec["result"] = "NO_ENGLISH_AUDIO"
+            return rec
+
+        if budget_deadline - time.monotonic() < DEFER_TRANSCRIPTION_IF_BUDGET_UNDER_S:
+            rec["result"] = "DEFERRED_BUDGET"
+            return rec
+        try:
+            srt_text = _transcribe_in_subprocess(
+                video, audio_idx, cfg, budget, workdir, cfg.asr_timeout_min * 60)
+        except ASRTimeout:
+            rec["result"] = "ASR_TIMEOUT"
+            return rec
+        except MissingJellyfinKey as exc:
+            rec["result"] = "MISSING_JELLYFIN_KEY"
+            rec["error"] = str(exc)
+            return rec
+        rec["whisper_cues"] = srt_text.count(" --> ")
+        if rec["whisper_cues"] < MIN_WHISPER_CUES:
+            rec["result"] = "TOO_FEW_CUES"
+            return rec
+
+        wait_while_playing(jellyfin, cfg, budget)   # the transcript took a while
+        dest = _sidecar_dest(video, "dub")
+        block_reason = _place_sidecar(video, dest, srt_text,
+                                      video_identity=initial_identity,
+                                      pipeline_timeout_s=cfg.pipeline_timeout_min * 60,
+                                      rec=rec, workdir=workdir, dub=True)
+        if block_reason is not None:
+            rec["result"] = block_reason
+            return rec
+
+        reached, waited_s = wait_for_dub(video, dest, cfg.pipeline_timeout_min * 60)
+        rec["pipeline_reached"] = reached
+        rec["pipeline_wait_s"] = waited_s
+        final = probe(video) if reached else None
+        rec["result"] = ("PIPELINE_TIMEOUT" if not reached
+                         else "FIXED" if final and has_dub_subtitle(final) else "DUB_NOT_ADDED")
+        return rec
+    except PlaybackWaitTimeout:
+        raise
+    except Exception as exc:
+        rec["result"] = "ERROR"
+        rec["error"] = f"{type(exc).__name__}: {exc}"
+        return rec
+    finally:
+        rec["elapsed_s"] = round(time.monotonic() - t0, 1)
+
+
+def run_dub(cfg: Config, dry_run: bool) -> int:
+    """The `--dub` run: walk the library newest first and give each target a dub transcript.
+    Files settled as non-targets are remembered, so the walk stays cheap after the first run."""
+    files = _dub_files(MEDIA_ROOT)
+    checked = load_state(DUB_CHECKED_FILE)
+    todo = [(video, ident) for video, ident in files if checked.get(str(video)) != ident]
+
+    if dry_run:
+        log(f"DRY RUN: {len(todo)} of {len(files)} file(s) not yet checked "
+            f"(nothing transcribed, nothing written)")
+        for video, _ident in todo:
+            info = probe(video) if is_anime(video) else None
+            if info is not None and _dub_skip_reason(video, info) is None:
+                log(f"  would transcribe the English dub of: {video}")
+        return 0
+
+    jellyfin = JellyfinClient(cfg.jellyfin_url)
+    WORKDIR_ROOT.mkdir(parents=True, exist_ok=True)
+    budget_deadline = time.monotonic() + cfg.budget_min * 60
+    settled: dict[str, list[int]] = {}
+    handled = 0
+    try:
+        for video, ident in todo:
+            if time.monotonic() >= budget_deadline:
+                log(f"budget ({cfg.budget_min:g} min) reached; the rest waits for the next run")
+                break
+            with tempfile.TemporaryDirectory(prefix="sub-fallback_", dir=WORKDIR_ROOT) as workdir:
+                rec = process_dub_candidate(video, cfg, jellyfin, Path(workdir), budget_deadline)
+            result = rec.get("result")
+            if result in _DUB_SETTLED:
+                settled[str(video)] = ident
+            if result in _DUB_QUIET:
+                continue
+            handled += 1
+            rec["ts"] = _utc_now_iso()
+            _append_jsonl(JSONL_FILE, rec)
+            log(f"dub {result} ({rec.get('elapsed_s', '?')}s): {video}")
+    except PlaybackWaitTimeout as exc:
+        log(f"{exc}; ending run cleanly, the next hourly run retries")
+        return 0
+    finally:
+        live = {str(video) for video, _ident in files}
+        try:
+            mutate_state(DUB_CHECKED_FILE, lambda cur: {
+                k: v for k, v in {**cur, **settled}.items() if k in live})
+        except OSError as exc:
+            log(f"WARNING: could not save {DUB_CHECKED_FILE}: {exc}")
+    log(f"done: {handled} dub candidate(s) handled this run")
+    return 0
+
+
 def _append_jsonl(path: Path, rec: dict) -> None:
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec) + "\n")
@@ -825,9 +1037,12 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dry-run", action="store_true",
                     help="list candidates and what would be attempted; fetch/mutate nothing")
+    ap.add_argument("--dub", action="store_true",
+                    help="instead: transcribe the English dub of consolidated dual-audio files "
+                         "that lack a dub subtitle (writes <stem>.en.dub.srt)")
     args = ap.parse_args()
 
-    lock_fp = acquire_singleton_lock(LOCK_FILE)
+    lock_fp = acquire_singleton_lock(DUB_LOCK_FILE if args.dub else LOCK_FILE)
     if lock_fp is None:
         return 0  # another instance is running; exit quietly, not an error
 
@@ -846,6 +1061,9 @@ def main() -> int:
         log("ERROR: JELLYFIN_API_KEY is not set; a real run cannot fail closed on "
             "playback without it -- refusing to start blinded. --dry-run still works.")
         return 1
+
+    if args.dub:
+        return run_dub(cfg, args.dry_run)
 
     state = load_needs_english(NEEDS_ENGLISH_STATE_FILE)
     if state is None:

@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from media_stack.config import PIPELINE_VERSION
 from media_stack.subverify import ExtractionInterrupted
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -54,6 +55,8 @@ def _media(tmp_path: Path, name: str = "Episode S01E01.mkv") -> Path:
 def _isolate_runtime_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(sf, "NEEDS_ENGLISH_STATE_FILE", tmp_path / "needs-english.json")
     monkeypatch.setattr(sf, "LOCK_FILE", tmp_path / "sub-fallback.lock")
+    monkeypatch.setattr(sf, "DUB_LOCK_FILE", tmp_path / "sub-fallback-dub.lock")
+    monkeypatch.setattr(sf, "DUB_CHECKED_FILE", tmp_path / "sub-fallback-dub.json")
     monkeypatch.setattr(sf, "JSONL_FILE", tmp_path / "sub-fallback.jsonl")
     monkeypatch.setattr(sf, "WORKDIR_ROOT", tmp_path / "workdir-root")
     monkeypatch.setattr(sf, "PIPELINE_POLL_S", 0)
@@ -1317,3 +1320,253 @@ def test_main_installs_sigterm_handler():
     with patch.object(sf.signal, "signal") as mock_signal:
         _run_main()
     mock_signal.assert_called_once_with(sf.signal.SIGTERM, sf._handle_sigterm)
+
+
+# --- --dub: a transcript of the English dub for consolidated dual-audio files -------------------
+
+def _dub_info(*, tagged=True, audio=("jpn", "eng"), subs=()):
+    streams = [{"index": i, "codec_type": "audio", "tags": {"language": lang}, "disposition": {}}
+               for i, lang in enumerate(audio, 1)]
+    streams += [{"index": 10 + i, "codec_type": "subtitle", "codec_name": "subrip",
+                 "tags": {"language": "eng", "title": title}} for i, title in enumerate(subs)]
+    return {"streams": streams,
+            "format": {"tags": {"CONSOLIDATED_SUBS": f"v{PIPELINE_VERSION}"}} if tagged else {}}
+
+
+@pytest.mark.parametrize("info, reason", [
+    (_dub_info(), None),
+    (_dub_info(subs=("English",)), None),
+    (_dub_info(tagged=False), "NOT_CONSOLIDATED"),
+    (_dub_info(audio=("jpn",)), "NOT_DUAL_AUDIO"),
+    (_dub_info(audio=("eng",)), "NOT_DUAL_AUDIO"),
+    (_dub_info(subs=("English", "English (dub)")), "DUB_PRESENT"),
+    (_dub_info(subs=("English SDH",)), "DUB_PRESENT"),
+], ids=["target", "target-with-a-main", "untagged", "japanese-only", "english-only", "dub-track", "cc-track"])
+def test_dub_skip_reason(tmp_path, info, reason):
+    assert sf._dub_skip_reason(_media(tmp_path), info) == reason
+
+
+def test_a_dub_sidecar_already_beside_the_file_is_not_a_target(tmp_path):
+    video = _media(tmp_path)
+    (tmp_path / (video.stem + ".en.dub.srt")).write_text("x")
+    assert sf._dub_skip_reason(video, _dub_info()) == "DUB_SIDECAR_PRESENT"
+
+
+def test_dub_files_are_matroska_under_tv_newest_first(tmp_path):
+    root = tmp_path / "media"
+    for rel, age in [("tv/Old/old.mkv", 300), ("tv/Show/Season 1/new.mkv", 100), ("tv/mid.mkv", 200),
+                     ("tv/skip.mp4", 50), ("tv/.dupe-recycle/hidden.mkv", 50), ("tv/.dot.mkv", 50),
+                     ("tv/Show/x.mkv.consol.1.tmp.mkv", 50), ("movies/film.mkv", 50), ("other/outside.mkv", 50)]:
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(_MKV)
+        os.utime(path, (time.time() - age, time.time() - age))
+    found = sf._dub_files(root)
+    assert [p.name for p, _ in found] == ["new.mkv", "mid.mkv", "old.mkv"]
+    st = (root / "tv/mid.mkv").stat()
+    assert dict(found)[root / "tv/mid.mkv"] == [st.st_ino, st.st_size, st.st_mtime_ns]
+
+
+def _dub_candidate(tmp_path, infos, *, deadline_s=3000.0, **patches):
+    """Run `process_dub_candidate` with `probe` returning `infos` in turn and the rest stubbed."""
+    video = _media(tmp_path)
+    workdir = tmp_path / "work"
+    workdir.mkdir(exist_ok=True)
+    stubs = {"probe": {"side_effect": list(infos)}, "wait_while_playing": {}, "is_anime": {"return_value": True},
+             "_transcribe_in_subprocess": {"return_value": _HI_SRT}, "wait_for_dub": {"return_value": (True, 3)},
+             "_place_sidecar": {"return_value": None}, **patches}
+    with ExitStack() as stack:
+        mocks = {name: stack.enter_context(patch.object(sf, name, **kw)) for name, kw in stubs.items()}
+        rec = sf.process_dub_candidate(video, _cfg(), _FakeJellyfin([]), workdir,
+                                       sf.time.monotonic() + deadline_s)
+    return rec, mocks, video
+
+
+def test_a_dual_audio_file_without_a_dub_subtitle_gets_the_english_audio_transcribed_as_a_dub_sidecar(tmp_path):
+    rec, mocks, video = _dub_candidate(tmp_path, [_dub_info(), _dub_info(subs=("English", "English (dub)"))])
+
+    assert rec["result"] == "FIXED"
+    assert mocks["_transcribe_in_subprocess"].call_args[0][1] == 2          # the eng stream, not the jpn one
+    place = mocks["_place_sidecar"]
+    assert place.call_args[0][1] == video.with_name(video.stem + ".en.dub.srt")
+    assert place.call_args[1]["dub"] is True
+    mocks["wait_for_dub"].assert_called_once()
+
+
+def test_a_non_anime_file_is_skipped_before_the_gate_and_any_probe(tmp_path):
+    rec, mocks, _ = _dub_candidate(tmp_path, [], is_anime={"return_value": False})
+    assert rec["result"] == "NOT_ANIME"
+    for name in ("probe", "wait_while_playing", "_transcribe_in_subprocess", "_place_sidecar"):
+        mocks[name].assert_not_called()
+
+
+@pytest.mark.parametrize("info, result", [
+    (_dub_info(audio=("jpn",)), "NOT_DUAL_AUDIO"),
+    (_dub_info(subs=("English CC",)), "DUB_PRESENT"),
+    (_dub_info(tagged=False), "NOT_CONSOLIDATED"),
+    (None, "PROBE_FAILED"),
+])
+def test_a_non_target_is_reported_and_never_transcribed(tmp_path, info, result):
+    rec, mocks, _ = _dub_candidate(tmp_path, [info])
+    assert rec["result"] == result
+    mocks["_transcribe_in_subprocess"].assert_not_called()
+    mocks["_place_sidecar"].assert_not_called()
+
+
+@pytest.mark.parametrize("patches, deadline_s, result", [
+    ({}, 599.0, "DEFERRED_BUDGET"),
+    ({"_transcribe_in_subprocess": {"return_value": ""}}, 3000.0, "TOO_FEW_CUES"),
+    ({"_place_sidecar": {"return_value": "VIDEO_CHANGED"}}, 3000.0, "VIDEO_CHANGED"),
+    ({"wait_for_dub": {"return_value": (False, 3600)}}, 3000.0, "PIPELINE_TIMEOUT"),
+], ids=["under-ten-minutes-of-budget", "no-speech", "placement-blocked", "pipeline-never-took-it"])
+def test_a_dub_run_stops_where_the_regular_fallback_would(tmp_path, patches, deadline_s, result):
+    rec, mocks, _ = _dub_candidate(tmp_path, [_dub_info(), _dub_info()], deadline_s=deadline_s, **patches)
+    assert rec["result"] == result
+
+
+def test_a_sidecar_the_pipeline_took_without_adding_a_track_is_not_a_success(tmp_path):
+    rec, _, _ = _dub_candidate(tmp_path, [_dub_info(), _dub_info()])   # quarantined as foreign: still no dub
+    assert rec["result"] == "DUB_NOT_ADDED"
+
+
+@pytest.mark.parametrize("info, expected", [
+    (_dub_info(), None),
+    (_dub_info(tagged=False), "NOT_CONSOLIDATED"),                     # consolidate-subs.py has not run yet
+    (_dub_info(subs=("English (dub)",)), "DUB_PRESENT"),
+], ids=["ok", "not-consolidated", "dub-appeared"])
+def test_the_dub_placement_rechecks_the_file_right_before_publishing(tmp_path, info, expected):
+    video = _media(tmp_path)
+    dest = sf._sidecar_dest(video, "dub")
+    with patch.object(sf, "probe", return_value=info):
+        got = sf._place_sidecar(video, dest, "dub text", video_identity=sf._video_identity(video),
+                                pipeline_timeout_s=60.0, rec={}, workdir=tmp_path, dub=True)
+    assert got == expected
+    assert dest.exists() is (expected is None)
+
+
+def test_the_dub_placement_never_clobbers_an_existing_dub_sidecar(tmp_path):
+    video = _media(tmp_path)
+    dest = sf._sidecar_dest(video, "dub")
+    other = video.with_name(video.stem + ".en.dub.srt")
+    other.write_text("already here")
+    with patch.object(sf, "probe", return_value=_dub_info()):
+        got = sf._place_sidecar(video, dest, "dub text", video_identity=sf._video_identity(video),
+                                pipeline_timeout_s=60.0, rec={}, workdir=tmp_path, dub=True)
+    assert got == "SIDECAR_APPEARED" and other.read_text() == "already here"
+
+
+def _library(tmp_path, names):
+    root = tmp_path / "media"
+    paths = {}
+    for i, name in enumerate(names):
+        path = root / "tv" / "Show" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(_MKV)
+        os.utime(path, (time.time() - 1000 + i, time.time() - 1000 + i))   # later in the list = newer
+        paths[name] = path
+    return root, paths
+
+
+def _run_dub(root, results, *, dry_run=False, probes=None, anime=lambda path: True):
+    """`run_dub` over `root`; `results` maps a file name to what `process_dub_candidate` returns (or raises)."""
+    seen = []
+
+    def _process(video, cfg, jellyfin, workdir, deadline):
+        seen.append(video.name)
+        outcome = results[video.name]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return {"path": str(video), "result": outcome, "elapsed_s": 0.1}
+
+    with patch.object(sf, "MEDIA_ROOT", root), patch.object(sf, "process_dub_candidate", side_effect=_process), \
+            patch.object(sf, "JellyfinClient"), patch.object(sf, "is_anime", side_effect=anime), \
+            patch.object(sf, "probe", side_effect=lambda p: (probes or {}).get(Path(p).name)):
+        rc = sf.run_dub(_cfg(), dry_run)
+    return rc, seen
+
+
+def test_run_dub_remembers_settled_non_targets_and_skips_them_next_time(tmp_path):
+    root, paths = _library(tmp_path, ["standard.mkv", "single.mkv", "dubbed.mkv", "pending.mkv", "target.mkv"])
+    results = {"target.mkv": "FIXED", "pending.mkv": "DUB_SIDECAR_PRESENT", "standard.mkv": "NOT_ANIME",
+               "dubbed.mkv": "DUB_PRESENT", "single.mkv": "NOT_DUAL_AUDIO"}
+
+    rc, seen = _run_dub(root, results)
+
+    assert rc == 0 and seen == ["target.mkv", "pending.mkv", "dubbed.mkv", "single.mkv", "standard.mkv"]   # newest first
+    checked = json.loads(sf.DUB_CHECKED_FILE.read_text())
+    assert sorted(Path(k).name for k in checked) == ["dubbed.mkv", "single.mkv"]   # settled by the file only
+    st = paths["single.mkv"].stat()
+    assert checked[str(paths["single.mkv"])] == [st.st_ino, st.st_size, st.st_mtime_ns]
+    rows = [json.loads(line) for line in sf.JSONL_FILE.read_text().splitlines()]
+    assert [(Path(r["path"]).name, r["result"]) for r in rows] == [("target.mkv", "FIXED")]   # quiet skips
+
+    _, seen = _run_dub(root, results)
+    assert seen == ["target.mkv", "pending.mkv", "standard.mkv"]       # the settled two are not looked at
+
+    paths["single.mkv"].write_bytes(_MKV + b"changed")                   # a new identity is checked again (newest now)
+    _, seen = _run_dub(root, results)
+    assert seen == ["single.mkv", "target.mkv", "pending.mkv", "standard.mkv"]
+
+
+def test_run_dub_forgets_files_that_are_gone(tmp_path):
+    root, paths = _library(tmp_path, ["a.mkv", "b.mkv"])
+    _run_dub(root, {"a.mkv": "NOT_DUAL_AUDIO", "b.mkv": "NOT_DUAL_AUDIO"})
+    paths["a.mkv"].unlink()
+    _run_dub(root, {"b.mkv": "NOT_DUAL_AUDIO"})
+    assert [Path(k).name for k in json.loads(sf.DUB_CHECKED_FILE.read_text())] == ["b.mkv"]
+
+
+def test_run_dub_playback_timeout_ends_the_run_cleanly_and_keeps_what_it_settled(tmp_path):
+    root, _ = _library(tmp_path, ["older.mkv", "newer.mkv"])
+    rc, seen = _run_dub(root, {"newer.mkv": "NOT_DUAL_AUDIO", "older.mkv": sf.PlaybackWaitTimeout("busy")})
+    assert rc == 0 and seen == ["newer.mkv", "older.mkv"]
+    assert [Path(k).name for k in json.loads(sf.DUB_CHECKED_FILE.read_text())] == ["newer.mkv"]
+
+
+def test_run_dub_dry_run_lists_targets_and_writes_nothing(tmp_path, capsys):
+    root, _ = _library(tmp_path, ["target.mkv", "single.mkv", "standard.mkv"])
+    rc, seen = _run_dub(root, {}, dry_run=True, anime=lambda p: Path(p).name != "standard.mkv",
+                        probes={"target.mkv": _dub_info(), "single.mkv": _dub_info(audio=("jpn",)),
+                                "standard.mkv": _dub_info()})   # dual, but not anime
+    out = capsys.readouterr().out
+    assert rc == 0 and seen == []
+    assert "would transcribe the English dub of" in out and "target.mkv" in out
+    assert "single.mkv" not in out and "standard.mkv" not in out
+    assert not sf.DUB_CHECKED_FILE.exists() and not sf.JSONL_FILE.exists()
+
+
+def test_main_dub_runs_the_dub_mode_under_its_own_lock():
+    with open(sf.LOCK_FILE, "w") as regular_run:                       # a running regular fallback does not block it
+        fcntl.flock(regular_run, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        rc, mocks = _run_main("--dub", run_dub={"return_value": 0}, load_needs_english={})
+    assert rc == 0
+    mocks["run_dub"].assert_called_once()
+    assert mocks["run_dub"].call_args[0][1] is False
+    mocks["load_needs_english"].assert_not_called()
+
+    with open(sf.DUB_LOCK_FILE, "w") as dub_run:                      # a second dub run exits quietly
+        fcntl.flock(dub_run, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        rc, mocks = _run_main("--dub", run_dub={})
+    assert rc == 0
+    mocks["run_dub"].assert_not_called()
+
+
+def test_main_dub_still_refuses_a_real_run_without_the_jellyfin_key():
+    rc, mocks = _run_main("--dub", cfg=_cfg(jellyfin_key=""), run_dub={})
+    assert rc == 1
+    mocks["run_dub"].assert_not_called()
+
+
+def test_the_dub_cron_entry_is_hourly_idle_priority_and_collides_with_no_other_minute():
+    lines = [ln for ln in (PROJECT_ROOT / "ops/cron.d/media-stack.crontab").read_text().splitlines()
+             if ln.strip() and not ln.startswith("#") and "=" not in ln.split()[0]]
+    [ours] = [ln for ln in lines if "sub-fallback.py --dub" in ln]
+    fields = ours.split()
+    assert fields[1:5] == ["*", "*", "*", "*"] and fields[0].isdigit()
+    assert ours.split(None, 5)[5].startswith("nice -n19 ionice -c3 python3 ")
+    assert "var/log/sub-fallback.log" in ours
+    others = [ln.split()[0] for ln in lines if ln is not ours and ln.split()[0] != "*"]
+    taken = set()
+    for field in others:
+        taken |= set(range(0, 60, int(field[2:]))) if field.startswith("*/") else {int(x) for x in field.split(",")}
+    assert int(fields[0]) not in taken

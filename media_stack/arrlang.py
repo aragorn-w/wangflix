@@ -5,6 +5,7 @@ Records are matched by folder BASENAME, so one is indexed only when its path's P
 Arr root (`ARR_MOVIES_ROOT` default `/movies`, `ARR_TV_ROOT` default `/tv`; process env over
 `.env`), else an unrelated root with a colliding folder name could supply the signal. A basename
 shared by 2+ records is AMBIGUOUS and maps to `None`. Never raises: any failure returns `None`.
+The same lookup carries Sonarr's `seriesType` (`anime_series`).
 """
 
 from __future__ import annotations
@@ -25,8 +26,9 @@ _LANG_NAME_TO_CODE: dict[str, str] = {
     "korean": "kor",
 }
 
-# Per-process {"movie"|"series": {folder_basename: code_or_None}}; a failed fetch is cached too.
-_CACHE: dict[str, dict[str, str | None] | None] = {}
+# Per-process {"movie"|"series": {folder_basename: (code_or_None, series_type_or_None)}}; a failed
+# fetch is cached too. `series_type` is Sonarr's `seriesType` ("standard"/"daily"/"anime").
+_CACHE: dict[str, dict[str, tuple[str | None, str | None]] | None] = {}
 
 
 def _code_for_name(name: object) -> str | None:
@@ -65,12 +67,12 @@ def _record_parent(raw_path: str) -> str:
 def _folder_lang_map(
     *, cache_key: str, api_key_var: str, url: str, fetch: str,
     root_env_var: str, default_root: str, path_field: str = "path",
-) -> dict[str, str | None] | None:
+) -> dict[str, tuple[str | None, str | None]] | None:
     """None (also cached) on any failure. Applies the root check and ambiguity rule from the
     module docstring."""
     if cache_key in _CACHE:
         return _CACHE[cache_key]
-    result: dict[str, str | None] | None = None
+    result: dict[str, tuple[str | None, str | None]] | None = None
     try:
         key = _api_key(api_key_var)
         if key:
@@ -78,7 +80,7 @@ def _folder_lang_map(
             records = getattr(client, fetch)()
             if records is not None:
                 expected_root = _normalize_root(_arr_root(root_env_var, default_root))
-                seen: dict[str, str | None] = {}
+                seen: dict[str, tuple[str | None, str | None]] = {}
                 ambiguous: set[str] = set()
                 for rec in records:
                     raw_path = rec.get(path_field) or ""
@@ -92,15 +94,17 @@ def _folder_lang_map(
                         continue
                     lang = rec.get("originalLanguage")
                     name = lang.get("name") if isinstance(lang, dict) else None
-                    seen[folder] = _code_for_name(name)
-                result = {f: (None if f in ambiguous else v) for f, v in seen.items()}
+                    series_type = rec.get("seriesType")
+                    seen[folder] = (_code_for_name(name), series_type.lower()
+                                    if isinstance(series_type, str) else None)
+                result = {f: ((None, None) if f in ambiguous else v) for f, v in seen.items()}
     except Exception:
         result = None
     _CACHE[cache_key] = result
     return result
 
 
-def _movies_by_folder() -> dict[str, str | None] | None:
+def _movies_by_folder() -> dict[str, tuple[str | None, str | None]] | None:
     return _folder_lang_map(
         cache_key="movie", api_key_var="RADARR_API_KEY",
         url=paths.RADARR_URL, fetch="movies",
@@ -108,7 +112,7 @@ def _movies_by_folder() -> dict[str, str | None] | None:
     )
 
 
-def _series_by_folder() -> dict[str, str | None] | None:
+def _series_by_folder() -> dict[str, tuple[str | None, str | None]] | None:
     return _folder_lang_map(
         cache_key="series", api_key_var="SONARR_API_KEY",
         url=paths.SONARR_URL, fetch="series",
@@ -152,7 +156,7 @@ def original_language_lookup(path: Path) -> tuple[str | None, str]:
         table = _movies_by_folder() if kind == "movie" else _series_by_folder()
         if table is None:
             return None, ORIGINAL_UNAVAILABLE
-        code = table.get(folder)
+        code = table.get(folder, (None, None))[0]
         if code is None:
             return None, ORIGINAL_UNKNOWN
         return code, ORIGINAL_KNOWN
@@ -163,3 +167,21 @@ def original_language_lookup(path: Path) -> tuple[str | None, str]:
 def original_language_for(path: Path) -> str | None:
     """Code of `original_language_lookup`; use that to tell an Arr outage from "no answer"."""
     return original_language_lookup(path)[0]
+
+
+def anime_series(path: Path) -> bool | None:
+    """Is `path` in a Sonarr series whose `seriesType` is "anime"? A Radarr movie is never
+    anime here (False). None when Sonarr can't say: outside `movies/`/`tv/`, no key, down, or
+    no (or an ambiguous) record. Never raises."""
+    try:
+        kind_folder = _kind_and_folder(path)
+        if kind_folder is None:
+            return None
+        kind, folder = kind_folder
+        if kind == "movie":
+            return False
+        table = _series_by_folder()
+        series_type = table.get(folder, (None, None))[1] if table is not None else None
+        return None if series_type is None else series_type == "anime"
+    except Exception:
+        return None

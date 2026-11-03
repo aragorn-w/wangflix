@@ -5,14 +5,16 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import srt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from media_stack import subtitles as st
 from media_stack.subtitles import (
-    clean_srt_text, decode_subtitle_bytes, decode_subtitle_text, find_sidecar_subs,
-    is_forced_track, is_generated_sidecar, is_generated_track, is_sdh_track,
-    normalize_subtitle_caps, score_text_track,
+    clean_srt_text, decode_subtitle_bytes, decode_subtitle_text, find_dub_sidecars,
+    find_sidecar_subs, has_dub_subtitle, is_dub_track, is_forced_track, is_generated_sidecar,
+    is_generated_track, is_sdh_track, normalize_subtitle_caps, score_text_track,
+    strip_hi_annotations,
 )
 
 
@@ -47,6 +49,60 @@ def test_words_that_merely_contain_hi_or_cc_are_not_sdh():
 def test_hearing_impaired_disposition_alone_marks_a_track_sdh():
     assert is_sdh_track({"disposition": {"hearing_impaired": 1}, "tags": {"title": "English"}})
     assert not is_sdh_track({"disposition": {"hearing_impaired": 0}, "tags": {"title": "English"}})
+
+
+@pytest.mark.parametrize("stream, expected", [
+    ({"tags": {"title": "English (dub)"}}, True),       # the title this pipeline muxes
+    ({"tags": {"title": "English Dubtitles"}}, True),
+    ({"tags": {"title": "English [Dubs]"}}, True),
+    ({"tags": {"title": "English SDH"}}, True),         # a release's CC track follows the dub
+    ({"disposition": {"hearing_impaired": 1}, "tags": {"title": "English"}}, True),
+    ({"tags": {"title": "English"}}, False),
+    ({"tags": {"title": "English (generated)"}}, False),
+    ({"tags": {"title": "Dubbing credits"}}, False),    # whole tokens only
+    ({"tags": {"title": "Forced SDH"}, "disposition": {"forced": 1}}, False),
+], ids=["our-title", "dubtitles", "dubs", "sdh", "hi-disposition", "plain", "generated", "dubbing", "forced"])
+def test_is_dub_track(stream, expected):
+    assert is_dub_track(stream) is expected
+
+
+def test_has_dub_subtitle_wants_an_english_text_track():
+    def _info(*subs):
+        return {"streams": [{"codec_type": "audio"}, *subs]}
+
+    def _sub(title, lang="eng", codec="subrip"):
+        return {"codec_type": "subtitle", "codec_name": codec,
+                "tags": {"language": lang, "title": title}}
+
+    assert has_dub_subtitle(_info(_sub("English"), _sub("English (dub)")))
+    assert not has_dub_subtitle(_info(_sub("English"), _sub("Forced")))
+    assert not has_dub_subtitle(_info(_sub("English (dub)", lang="fre")))
+    assert not has_dub_subtitle(_info(_sub("English (dub)", codec="hdmv_pgs_subtitle")))
+    assert not has_dub_subtitle({})
+
+
+# --- hearing-impaired annotations ---
+
+def _srt(*cues):
+    return "\n".join(f"{i}\n00:00:{i:02d},000 --> 00:00:{i:02d},500\n{text}\n"
+                     for i, text in enumerate(cues, 1))
+
+
+def test_strip_hi_annotations_removes_sound_tags_and_the_cues_they_empty():
+    out = strip_hi_annotations(_srt(
+        "[door slams]",                      # whole cue gone
+        "- (sighs)\n- Hello [softly] there",  # first line gone, dash line gone
+        "[music\nplaying]\nReal line",       # a tag spanning two lines
+        "(Kazuma) Wait!",
+        "Plain dialogue",
+    ))
+    assert [c.content for c in srt.parse(out)] == [
+        "- Hello there", "Real line", "Wait!", "Plain dialogue"]
+    assert out.count("-->") == 4 and out.startswith("1\n")   # renumbered
+
+
+def test_strip_hi_annotations_returns_unparseable_input_unchanged():
+    assert strip_hi_annotations("not an srt") == "not an srt"
 
 
 # --- scoring ---
@@ -144,6 +200,32 @@ def movie(tmp_path):
 def test_find_sidecar_classifies_a_single_sidecar(tmp_path, movie, sidecar, expected):
     (tmp_path / sidecar).write_text("x")
     assert find_sidecar_subs(movie) == ([] if expected is None else [(tmp_path / sidecar, *expected)])
+
+
+def test_a_dub_tagged_sidecar_is_never_a_main_one_but_is_found_as_a_dub_one(tmp_path, movie):
+    """`.en.dub.srt` follows the dub audio: `find_sidecar_subs` skips it, `find_dub_sidecars` returns it."""
+    main, dub = tmp_path / "Movie (2024).en.srt", tmp_path / "Movie (2024).en.dub.srt"
+    main.write_text("x")
+    dub.write_text("y")
+    (tmp_path / "Movie (2024).dub.srt").write_text("z")        # no English tag: not an English sidecar
+    assert find_sidecar_subs(movie) == [(main, False, False)]
+    assert find_dub_sidecars(movie) == [dub]
+
+
+def test_a_forced_tag_wins_over_a_dub_tag(tmp_path, movie):
+    forced = tmp_path / "Movie (2024).en.dub.forced.srt"
+    forced.write_text("x")
+    assert find_sidecar_subs(movie) == [(forced, True, False)]
+    assert find_dub_sidecars(movie) == []
+
+
+def test_a_dub_sidecar_belongs_to_the_longer_stemmed_video(tmp_path):
+    short, long_ = tmp_path / "Movie.mkv", tmp_path / "Movie.2020.mkv"
+    short.touch()
+    long_.touch()
+    (tmp_path / "Movie.2020.en.dub.srt").write_text("x")
+    assert find_dub_sidecars(short) == []
+    assert [p.name for p in find_dub_sidecars(long_)] == ["Movie.2020.en.dub.srt"]
 
 
 def test_find_sidecar_hi_cc_and_sdh_tags_are_hearing_impaired(tmp_path, movie):

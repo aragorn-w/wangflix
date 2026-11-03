@@ -42,8 +42,8 @@ TRAIL_WS_RE     = re.compile(r"[ \t]+$", re.MULTILINE)
 MULTI_BLANK_RE  = re.compile(r"\n{3,}")
 
 
-# Substrings of the lowercased FULL PATH: keep a single Japanese track and prune English dubs
-# (the anime default). A title also in DUAL_AUDIO_KEYWORDS keeps both (that set is checked first).
+# Substrings of the lowercased FULL PATH: Japanese original primary, English dub kept beside it
+# (the anime default; the same outcome as DUAL_AUDIO_KEYWORDS, which also covers non-anime titles).
 JAPANESE_KEYWORDS: set[str] = {
     "aggretsuko", "one piece", "naruto", "dragon ball", "attack on titan",
     "demon slayer", "jujutsu kaisen", "my hero academia", "fullmetal",
@@ -60,7 +60,7 @@ JAPANESE_KEYWORDS: set[str] = {
     "pop team epic", "may i ask for one final thing",
 }
 
-# Per-title opt-in to keep BOTH the original track and the English dub.
+# Per-title opt-in (beyond anime) to keep BOTH the original track and the English dub.
 DUAL_AUDIO_KEYWORDS: set[str] = {
     "godzilla minus one", "shin godzilla",
     "may i ask for one final thing",

@@ -57,6 +57,13 @@ PATH=$HOME/media-stack/.venv/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin
 # Minute :20 avoids the :00 healthcheck.
 20 * * * * nice -n19 ionice -c3 python3 $HOME/media-stack/sub-fallback.py >> $HOME/media-stack/var/log/sub-fallback.log 2>&1
 
+# Hourly dub subtitle fallback: `sub-fallback.py --dub` transcribes the English audio of a
+# consolidated dual-audio (Japanese + English) file that has no dub-matching English subtitle
+# and publishes it as <stem>.en.dub.srt, which consolidate-subs.py adds as "English (dub)".
+# Own lock file, so a long dub backlog never blocks the :20 run above; same log, playback gate
+# and idle priority.  Minute :52 collides with no other entry.
+52 * * * * nice -n19 ionice -c3 python3 $HOME/media-stack/sub-fallback.py --dub >> $HOME/media-stack/var/log/sub-fallback.log 2>&1
+
 # Hourly audio-language spot-check: release names and track tags lie about audio, and
 # nothing else listens to it.  audio-lang-check.py runs a short whisper language-ID window
 # per audio stream, newest files first, and Telegrams each NEW finding once (MISLABELED,

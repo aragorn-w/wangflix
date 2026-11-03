@@ -172,3 +172,50 @@ def test_arr_failure_is_none_for_original_language_for_and_unavailable_for_looku
 def test_lookup_unknown_when_arr_answered_but_has_nothing_usable(arr, records):
     movie_file = _movie_file(arr, "Heat (1995)")
     assert _ask(movie_file, "movies", records, arrlang.original_language_lookup) == (None, "unknown")
+
+
+def _typed(path, series_type):
+    rec = _rec(path)
+    return {**rec, "seriesType": series_type} if series_type is not None else rec
+
+
+@pytest.mark.parametrize("kind, folder, records, expected", [
+    pytest.param("series", "Aggretsuko", [_typed("/tv/Aggretsuko", "anime")], True, id="anime-series"),
+    pytest.param("series", "Aggretsuko", [_typed("/tv/Aggretsuko", "Anime")], True, id="case-insensitive"),
+    pytest.param("series", "Squid Game", [_typed("/tv/Squid Game", "standard")], False, id="standard-series"),
+    pytest.param("series", "Late Show", [_typed("/tv/Late Show", "daily")], False, id="daily-series"),
+    pytest.param("movies", "Akira (1988)", [_typed("/movies/Akira (1988)", None)], False,
+                 id="a-radarr-movie-is-never-anime"),
+    pytest.param("series", "Other", [_typed("/tv/Else", "anime")], None, id="no-record"),
+    pytest.param("series", "Old Sonarr", [_typed("/tv/Old Sonarr", None)], None, id="record-without-a-type"),
+    pytest.param("series", "Shared", [_typed("/tv/Shared", "anime"), _typed("/tv/Shared", "standard")], None,
+                 id="ambiguous-basename"),
+    pytest.param("series", "Down", None, None, id="sonarr-failed"),
+])
+def test_anime_series_reads_the_sonarr_series_type(arr, kind, folder, records, expected):
+    make = _movie_file if kind == "movies" else _series_file
+    assert _ask(make(arr, folder), kind, records, arrlang.anime_series) is expected
+
+
+def test_anime_series_cannot_say_for_a_path_outside_tv_and_movies_or_without_a_key(arr, monkeypatch):
+    outside = arr / "music" / "x.mkv"
+    outside.parent.mkdir()
+    outside.write_bytes(b"x")
+    assert arrlang.anime_series(outside) is None
+
+    monkeypatch.delenv("SONARR_API_KEY")
+    fake_client_cls = MagicMock()
+    with patch.object(arrlang, "ArrClient", fake_client_cls):
+        assert arrlang.anime_series(_series_file(arr, "Show")) is None
+    fake_client_cls.assert_not_called()
+
+
+def test_the_series_list_is_fetched_once_for_language_and_type(arr):
+    """One cached Sonarr read serves both questions about the same series."""
+    show = _series_file(arr, "Aggretsuko")
+    client = MagicMock()
+    client.series.return_value = [{**_rec("/tv/Aggretsuko", "Japanese"), "seriesType": "anime"}]
+    with patch.object(arrlang, "ArrClient", return_value=client):
+        assert arrlang.original_language_for(show) == "jpn"
+        assert arrlang.anime_series(show) is True
+    client.series.assert_called_once()

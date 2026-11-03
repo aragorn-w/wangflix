@@ -10,13 +10,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from media_stack.arrlang import anime_series
 from media_stack.config import (
     CODEC_PREF, COMMENT_TITLE_RE,
     DUAL_AUDIO_KEYWORDS, JAPANESE_KEYWORDS, KOREAN_KEYWORDS,
 )
 from media_stack.lang import (
     ENG_AUDIO_LANGS, JPN_AUDIO_LANGS, KOR_AUDIO_LANGS,
-    canonical_lang,
+    canonical_lang, is_english_tag,
 )
 
 
@@ -33,6 +34,26 @@ def is_dub_audio(s: dict) -> bool:
     return bool((s.get("disposition") or {}).get("dub"))
 
 
+def _anime_keyword(pl: str) -> bool:
+    """The lowercased path has `/anime/` or a `JAPANESE_KEYWORDS` title."""
+    return "/anime/" in pl or any(kw in pl for kw in JAPANESE_KEYWORDS)
+
+
+def is_anime(filepath: Path) -> bool:
+    """Sonarr's `seriesType` says anime (a Radarr movie never is); where Sonarr gives no answer
+    (down, no key, no unambiguous record, path outside `tv/`), the path keyword rule."""
+    answer = anime_series(filepath)
+    return _anime_keyword(str(filepath).lower()) if answer is None else answer
+
+
+def is_dual_audio(audios: list[dict]) -> bool:
+    """Both a Japanese and an explicitly English (`en-US` counts, untagged/`und` doesn't)
+    non-commentary stream: the original plus an English dub."""
+    langs = {(s.get("tags") or {}).get("language") for s in audios if not is_commentary_audio(s)}
+    return (any(canonical_lang(raw) == "jpn" for raw in langs)
+            and any(is_english_tag(raw) for raw in langs))
+
+
 def get_audio_lang_pref(
     filepath: Path,
     audios: list[dict] | None = None,
@@ -40,29 +61,26 @@ def get_audio_lang_pref(
     original_language: str | None = None,
 ) -> tuple[set, str, bool]:
     """`(allowed_langs, primary_lang, multi_keep)`. `multi_keep` keeps the best stream per
-    allowed family (foreign-original films wanting original + English dub), else one stream.
+    allowed family (anime and foreign-original films wanting original + English dub), else one stream.
 
     `original_language` is the Arr ISO 639-2 signal (`arrlang`), or None. The `default`
     disposition is NOT evidence of original language (release groups flag DUBs `default`);
-    `original` is. Rules 1-3 are substring matches on the whole lowercased path. First match wins:
-    1. `DUAL_AUDIO_KEYWORDS`: eng+jpn, jpn primary, multi_keep. Before rule 2 so a per-title
-       opt-in beats the anime default.
-    2. `/anime/` or `JAPANESE_KEYWORDS`: eng+jpn, jpn primary, single (prune dubs).
-    3. `KOREAN_KEYWORDS`: eng+kor, kor primary, single.
-    4. `original_language == "eng"`: English only.
-    5. `original_language` jpn/kor with `audios`: that language primary; multi_keep if both an
+    `original` is. Rules 1-2 are substring matches on the whole lowercased path. First match wins:
+    1. `DUAL_AUDIO_KEYWORDS`, `/anime/` or `JAPANESE_KEYWORDS`: eng+jpn, jpn primary, multi_keep
+       (an anime keeps its English dub beside the Japanese original).
+    2. `KOREAN_KEYWORDS`: eng+kor, kor primary, single.
+    3. `original_language == "eng"`: English only.
+    4. `original_language` jpn/kor with `audios`: that language primary; multi_keep if both an
        eng stream and one of that language exist.
-    6. `original_language is None` with `audios` and an eng-family stream: a jpn/kor stream carrying `original` -> eng +
+    5. `original_language is None` with `audios` and an eng-family stream: a jpn/kor stream carrying `original` -> eng +
        that language, it primary, multi_keep; carrying only `default` -> same but **eng primary**
        (a wrong default flag is recoverable, a deleted track is not).
-    7. Otherwise (including any other `original_language`, e.g. "dan"): English only, single.
-    Without `audios`, only rules 1-4 and 7 apply.
+    6. Otherwise (including any other `original_language`, e.g. "dan"): English only, single.
+    Without `audios`, only rules 1-3 and 6 apply.
     """
     pl = str(filepath).lower()
-    if any(kw in pl for kw in DUAL_AUDIO_KEYWORDS):
+    if any(kw in pl for kw in DUAL_AUDIO_KEYWORDS) or _anime_keyword(pl):
         return ENG_AUDIO_LANGS | JPN_AUDIO_LANGS, "jpn", True
-    if "/anime/" in pl or any(kw in pl for kw in JAPANESE_KEYWORDS):
-        return ENG_AUDIO_LANGS | JPN_AUDIO_LANGS, "jpn", False
     if any(kw in pl for kw in KOREAN_KEYWORDS):
         return ENG_AUDIO_LANGS | KOR_AUDIO_LANGS, "kor", False
 
@@ -131,7 +149,7 @@ def confident_default_audio(
     primary: str | None = None
     if any(kw in pl for kw in DUAL_AUDIO_KEYWORDS):
         primary = "jpn"
-    elif "/anime/" in pl or any(kw in pl for kw in JAPANESE_KEYWORDS):
+    elif _anime_keyword(pl):
         primary = "jpn"
     elif any(kw in pl for kw in KOREAN_KEYWORDS):
         primary = "kor"

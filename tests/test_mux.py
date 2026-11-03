@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from media_stack.mux import mkvmerge_remux_simple, remux, remux_timeout_s
+from media_stack.mux import add_dub_subtitle, mkvmerge_remux_simple, remux, remux_timeout_s
 
 
 def _ok_result():
@@ -55,6 +55,48 @@ def test_remux_full_path_argv_unchanged(files, tmp_path):
         "--language", "0:eng", "--track-name", "0:Forced",
         "--default-track", "0:no", "--forced-track", "0:yes", str(forced_srt),
     ]
+
+
+def test_remux_dub_srt_sits_between_the_main_and_the_forced_track(files, tmp_path):
+    """Main "English" (default), then "English (dub)" (neither default nor forced), then "Forced";
+    without `dub_srt` the pinned argv above is unchanged."""
+    src, dst = files
+    eng_srt, dub_srt, forced_srt = tmp_path / "main.srt", tmp_path / "dub.srt", tmp_path / "forced.srt"
+
+    assert _argv(files, [0], [2, 1], eng_srt, forced_srt, dub_srt=dub_srt) == [
+        "mkvmerge", "--quiet", "--output", str(dst),
+        "--video-tracks", "0", "--default-track", "0:yes",
+        "--audio-tracks", "2,1",
+        "--default-track", "2:yes", "--default-track", "1:no",
+        "--no-subtitles",
+        str(src),
+        "--language", "0:eng", "--track-name", "0:English",
+        "--default-track", "0:yes", "--forced-track", "0:no", str(eng_srt),
+        "--language", "0:eng", "--track-name", "0:English (dub)",
+        "--default-track", "0:no", "--forced-track", "0:no", str(dub_srt),
+        "--language", "0:eng", "--track-name", "0:Forced",
+        "--default-track", "0:no", "--forced-track", "0:yes", str(forced_srt),
+    ]
+
+
+def test_add_dub_subtitle_copies_the_source_untouched_and_appends_one_track(files, tmp_path):
+    """No track selectors or flags for the source, so every track, attachment and tag survives."""
+    src, dst = files
+    dub_srt = tmp_path / "dub.srt"
+    with patch("media_stack.mux.subprocess.run", return_value=_ok_result()) as run:
+        assert add_dub_subtitle(src, dst, dub_srt) == (True, "ok")
+    assert run.call_args.args[0] == [
+        "mkvmerge", "--quiet", "--output", str(dst), str(src),
+        "--language", "0:eng", "--track-name", "0:English (dub)",
+        "--default-track", "0:no", "--forced-track", "0:no", str(dub_srt),
+    ]
+
+
+def test_add_dub_subtitle_reports_a_mkvmerge_error(files, tmp_path):
+    src, dst = files
+    failed = MagicMock(returncode=2, stdout="", stderr="Error: bad file\n")
+    with patch("media_stack.mux.subprocess.run", return_value=failed):
+        assert add_dub_subtitle(src, dst, tmp_path / "dub.srt") == (False, "Error: bad file")
 
 
 def test_remux_kept_source_subs_stream_copies_them_ahead_of_the_external_srt(files, tmp_path):

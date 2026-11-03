@@ -765,6 +765,20 @@ def test_forced_english_text_track_is_kept_as_is_and_never_extracted(tmp_path, m
     assert h.remuxes[0]["keep"] == [3] and h.remuxes[0]["forced"] is None
 
 
+def test_an_existing_english_dub_track_is_kept_and_does_not_block_the_upgrade(tmp_path, monkeypatch):
+    """The "English (dub)" track follows the dub audio, so it is neither a generated main track (the check
+    still sees only generated ones) nor replaced: it is carried over like a forced track, flags and all."""
+    h = _upgrade_ready(tmp_path, monkeypatch, info=_info_with(
+        _sub(3, "subrip", title="English (dub)", forced=0), _sub(4, PGS, title="Forced")))
+    result = h.run()
+    assert result["status"] == "FIXED" and result["detail"].startswith("UPGRADE")
+    assert h.remuxes[0]["keep"] == [3, 4]
+    assert h.remuxes[0]["flags"][3] == {"default": False, "forced": False}
+    assert h.extractions == []                                  # carried by mkvmerge, never extracted
+    assert [s["tags"].get("title") for s in h._out_info()["streams"] if s["codec_type"] == "subtitle"] == [
+        "English (dub)", "Forced", "English"]
+
+
 def test_only_forced_english_tracks_are_kept(tmp_path, monkeypatch):
     """A forced French track, a non-forced English PGS and an untagged forced track are dropped, as in the regular pass."""
     h = _upgrade_ready(tmp_path, monkeypatch, info=_info_with(

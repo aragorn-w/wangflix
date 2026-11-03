@@ -62,11 +62,12 @@ while IFS='|' read -r path event; do
             dir=$(dirname "$path")
             base=$(basename "$path")
             # "Show.S01E01.en.cc.srt" -> "Show.S01E01": peel up to 3 trailing lang/forced/sdh/
-            # generated tags ("generated" = sub-fallback.py's Whisper sidecar). A video named exactly
-            # like the stem at a step wins and stops the peeling ("The.Generated.mkv" is never cut).
-            # A video takes the sidecar only under media_stack.subtitles.find_sidecar_subs's rule: no
-            # tags left after its stem, or an English one (has_en: any tag starting with "en") among
-            # them.
+            # generated/dub tags ("generated" = sub-fallback.py's Whisper sidecar, "dub" = the
+            # subtitle for the English dub audio). A video named exactly like the stem at a step
+            # wins and stops the peeling ("The.Generated.mkv" is never cut). A video takes the
+            # sidecar only under media_stack.subtitles's rule (find_sidecar_subs and
+            # find_dub_sidecars): no tags left after its stem, or an English one (has_en: any tag
+            # starting with "en") among them.
             stem="${base%.*}"
             found=""
             has_en=0
@@ -82,7 +83,7 @@ while IFS='|' read -r path event; do
                 [ "$step" -eq 3 ] && break
                 last="${stem##*.}"
                 ll="${last,,}"
-                if [[ "$ll" == en* || "$ll" =~ ^(cc|sdh|forced|hi|generated)$ ]]; then
+                if [[ "$ll" == en* || "$ll" =~ ^(cc|sdh|forced|hi|generated|dub)$ ]]; then
                     if [[ "$ll" == en* ]]; then
                         has_en=1
                     fi
