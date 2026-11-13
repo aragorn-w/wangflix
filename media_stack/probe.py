@@ -155,6 +155,17 @@ def primary_audio_stream(info: dict) -> dict | None:
     return audio[0]
 
 
+def aac_layout_unknown(stream: dict) -> bool:
+    """AAC with more than 2 channels and no channel layout: ffmpeg 4.4's encoder wrote a
+    program config element (ASC channel config 0) for a layout such as 5.1(side), and
+    Apple's player cannot play that audio."""
+    if stream.get("codec_name") != "aac":
+        return False
+    if int(stream.get("channels") or 0) <= 2:
+        return False
+    return (stream.get("channel_layout") or "").strip().lower() in ("", "unknown")
+
+
 def real_video_streams(streams: list[dict]) -> list[dict]:
     """Drops `attached_pic` cover art and still-image codecs muxed as bare video streams:
     players bind to such a thumbnail and stall at 0s, so every muxing step must drop them."""

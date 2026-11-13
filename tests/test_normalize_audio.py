@@ -172,3 +172,77 @@ def test_normalize_output_within_tolerance_or_unchecked_replaces_the_original(
     assert result["status"] == "FIXED"
     assert src.read_bytes() == b"NORMALIZED"
     tag.assert_called_once()
+
+
+# --- PCE-layout AAC: a 5.1(side) track encoded by ffmpeg 4.4 has channel_layout=unknown, which
+# --- Apple's player cannot play, so it must be re-encoded even when tagged v1 or on target ---
+
+OFF_TARGET = {"input_i": "-30.0", "input_tp": "-5.0", "input_lra": "6.0",
+              "input_thresh": "-40.0", "target_offset": "7.0"}
+ON_TARGET = {"input_i": "-23.0", "input_tp": "-5.0", "input_lra": "6.0",
+             "input_thresh": "-33.0", "target_offset": "0.0"}
+
+
+def _audio_info(codec, channels, layout, tagged):
+    audio = {"codec_type": "audio", "codec_name": codec, "channels": channels,
+             "disposition": {"default": 1}}
+    if layout is not None:
+        audio["channel_layout"] = layout
+    return {"streams": [_vid("h264"), audio],
+            "format": {"duration": "1320.0",
+                       "tags": {"NORMALIZED_AUDIO": "v1"} if tagged else {}}}
+
+
+def _process(tmp_path, monkeypatch, info, measured):
+    """`process_file` with every external tool faked; returns (result, mocks)."""
+    monkeypatch.setattr(na, "LOG_FILE", tmp_path / "normalize-audio.log")
+    src = tmp_path / "Movie (2024).mkv"
+    src.write_bytes(b"ORIGINAL")
+
+    def fake_render(src_, dst, *a, **k):
+        Path(dst).write_bytes(b"PASS2")
+
+    def fake_remux(src_, dst):
+        Path(dst).write_bytes(b"NORMALIZED")
+
+    with patch.object(na, "ffprobe", return_value=info), \
+         patch.object(na, "measure_loudness", return_value=measured) as measure, \
+         patch.object(na, "render_normalized", side_effect=fake_render) as render, \
+         patch.object(na, "mkvmerge_remux", side_effect=fake_remux), \
+         patch.object(na, "set_normalized_tag", return_value=True) as tag:
+        result = na.process_file(str(src))
+    return result, {"measure": measure, "render": render, "tag": tag}
+
+
+@pytest.mark.parametrize("measured", [OFF_TARGET, ON_TARGET], ids=["off-target", "on-target"])
+@pytest.mark.parametrize("tagged", [True, False], ids=["tagged-v1", "untagged"])
+def test_pce_layout_primary_is_reencoded_never_skipped_or_tag_only(
+        tmp_path, monkeypatch, tagged, measured):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 6, "unknown", tagged), measured)
+    assert result["status"] == "FIXED"
+    m["render"].assert_called_once()
+    m["tag"].assert_called_once()
+
+
+@pytest.mark.parametrize("codec, channels, layout", [
+    ("aac", 6, "5.1"),
+    ("aac", 2, "unknown"),
+    ("eac3", 6, "unknown"),
+], ids=["standard-5.1-aac", "stereo-aac", "non-aac"])
+def test_v1_tagged_file_without_pce_layout_is_still_skipped(
+        tmp_path, monkeypatch, codec, channels, layout):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info(codec, channels, layout, tagged=True), OFF_TARGET)
+    assert result["status"] == "SKIP"
+    assert result["detail"] == "already v1"
+    m["measure"].assert_not_called()
+    m["render"].assert_not_called()
+
+
+def test_on_target_file_with_standard_layout_still_takes_the_tag_only_shortcut(
+        tmp_path, monkeypatch):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 6, "5.1", tagged=False), ON_TARGET)
+    assert result["status"] == "TAG_ONLY"
+    m["render"].assert_not_called()

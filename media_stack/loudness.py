@@ -110,6 +110,10 @@ def render_normalized(
         f":offset={measured['target_offset']}"
         ":linear=true:print_format=summary"
     )
+    if channels_out == 6:
+        # Force the standard 5.1 layout: ffmpeg 4.4's AAC encoder writes a program config
+        # element for 5.1(side), and Apple's player cannot play that.
+        af += ",aformat=channel_layouts=5.1"
     # Real motion video only: a bare `-map 0:v` would carry still-image cover art (no
     # attached_pic flag) through a standalone pass, and players then stall at 0s.
     probe_streams = ffprobe_strict(src).get("streams", [])

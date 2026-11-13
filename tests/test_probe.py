@@ -11,8 +11,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from media_stack.probe import (
-    already_normalized, already_processed, audio_stream_duration, duration_shortfall, file_key,
-    parse_duration, primary_audio_stream, probe, probe_duration, real_video_streams,
+    aac_layout_unknown, already_normalized, already_processed, audio_stream_duration,
+    duration_shortfall, file_key, parse_duration, primary_audio_stream, probe, probe_duration,
+    real_video_streams,
 )
 
 
@@ -54,6 +55,25 @@ def test_already_normalized(tags, expected):
 def test_primary_audio_stream(streams, expected_index):
     a = primary_audio_stream({"streams": streams})
     assert (a["index"] if a is not None else None) == expected_index
+
+
+@pytest.mark.parametrize("stream, expected", [
+    ({"codec_name": "aac", "channels": 6, "channel_layout": "unknown"}, True),
+    ({"codec_name": "aac", "channels": 6, "channel_layout": ""}, True),
+    ({"codec_name": "aac", "channels": 6}, True),
+    ({"codec_name": "aac", "channels": 8, "channel_layout": None}, True),
+    ({"codec_name": "aac", "channels": 3, "channel_layout": "Unknown"}, True),
+    ({"codec_name": "aac", "channels": 6, "channel_layout": "5.1"}, False),
+    ({"codec_name": "aac", "channels": 6, "channel_layout": "5.1(side)"}, False),
+    ({"codec_name": "aac", "channels": 2, "channel_layout": "unknown"}, False),
+    ({"codec_name": "aac", "channels": 1}, False),
+    ({"codec_name": "aac"}, False),
+    ({"codec_name": "eac3", "channels": 6, "channel_layout": "unknown"}, False),
+    ({"codec_name": "ac3", "channels": 6}, False),
+], ids=["unknown", "empty", "missing", "none-8ch", "unknown-3ch-mixed-case", "5.1", "5.1-side",
+        "stereo-unknown", "mono-missing", "no-channels", "eac3", "ac3"])
+def test_aac_layout_unknown(stream, expected):
+    assert aac_layout_unknown(stream) is expected
 
 
 def _ffprobe_returns(payload, rc=0):

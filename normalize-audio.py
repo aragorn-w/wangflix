@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from media_stack.paths import VAR_LOG, ensure_var_dirs  # noqa: E402
 ensure_var_dirs()
 from media_stack.probe import (  # noqa: E402
-    ffprobe_strict as ffprobe, already_normalized, duration_shortfall,
+    ffprobe_strict as ffprobe, aac_layout_unknown, already_normalized, duration_shortfall,
     primary_audio_stream, real_video_streams,
 )
 from media_stack.loudness import (  # noqa: E402
@@ -160,10 +160,13 @@ def _check_stream_regression(info: dict, new_info: dict) -> None:
 def _process_file_inner_locked(src: Path, path_str: str, dry_run: bool) -> dict:
 
     info = ffprobe(src)
-    if already_normalized(info):
+    a = primary_audio_stream(info)
+    # A PCE-layout AAC primary (see aac_layout_unknown) must be re-encoded even when it is
+    # tagged v1 or already on target.
+    relayout = bool(a) and aac_layout_unknown(a)
+    if already_normalized(info) and not relayout:
         return {"path": path_str, "status": "SKIP", "detail": "already v1"}
 
-    a = primary_audio_stream(info)
     if not a:
         return {"path": path_str, "status": "SKIP", "detail": "no audio"}
 
@@ -191,6 +194,7 @@ def _process_file_inner_locked(src: Path, path_str: str, dry_run: bool) -> dict:
     # On target (within 0.3 LU, peak OK): just tag. mkvpropedit is Matroska-only, so a
     # non-MKV input would be a permanent TAG_FAIL and goes through pass 2 instead.
     if (src.suffix.lower() == ".mkv"
+            and not relayout
             and abs(in_i - TARGET_I) < 0.3
             and in_tp < TARGET_TP - 0.5):
         ok = set_normalized_tag(src, PIPELINE_VERSION)

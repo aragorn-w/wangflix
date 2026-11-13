@@ -135,6 +135,41 @@ def test_pass2_downmix_targets_only_the_primary(tmp_path):
     assert "-ac:a:1" not in cmd
 
 
+# --- 5.1 layout: ffmpeg 4.4's AAC encoder writes a PCE for 5.1(side), which Apple's player rejects ---
+
+AFORMAT_51 = "aformat=channel_layouts=5.1"
+
+
+@pytest.mark.parametrize("channels, layout, expect_aformat", [
+    (6, "5.1(side)", True),
+    (6, "5.1", True),
+    (6, "", True),                                    # unknown source layout
+    (8, "FL+FR+FC+LFE+SL+SR+TFL+TFR", True),         # Atmos downmixed to 6 channels
+    (1, "mono", False),
+    (2, "stereo", False),
+    (8, "7.1", False),                                # 8ch is passed through unchanged
+], ids=["5.1-side", "5.1", "layout-unknown", "atmos-downmix", "mono", "stereo", "7.1"])
+def test_pass2_forces_standard_5_1_layout_only_for_6_output_channels(
+        tmp_path, channels, layout, expect_aformat):
+    cmd = _run_pass2(tmp_path, _streams(
+        (0, "video", "hevc", False),
+        (1, "audio", "eac3", False),
+    ), channels=channels, layout=layout)
+    af = _arg_after(cmd, "-filter:a:0")
+    assert af.startswith("loudnorm=")
+    assert (AFORMAT_51 in af) is expect_aformat
+    if expect_aformat:
+        assert af.endswith(f",{AFORMAT_51}"), "aformat must come after loudnorm"
+
+
+def test_pass2_5_1_layout_filter_is_on_the_reencoded_stream_only(tmp_path):
+    cmd = _run_pass2(tmp_path, _dual_audio_streams(), audio_index=1, channels=6,
+                     layout="5.1(side)")
+    assert AFORMAT_51 in _arg_after(cmd, "-filter:a:1")
+    assert "-filter:a:0" not in cmd
+    assert "-filter:a" not in cmd
+
+
 # --- output sample rate: loudnorm emits 192 kHz and the Shield's AAC decoder tops out at 48 kHz ---
 
 def _with_rates(streams, **rates):
