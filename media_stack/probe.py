@@ -156,12 +156,13 @@ def primary_audio_stream(info: dict) -> dict | None:
 
 
 def aac_layout_unknown(stream: dict) -> bool:
-    """AAC with more than 2 channels and no channel layout: ffmpeg 4.4's encoder wrote a
-    program config element (ASC channel config 0) for a layout such as 5.1(side), and
-    Apple's player cannot play that audio."""
+    """6-channel AAC with no channel layout: ffmpeg 4.4's encoder wrote a program config
+    element (ASC channel config 0) for 5.1(side), and Apple's player cannot play that audio.
+    Exactly 6 channels: render_normalized turns only that case into a standard layout, so
+    re-encoding a 7 or 8 channel PCE track would only add a lossy generation per run."""
     if stream.get("codec_name") != "aac":
         return False
-    if int(stream.get("channels") or 0) <= 2:
+    if int(stream.get("channels") or 0) != 6:
         return False
     return (stream.get("channel_layout") or "").strip().lower() in ("", "unknown")
 

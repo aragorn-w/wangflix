@@ -61,17 +61,21 @@ def test_primary_audio_stream(streams, expected_index):
     ({"codec_name": "aac", "channels": 6, "channel_layout": "unknown"}, True),
     ({"codec_name": "aac", "channels": 6, "channel_layout": ""}, True),
     ({"codec_name": "aac", "channels": 6}, True),
-    ({"codec_name": "aac", "channels": 8, "channel_layout": None}, True),
-    ({"codec_name": "aac", "channels": 3, "channel_layout": "Unknown"}, True),
+    ({"codec_name": "aac", "channels": 6, "channel_layout": None}, True),
+    ({"codec_name": "aac", "channels": 6, "channel_layout": " Unknown "}, True),
     ({"codec_name": "aac", "channels": 6, "channel_layout": "5.1"}, False),
     ({"codec_name": "aac", "channels": 6, "channel_layout": "5.1(side)"}, False),
+    ({"codec_name": "aac", "channels": 7, "channel_layout": "unknown"}, False),
+    ({"codec_name": "aac", "channels": 8, "channel_layout": "unknown"}, False),
+    ({"codec_name": "aac", "channels": 3, "channel_layout": "unknown"}, False),
     ({"codec_name": "aac", "channels": 2, "channel_layout": "unknown"}, False),
     ({"codec_name": "aac", "channels": 1}, False),
     ({"codec_name": "aac"}, False),
     ({"codec_name": "eac3", "channels": 6, "channel_layout": "unknown"}, False),
     ({"codec_name": "ac3", "channels": 6}, False),
-], ids=["unknown", "empty", "missing", "none-8ch", "unknown-3ch-mixed-case", "5.1", "5.1-side",
-        "stereo-unknown", "mono-missing", "no-channels", "eac3", "ac3"])
+], ids=["unknown", "empty", "missing", "none", "unknown-mixed-case", "5.1", "5.1-side",
+        "7ch-unknown", "8ch-unknown", "3ch-unknown", "stereo-unknown", "mono-missing",
+        "no-channels", "eac3", "ac3"])
 def test_aac_layout_unknown(stream, expected):
     assert aac_layout_unknown(stream) is expected
 

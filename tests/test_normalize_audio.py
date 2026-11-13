@@ -228,8 +228,10 @@ def test_pce_layout_primary_is_reencoded_never_skipped_or_tag_only(
 @pytest.mark.parametrize("codec, channels, layout", [
     ("aac", 6, "5.1"),
     ("aac", 2, "unknown"),
+    ("aac", 7, "unknown"),     # never convertible to a standard layout: re-encoding would loop
+    ("aac", 8, "unknown"),
     ("eac3", 6, "unknown"),
-], ids=["standard-5.1-aac", "stereo-aac", "non-aac"])
+], ids=["standard-5.1-aac", "stereo-aac", "7ch-aac", "8ch-aac", "non-aac"])
 def test_v1_tagged_file_without_pce_layout_is_still_skipped(
         tmp_path, monkeypatch, codec, channels, layout):
     result, m = _process(tmp_path, monkeypatch,
