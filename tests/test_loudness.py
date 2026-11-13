@@ -26,7 +26,7 @@ def _streams(*specs):
             for i, t, c, ap in specs]
 
 
-def _run_pass2(tmp_path, streams, audio_index=0, channels=6, layout="5.1"):
+def _run_pass2(tmp_path, streams, audio_index=0, channels=6, layout="5.1", measured=MEASURED):
     """Invoke render_normalized with ffprobe + ffmpeg mocked; return argv."""
     src = tmp_path / "in.mkv"
     src.write_bytes(b"X" * 200_000)
@@ -41,7 +41,7 @@ def _run_pass2(tmp_path, streams, audio_index=0, channels=6, layout="5.1"):
     with patch("media_stack.loudness.ffprobe_strict",
                return_value={"streams": streams}), \
          patch("media_stack.loudness.subprocess.run", side_effect=fake_run):
-        render_normalized(src, dst, audio_index, channels, MEASURED, layout)
+        render_normalized(src, dst, audio_index, channels, measured, layout)
     return captured["cmd"]
 
 
@@ -210,6 +210,38 @@ def test_pass2_output_rate_is_on_the_reencoded_stream_only(tmp_path):
     assert "-ar:a:1" not in cmd, "a stream-copied track cannot take a sample rate"
     assert "-ar" not in cmd, "a bare -ar applies to every audio stream"
     assert cmd.count("-ar:a:0") == 1
+
+
+# --- layout-only pass (measured=None): a v1 track already on target gets no loudnorm ---
+
+@pytest.mark.parametrize("channels, layout, expected_af", [
+    (6, "5.1(side)", AFORMAT_51),
+    (8, "FL+FR+FC+LFE+SL+SR+TFL+TFR", AFORMAT_51),   # Atmos downmixed to 6 channels
+    (8, "7.1", "anull"),
+    (2, "stereo", "anull"),
+], ids=["5.1-side", "atmos-downmix", "7.1", "stereo"])
+def test_pass2_without_measurement_builds_no_loudnorm_filter(
+        tmp_path, channels, layout, expected_af):
+    cmd = _run_pass2(tmp_path, _streams(
+        (0, "video", "hevc", False),
+        (1, "audio", "aac", False),
+    ), channels=channels, layout=layout, measured=None)
+    assert _arg_after(cmd, "-filter:a:0") == expected_af
+    assert "loudnorm" not in " ".join(cmd)
+
+
+def test_pass2_without_measurement_keeps_rate_pin_bitrate_copies_and_downmix(tmp_path):
+    cmd = _run_pass2(tmp_path, _with_rates(_streams(
+        (0, "video", "hevc", False),
+        (1, "audio", "truehd", False),
+        (2, "audio", "ac3", False),
+    ), **{"1": "96000", "2": "44100"}), channels=8,
+        layout="FL+FR+FC+LFE+SL+SR+TFL+TFR", measured=None)
+    assert _arg_after(cmd, "-ar:a:0") == "48000"        # 96 kHz is still pinned down
+    assert _arg_after(cmd, "-b:a:0") == "384k"
+    assert _arg_after(cmd, "-ac:a:0") == "6"
+    assert _arg_after(cmd, "-c:a:1") == "copy"
+    assert "-filter:a:1" not in cmd
 
 
 # --- timeouts: shared helpers + the outer normalize budget ----------------

@@ -84,11 +84,12 @@ def render_normalized(
     dst: Path,
     audio_index: int,
     channels: int,
-    measured: dict,
+    measured: dict | None,
     channel_layout: str = "",
 ) -> None:
     """Pass 2: re-encode the primary audio track (`audio_index` is audio-relative) with the
     pass-1 values; stream-copy everything else except rejected video and data streams.
+    `measured=None` applies no loudnorm (a layout-only fix of a track already on target).
 
     Atmos / >6ch height layouts (e.g. `FL+FR+FC+LFE+SL+SR+TFL+TFR`) are rejected by the
     native AAC encoder, so they are downmixed to 5.1.
@@ -101,19 +102,22 @@ def render_normalized(
     )
     channels_out = 6 if needs_downmix else channels
     bitrate = AAC_BITRATE.get(channels_out, DEFAULT_AAC_BITRATE)
-    af = (
-        f"loudnorm=I={TARGET_I}:LRA={TARGET_LRA}:TP={TARGET_TP}"
-        f":measured_I={measured['input_i']}"
-        f":measured_LRA={measured['input_lra']}"
-        f":measured_TP={measured['input_tp']}"
-        f":measured_thresh={measured['input_thresh']}"
-        f":offset={measured['target_offset']}"
-        ":linear=true:print_format=summary"
-    )
+    filters: list[str] = []
+    if measured is not None:
+        filters.append(
+            f"loudnorm=I={TARGET_I}:LRA={TARGET_LRA}:TP={TARGET_TP}"
+            f":measured_I={measured['input_i']}"
+            f":measured_LRA={measured['input_lra']}"
+            f":measured_TP={measured['input_tp']}"
+            f":measured_thresh={measured['input_thresh']}"
+            f":offset={measured['target_offset']}"
+            ":linear=true:print_format=summary"
+        )
     if channels_out == 6:
         # Force the standard 5.1 layout: ffmpeg 4.4's AAC encoder writes a program config
         # element for 5.1(side), and Apple's player cannot play that.
-        af += ",aformat=channel_layouts=5.1"
+        filters.append("aformat=channel_layouts=5.1")
+    af = ",".join(filters) or "anull"
     # Real motion video only: a bare `-map 0:v` would carry still-image cover art (no
     # attached_pic flag) through a standalone pass, and players then stall at 0s.
     probe_streams = ffprobe_strict(src).get("streams", [])

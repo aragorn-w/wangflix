@@ -193,7 +193,7 @@ def _audio_info(codec, channels, layout, tagged):
                        "tags": {"NORMALIZED_AUDIO": "v1"} if tagged else {}}}
 
 
-def _process(tmp_path, monkeypatch, info, measured):
+def _process(tmp_path, monkeypatch, info, measured, dry_run=False):
     """`process_file` with every external tool faked; returns (result, mocks)."""
     monkeypatch.setattr(na, "LOG_FILE", tmp_path / "normalize-audio.log")
     src = tmp_path / "Movie (2024).mkv"
@@ -210,7 +210,7 @@ def _process(tmp_path, monkeypatch, info, measured):
          patch.object(na, "render_normalized", side_effect=fake_render) as render, \
          patch.object(na, "mkvmerge_remux", side_effect=fake_remux), \
          patch.object(na, "set_normalized_tag", return_value=True) as tag:
-        result = na.process_file(str(src))
+        result = na.process_file(str(src), dry_run=dry_run)
     return result, {"measure": measure, "render": render, "tag": tag}
 
 
@@ -223,6 +223,52 @@ def test_pce_layout_primary_is_reencoded_never_skipped_or_tag_only(
     assert result["status"] == "FIXED"
     m["render"].assert_called_once()
     m["tag"].assert_called_once()
+
+
+def _render_measured_arg(render):
+    """The `measured` argument render_normalized was called with (positional index 4)."""
+    return render.call_args.args[4]
+
+
+@pytest.mark.parametrize("measured", [OFF_TARGET, ON_TARGET], ids=["off-target", "on-target"])
+def test_v1_tagged_pce_primary_takes_the_layout_only_fast_path(tmp_path, monkeypatch, measured):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 6, "unknown", tagged=True), measured)
+    assert result["status"] == "FIXED"
+    assert result["relayout_only"] is True
+    m["measure"].assert_not_called()                    # no pass 1
+    m["render"].assert_called_once()
+    assert _render_measured_arg(m["render"]) is None    # and no loudnorm in pass 2
+    m["tag"].assert_called_once()
+
+
+def test_v1_tagged_pce_primary_dry_run_reports_dry_without_measuring(tmp_path, monkeypatch):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 6, "unknown", tagged=True), OFF_TARGET, dry_run=True)
+    assert result["status"] == "DRY"
+    assert result["relayout_only"] is True
+    m["measure"].assert_not_called()
+    m["render"].assert_not_called()
+    m["tag"].assert_not_called()
+
+
+@pytest.mark.parametrize("measured", [OFF_TARGET, ON_TARGET], ids=["off-target", "on-target"])
+def test_untagged_pce_primary_still_measures_and_gets_loudnorm(tmp_path, monkeypatch, measured):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 6, "unknown", tagged=False), measured)
+    assert result["status"] == "FIXED"
+    assert "relayout_only" not in result
+    m["measure"].assert_called_once()
+    assert _render_measured_arg(m["render"]) is measured
+
+
+def test_untagged_pce_primary_dry_run_still_measures(tmp_path, monkeypatch):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 6, "unknown", tagged=False), OFF_TARGET, dry_run=True)
+    assert result["status"] == "DRY"
+    assert "relayout_only" not in result
+    m["measure"].assert_called_once()
+    m["render"].assert_not_called()
 
 
 @pytest.mark.parametrize("codec, channels, layout", [

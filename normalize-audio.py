@@ -177,31 +177,43 @@ def _process_file_inner_locked(src: Path, path_str: str, dry_run: bool) -> dict:
     channel_layout = a.get("channel_layout", "") or ""
 
     t0 = time.time()
-    measured = measure_loudness(src, audio_idx)
-    in_i  = float(measured["input_i"])
-    in_tp = float(measured["input_tp"])
-    in_lra = float(measured["input_lra"])
-    offset = float(measured["target_offset"])
+    # Tagged v1 and only the channel layout is wrong: loudness is already on target, so skip
+    # pass 1 and loudnorm and re-encode with the layout fix alone.
+    relayout_only = relayout and already_normalized(info)
+    if relayout_only:
+        if dry_run:
+            return {"path": path_str, "status": "DRY", "relayout_only": True,
+                    "channels": channels, "codec": codec}
+        measured = None
+        stats: dict = {"relayout_only": True}
+    else:
+        measured = measure_loudness(src, audio_idx)
+        in_i  = float(measured["input_i"])
+        in_tp = float(measured["input_tp"])
+        in_lra = float(measured["input_lra"])
+        offset = float(measured["target_offset"])
 
-    if dry_run:
-        return {
-            "path": path_str, "status": "DRY",
-            "in_i": in_i, "in_tp": in_tp, "in_lra": in_lra, "offset": offset,
-            "channels": channels, "codec": codec,
-            "measure_s": round(time.time() - t0, 1),
-        }
+        if dry_run:
+            return {
+                "path": path_str, "status": "DRY",
+                "in_i": in_i, "in_tp": in_tp, "in_lra": in_lra, "offset": offset,
+                "channels": channels, "codec": codec,
+                "measure_s": round(time.time() - t0, 1),
+            }
 
-    # On target (within 0.3 LU, peak OK): just tag. mkvpropedit is Matroska-only, so a
-    # non-MKV input would be a permanent TAG_FAIL and goes through pass 2 instead.
-    if (src.suffix.lower() == ".mkv"
-            and not relayout
-            and abs(in_i - TARGET_I) < 0.3
-            and in_tp < TARGET_TP - 0.5):
-        ok = set_normalized_tag(src, PIPELINE_VERSION)
-        return {"path": path_str,
-                "status": "TAG_ONLY" if ok else "TAG_FAIL",
-                "in_i": in_i, "in_tp": in_tp, "channels": channels,
-                "codec": codec}
+        # On target (within 0.3 LU, peak OK): just tag. mkvpropedit is Matroska-only, so a
+        # non-MKV input would be a permanent TAG_FAIL and goes through pass 2 instead.
+        if (src.suffix.lower() == ".mkv"
+                and not relayout
+                and abs(in_i - TARGET_I) < 0.3
+                and in_tp < TARGET_TP - 0.5):
+            ok = set_normalized_tag(src, PIPELINE_VERSION)
+            return {"path": path_str,
+                    "status": "TAG_ONLY" if ok else "TAG_FAIL",
+                    "in_i": in_i, "in_tp": in_tp, "channels": channels,
+                    "codec": codec}
+        stats = {"in_i": round(in_i, 2), "in_tp": round(in_tp, 2),
+                 "in_lra": round(in_lra, 2), "offset": round(offset, 2)}
 
     # Next to the source: /tmp shares the small root LV.
     workdir = src.parent / ".normalize-tmp"
@@ -245,9 +257,7 @@ def _process_file_inner_locked(src: Path, path_str: str, dry_run: bool) -> dict:
             pass  # another worker still using it
 
     elapsed = round(time.time() - t0, 1)
-    return {"path": path_str, "status": "FIXED",
-            "in_i": round(in_i, 2), "in_tp": round(in_tp, 2),
-            "in_lra": round(in_lra, 2), "offset": round(offset, 2),
+    return {"path": path_str, "status": "FIXED", **stats,
             "channels": channels, "codec": codec, "elapsed_s": elapsed}
 
 
