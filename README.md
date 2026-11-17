@@ -84,6 +84,7 @@ The main jobs; the versioned snapshot `ops/cron.d/media-stack.crontab` is the fu
 | `0 *` | `healthcheck.sh`: hourly aggregate health probe |
 | `20 *` / `52 *` | `sub-fallback.py` (ASR fallback for files with no English subtitle) / `sub-fallback.py --dub` (transcribes the English dub of dual-audio files) |
 | `05:00` daily | `consolidate-subs.py --scan`: full library sweep |
+| `01:10` daily | `warm-subtitle-cache.py`: pre-extracts embedded subtitles into Jellyfin's cache, behind the playback gate |
 | `04:30` daily | `bazarr-profile-audit.py`: fixes silent `profileId=None` items |
 | `04:00` daily | `nightly-upgrade.sh`: host package updates |
 | `12:15` daily | `shield-check.py`: report-only NVIDIA Shield configuration drift check |

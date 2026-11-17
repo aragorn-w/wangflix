@@ -97,3 +97,11 @@ PATH=$HOME/media-stack/.venv/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin
 # REPORT-ONLY (an automatic debloat once broke Play Store and voice search): fixes stay
 # manual, from the hint lines in var/log/shield-check.log.  No-op when SHIELD_DEVICES is unset.
 15 12 * * * python3 $HOME/media-stack/shield-check.py >> $HOME/media-stack/var/log/shield-check.log 2>&1
+
+# Nightly Jellyfin subtitle cache warm-up, 01:10.  Jellyfin extracts an embedded text subtitle
+# only when a transcoding client first asks for it, a whole-file read (minutes for a large 4K
+# movie on a USB disk) that the client gives up on.  warm-subtitle-cache.py requests every
+# embedded text track through Jellyfin's own endpoint ahead of time, one at a time, behind the
+# same pause-aware playback gate, so playback finds the cache warm.  Stops after 6 hours and the
+# next night resumes.  Minute :10 avoids the :00 healthcheck.
+10 1 * * * python3 $HOME/media-stack/warm-subtitle-cache.py >> $HOME/media-stack/var/log/warm-subtitle-cache.log 2>&1
