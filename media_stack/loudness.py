@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from collections.abc import Collection
 from pathlib import Path
 
 from media_stack.mux import remux_timeout_s
@@ -82,14 +83,19 @@ def _aac_sample_rate(stream: dict) -> int:
 def render_normalized(
     src: Path,
     dst: Path,
-    audio_index: int,
+    audio_index: int | None,
     channels: int,
     measured: dict | None,
     channel_layout: str = "",
+    strip_cc: Collection[int] = (),
 ) -> None:
     """Pass 2: re-encode the primary audio track (`audio_index` is audio-relative) with the
     pass-1 values; stream-copy everything else except rejected video and data streams.
     `measured=None` applies no loudnorm (a layout-only fix of a track already on target).
+    `audio_index=None` stream-copies every audio track (a caption-only pass on a file whose
+    loudness is already done). `strip_cc` holds absolute input indices of H.264 video streams
+    whose embedded closed captions to remove: the copy then drops their SEI NAL units
+    (type 6, where the CEA-608/708 payload lives).
 
     Atmos / >6ch height layouts (e.g. `FL+FR+FC+LFE+SL+SR+TFL+TFR`) are rejected by the
     native AAC encoder, so they are downmixed to 5.1.
@@ -125,13 +131,16 @@ def render_normalized(
     if not keep_video:
         raise RuntimeError("loudnorm pass2: no real video stream to map")
     video_maps: list[str] = []
-    for _vs in keep_video:
+    video_args: list[str] = []
+    for pos, _vs in enumerate(keep_video):
         video_maps += ["-map", f"0:{_vs['index']}"]
+        if _vs["index"] in strip_cc:
+            video_args += [f"-bsf:v:{pos}", "filter_units=remove_types=6"]
 
     # Map EVERY audio stream, re-encoding only the primary: track selection is
     # consolidate-subs' job, and mapping only the primary would drop a kept dub.
     audio_streams = [s for s in probe_streams if s.get("codec_type") == "audio"]
-    if not 0 <= audio_index < len(audio_streams):
+    if audio_index is not None and not 0 <= audio_index < len(audio_streams):
         raise RuntimeError(
             f"loudnorm pass2: audio_index {audio_index} out of range "
             f"({len(audio_streams)} audio stream(s))"
@@ -142,7 +151,7 @@ def render_normalized(
         # Maps are in input order, so output `pos` == input `pos`. Per-stream specifiers:
         # a bare `-c:a`/`-af`/`-ac` would also hit the copied tracks.
         audio_maps += ["-map", f"0:a:{pos}"]
-        if pos == audio_index:
+        if audio_index is not None and pos == audio_index:
             # loudnorm outputs 192 kHz and AAC would snap to 96 kHz, which the Shield
             # cannot decode: pin the rate.
             audio_args += [f"-c:a:{pos}", "aac", f"-b:a:{pos}", bitrate,
@@ -164,7 +173,11 @@ def render_normalized(
         "-c:v", "copy",
         "-c:s", "copy",
         "-c:t", "copy",
+        *video_args,
         *audio_args,
+        # Copy each track's default flag exactly: `infer` would flag a subtitle default when
+        # none is and collapse multiple defaults.
+        "-default_mode", "passthrough",
         "-f", "matroska", str(dst),
     ]
     timeout = pass2_timeout_s(src.stat().st_size)

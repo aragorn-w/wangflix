@@ -12,8 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from media_stack.probe import (
     aac_layout_unknown, already_normalized, already_processed, audio_stream_duration,
-    duration_shortfall, file_key, parse_duration, primary_audio_stream, probe, probe_duration,
-    real_video_streams,
+    closed_caption_video_indices, duration_shortfall, file_key, keyframe_count, parse_duration,
+    primary_audio_stream, probe, probe_duration, real_video_streams,
 )
 
 
@@ -247,3 +247,85 @@ def test_duration_shortfall_fails_when_only_the_output_duration_is_unreadable(ou
 def test_duration_shortfall_fails_when_a_file_cannot_be_probed_at_all(src_info, out_info, who):
     reason = duration_shortfall(src_info, out_info, lambda m: None)
     assert reason == f"{who} could not be probed"
+
+
+# --- closed_caption_video_indices: ffprobe 4.4's JSON `closed_captions` reads 0 on files that
+# --- have them, so the human-readable banner line is what gets parsed ---
+
+_H264_CC = ("  Stream #0:0: Video: h264 (High), yuv420p(tv, bt709, progressive), 1920x1080, "
+            "Closed Captions, SAR 1:1 DAR 16:9, 23.98 fps, 23.98 tbr, 1k tbn, 47.95 tbc (default)")
+_H264_PLAIN = ("  Stream #0:0: Video: h264 (High), yuv420p(tv, bt709, progressive), 1920x1080, "
+               "SAR 1:1 DAR 16:9, 23.98 fps, 23.98 tbr, 1k tbn, 47.95 tbc (default)")
+_AUDIO = "  Stream #0:1(eng): Audio: aac (LC), 48000 Hz, stereo, fltp (default)"
+
+
+def _banner(*stream_lines):
+    text = "Input #0, matroska,webm, from '/v.mkv':\n  Duration: 00:22:00.00\n" + "\n".join(stream_lines)
+    return MagicMock(returncode=0, stdout="", stderr=text + "\n")
+
+
+@pytest.mark.parametrize("lines, expected", [
+    pytest.param([_H264_CC, _AUDIO], [0], id="h264-with-captions"),
+    pytest.param([_H264_PLAIN, _AUDIO], [], id="h264-without-captions"),
+    pytest.param([_H264_CC.replace("h264 (High)", "hevc (Main 10)"), _AUDIO], [],
+                 id="hevc-with-captions-is-never-returned"),
+    pytest.param([_H264_CC.replace("Stream #0:0:", "Stream #0:0(eng):"), _AUDIO], [0],
+                 id="language-tag-variant"),
+    pytest.param([_H264_CC.replace("Stream #0:0:", "Stream #0:1[0x1011]:"), _AUDIO], [1],
+                 id="hex-id-variant"),
+    pytest.param([_H264_CC.replace("Stream #0:0:", "Stream #0:2[0x1011](eng):"), _AUDIO], [2],
+                 id="hex-id-and-language-variant"),
+    pytest.param([_H264_PLAIN, _H264_CC.replace("Stream #0:0:", "Stream #0:3:")], [3],
+                 id="absolute-index-of-the-second-video"),
+    pytest.param(["  Stream #0:4(eng): Subtitle: subrip (default) Closed Captions"], [],
+                 id="non-video-stream-is-ignored"),
+])
+def test_closed_caption_video_indices_parses_the_banner(lines, expected):
+    with patch("media_stack.probe.subprocess.run", return_value=_banner(*lines)) as run:
+        assert closed_caption_video_indices(Path("/v.mkv")) == expected
+    argv = run.call_args.args[0]
+    assert argv[:2] == ["ffprobe", "-hide_banner"] and argv[-1] == "/v.mkv"
+    assert run.call_args.kwargs["timeout"] == 60
+
+
+@pytest.mark.parametrize("run_kwargs", [
+    pytest.param({"return_value": MagicMock(returncode=1, stdout="", stderr=_H264_CC)},
+                 id="nonzero-exit"),
+    pytest.param({"side_effect": subprocess.TimeoutExpired("ffprobe", 60)}, id="timeout"),
+    pytest.param({"side_effect": FileNotFoundError("ffprobe")}, id="missing-binary"),
+    pytest.param({"return_value": MagicMock(returncode=0, stdout="", stderr=None)},
+                 id="no-stderr"),
+])
+def test_closed_caption_video_indices_is_empty_on_any_failure(run_kwargs):
+    with patch("media_stack.probe.subprocess.run", **run_kwargs):
+        assert closed_caption_video_indices(Path("/v.mkv")) == []
+
+
+# --- keyframe_count: guards the caption strip (open-GOP streams can lose their keyframes) ---
+
+def test_keyframe_count_counts_the_lines_that_start_with_k_and_reads_the_whole_file():
+    out = "K_\n__\n__\nK_\n__\nKD\n__\n"
+    with patch("media_stack.probe.subprocess.run",
+               return_value=MagicMock(returncode=0, stdout=out, stderr="")) as run:
+        assert keyframe_count(Path("/v.mkv"), "v:0") == 3
+    argv = run.call_args.args[0]
+    assert argv == ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "packet=flags", "-of", "csv=p=0", "/v.mkv"]
+    assert run.call_args.kwargs["timeout"] == 3600
+
+
+def test_keyframe_count_is_zero_for_a_stream_without_keyframes():
+    with patch("media_stack.probe.subprocess.run",
+               return_value=MagicMock(returncode=0, stdout="__\n__\n", stderr="")):
+        assert keyframe_count(Path("/v.mkv"), "0") == 0
+
+
+@pytest.mark.parametrize("run_kwargs", [
+    pytest.param({"return_value": MagicMock(returncode=1, stdout="K_\n", stderr="boom")},
+                 id="nonzero-exit"),
+    pytest.param({"side_effect": subprocess.TimeoutExpired("ffprobe", 3600)}, id="timeout"),
+    pytest.param({"side_effect": Exception("boom")}, id="exception"),
+])
+def test_keyframe_count_is_none_on_any_failure(run_kwargs):
+    with patch("media_stack.probe.subprocess.run", **run_kwargs):
+        assert keyframe_count(Path("/v.mkv"), "v:0") is None

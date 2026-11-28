@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import subprocess
 from collections.abc import Callable, Collection
 from pathlib import Path
@@ -35,6 +36,53 @@ def probe(p: Path) -> dict | None:
         if r.returncode != 0:
             return None
         return json.loads(r.stdout)
+    except Exception:
+        return None
+
+
+# `Stream #0:1[0x1011](eng): Video: h264 (High), ..., 1920x1080, Closed Captions, SAR ...`
+_VIDEO_STREAM_LINE = re.compile(
+    r"^\s*Stream #0:(\d+)(?:\[[^\]]*\])?(?:\([^)]*\))?:\s*Video:\s*(\w+)")
+
+
+def closed_caption_video_indices(p: Path) -> list[int]:
+    """Absolute stream indices of H.264 video streams that carry CEA-608/708 closed captions
+    in their bitstream (SEI NAL units); [] on any failure. Only h264: stripping SEI from HEVC
+    would also drop its HDR metadata.
+
+    The banner is parsed because ffprobe 4.4's JSON `closed_captions` field reads 0 even on
+    files that have them, while the human-readable stream line says "Closed Captions"."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-hide_banner", "-i", str(p)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if r.returncode != 0:
+            return []
+        found = []
+        for line in (r.stderr or "").splitlines():
+            m = _VIDEO_STREAM_LINE.match(line)
+            if m and m.group(2) == "h264" and "Closed Captions" in line:
+                found.append(int(m.group(1)))
+        return found
+    except Exception:
+        return []
+
+
+def keyframe_count(p: Path, stream_spec: str) -> int | None:
+    """Number of keyframe packets in the stream `stream_spec` selects (an ffprobe
+    `-select_streams` value such as `2` or `v:0`), None on any failure. It reads the whole
+    file, hence the long timeout. Guards the caption strip: dropping every SEI NAL unit also
+    drops the H.264 recovery-point SEI that marks keyframes in an open-GOP stream."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", stream_spec,
+             "-show_entries", "packet=flags", "-of", "csv=p=0", str(p)],
+            capture_output=True, text=True, timeout=3600,
+        )
+        if r.returncode != 0:
+            return None
+        return sum(1 for line in r.stdout.splitlines() if line.startswith("K"))
     except Exception:
         return None
 

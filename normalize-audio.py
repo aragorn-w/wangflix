@@ -16,8 +16,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from media_stack.paths import VAR_LOG, ensure_var_dirs  # noqa: E402
 ensure_var_dirs()
 from media_stack.probe import (  # noqa: E402
-    ffprobe_strict as ffprobe, aac_layout_unknown, already_normalized, duration_shortfall,
-    primary_audio_stream, real_video_streams,
+    ffprobe_strict as ffprobe, aac_layout_unknown, already_normalized,
+    closed_caption_video_indices, duration_shortfall, keyframe_count, primary_audio_stream,
+    real_video_streams,
 )
 from media_stack.loudness import (  # noqa: E402
     TARGET_I, TARGET_TP,
@@ -164,7 +165,10 @@ def _process_file_inner_locked(src: Path, path_str: str, dry_run: bool) -> dict:
     # A PCE-layout AAC primary (see aac_layout_unknown) must be re-encoded even when it is
     # tagged v1 or already on target.
     relayout = bool(a) and aac_layout_unknown(a)
-    if already_normalized(info) and not relayout:
+    # H.264 streams with embedded CEA-608/708 captions: Jellyfin's NVENC transcode passes them
+    # through and iOS shows them as an always-on subtitle, so pass 2 strips them.
+    cc = closed_caption_video_indices(src)
+    if already_normalized(info) and not relayout and not cc:
         return {"path": path_str, "status": "SKIP", "detail": "already v1"}
 
     if not a:
@@ -180,12 +184,20 @@ def _process_file_inner_locked(src: Path, path_str: str, dry_run: bool) -> dict:
     # Tagged v1 and only the channel layout is wrong: loudness is already on target, so skip
     # pass 1 and loudnorm and re-encode with the layout fix alone.
     relayout_only = relayout and already_normalized(info)
+    copy_audio = False  # caption-only pass: stream-copy every audio track
     if relayout_only:
         if dry_run:
             return {"path": path_str, "status": "DRY", "relayout_only": True,
                     "channels": channels, "codec": codec}
         measured = None
         stats: dict = {"relayout_only": True}
+    elif already_normalized(info):
+        # Tagged v1, layout fine, so `cc` is non-empty (else SKIPped above): strip only.
+        if dry_run:
+            return {"path": path_str, "status": "DRY", "cc_only": True}
+        measured = None
+        copy_audio = True
+        stats = {"cc_only": True}
     else:
         measured = measure_loudness(src, audio_idx)
         in_i  = float(measured["input_i"])
@@ -203,10 +215,11 @@ def _process_file_inner_locked(src: Path, path_str: str, dry_run: bool) -> dict:
 
         # On target (within 0.3 LU, peak OK): just tag. mkvpropedit is Matroska-only, so a
         # non-MKV input would be a permanent TAG_FAIL and goes through pass 2 instead.
-        if (src.suffix.lower() == ".mkv"
-                and not relayout
-                and abs(in_i - TARGET_I) < 0.3
-                and in_tp < TARGET_TP - 0.5):
+        on_target = (src.suffix.lower() == ".mkv"
+                     and not relayout
+                     and abs(in_i - TARGET_I) < 0.3
+                     and in_tp < TARGET_TP - 0.5)
+        if on_target and not cc:
             ok = set_normalized_tag(src, PIPELINE_VERSION)
             return {"path": path_str,
                     "status": "TAG_ONLY" if ok else "TAG_FAIL",
@@ -214,6 +227,11 @@ def _process_file_inner_locked(src: Path, path_str: str, dry_run: bool) -> dict:
                     "codec": codec}
         stats = {"in_i": round(in_i, 2), "in_tp": round(in_tp, 2),
                  "in_lra": round(in_lra, 2), "offset": round(offset, 2)}
+        if on_target:
+            # On target but captions to strip: copy the audio untouched, then tag.
+            measured = None
+            copy_audio = True
+            stats["cc_only"] = True
 
     # Next to the source: /tmp shares the small root LV.
     workdir = src.parent / ".normalize-tmp"
@@ -223,7 +241,8 @@ def _process_file_inner_locked(src: Path, path_str: str, dry_run: bool) -> dict:
     remux_out = workdir / f".{stem_safe}.{os.getpid()}.remux.mkv"
 
     try:
-        render_normalized(src, pass2_out, audio_idx, channels, measured, channel_layout)
+        render_normalized(src, pass2_out, None if copy_audio else audio_idx, channels,
+                          measured, channel_layout, strip_cc=cc)
         mkvmerge_remux(pass2_out, remux_out)
         pass2_out.unlink(missing_ok=True)
 
@@ -243,6 +262,19 @@ def _process_file_inner_locked(src: Path, path_str: str, dry_run: bool) -> dict:
         problem = duration_shortfall(info, new_info, log)
         if problem:
             raise RuntimeError(f"duration regressed: {problem}")
+        if cc and closed_caption_video_indices(remux_out):
+            raise RuntimeError("closed captions survived the strip")
+        if cc:
+            # Dropping all SEI also drops H.264 recovery-point SEI, so an open-GOP stream can
+            # lose keyframes (seeking breaks) while packet count and duration still match.
+            real_v = [s["index"] for s in real_video_streams(info["streams"])]
+            for idx in cc:
+                if idx not in real_v:
+                    continue
+                before = keyframe_count(src, str(idx))
+                after = keyframe_count(remux_out, f"v:{real_v.index(idx)}")
+                if before is None or after is None or after < before:
+                    raise RuntimeError(f"caption strip lost keyframes: {before}->{after}")
 
         if not _replace_and_tag(src, remux_out, final_path, backup_path):
             return {"path": path_str, "status": "TAG_FAIL",

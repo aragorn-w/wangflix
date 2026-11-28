@@ -140,6 +140,8 @@ def _normalize(tmp_path, monkeypatch, src_duration, out_duration):
                 "input_thresh": "-40.0", "target_offset": "7.0"}
     with patch.object(na, "ffprobe", side_effect=fake_ffprobe), \
          patch.object(na, "measure_loudness", return_value=measured), \
+         patch.object(na, "closed_caption_video_indices", return_value=[]), \
+         patch.object(na, "keyframe_count", return_value=1), \
          patch.object(na, "render_normalized", side_effect=fake_render), \
          patch.object(na, "mkvmerge_remux", side_effect=fake_remux), \
          patch.object(na, "set_normalized_tag", return_value=True) as tag:
@@ -188,13 +190,16 @@ def _audio_info(codec, channels, layout, tagged):
              "disposition": {"default": 1}}
     if layout is not None:
         audio["channel_layout"] = layout
-    return {"streams": [_vid("h264"), audio],
+    return {"streams": [{**_vid("h264"), "index": 0}, {**audio, "index": 1}],
             "format": {"duration": "1320.0",
                        "tags": {"NORMALIZED_AUDIO": "v1"} if tagged else {}}}
 
 
-def _process(tmp_path, monkeypatch, info, measured, dry_run=False):
-    """`process_file` with every external tool faked; returns (result, mocks)."""
+def _process(tmp_path, monkeypatch, info, measured, dry_run=False, cc=(), remux_cc=(),
+             keyframes=(100, 100)):
+    """`process_file` with every external tool faked; returns (result, mocks).
+    `cc` / `remux_cc`: the closed-caption video indices the source / the remux output report.
+    `keyframes`: the (source, remux output) keyframe counts."""
     monkeypatch.setattr(na, "LOG_FILE", tmp_path / "normalize-audio.log")
     src = tmp_path / "Movie (2024).mkv"
     src.write_bytes(b"ORIGINAL")
@@ -205,13 +210,21 @@ def _process(tmp_path, monkeypatch, info, measured, dry_run=False):
     def fake_remux(src_, dst):
         Path(dst).write_bytes(b"NORMALIZED")
 
+    def fake_cc(p):
+        return list(remux_cc if Path(p).name.endswith(".remux.mkv") else cc)
+
+    def fake_keyframes(p, spec):
+        return keyframes[1 if Path(p).name.endswith(".remux.mkv") else 0]
+
     with patch.object(na, "ffprobe", return_value=info), \
+         patch.object(na, "closed_caption_video_indices", side_effect=fake_cc), \
+         patch.object(na, "keyframe_count", side_effect=fake_keyframes) as kf, \
          patch.object(na, "measure_loudness", return_value=measured) as measure, \
          patch.object(na, "render_normalized", side_effect=fake_render) as render, \
          patch.object(na, "mkvmerge_remux", side_effect=fake_remux), \
          patch.object(na, "set_normalized_tag", return_value=True) as tag:
         result = na.process_file(str(src), dry_run=dry_run)
-    return result, {"measure": measure, "render": render, "tag": tag}
+    return result, {"measure": measure, "render": render, "tag": tag, "src": src, "kf": kf}
 
 
 @pytest.mark.parametrize("measured", [OFF_TARGET, ON_TARGET], ids=["off-target", "on-target"])
@@ -294,3 +307,139 @@ def test_on_target_file_with_standard_layout_still_takes_the_tag_only_shortcut(
                          _audio_info("aac", 6, "5.1", tagged=False), ON_TARGET)
     assert result["status"] == "TAG_ONLY"
     m["render"].assert_not_called()
+
+
+# --- embedded CEA-608/708 closed captions: Jellyfin's NVENC transcode passes them through and
+# --- iOS shows them as an always-on subtitle, so the pass strips them from H.264 video ---
+
+def _render_audio_index_arg(render):
+    """The `audio_index` argument render_normalized was called with (positional index 2)."""
+    return render.call_args.args[2]
+
+
+def test_v1_tagged_file_with_captions_gets_a_caption_only_pass_not_a_skip(tmp_path, monkeypatch):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 6, "5.1", tagged=True), OFF_TARGET, cc=[0])
+    assert result["status"] == "FIXED"
+    assert result["cc_only"] is True
+    m["measure"].assert_not_called()                    # loudness is already done
+    m["render"].assert_called_once()
+    assert _render_audio_index_arg(m["render"]) is None  # every audio track copied
+    assert _render_measured_arg(m["render"]) is None
+    assert m["render"].call_args.kwargs["strip_cc"] == [0]
+    m["tag"].assert_called_once()
+    assert m["src"].read_bytes() == b"NORMALIZED"
+
+
+def test_v1_tagged_file_with_captions_dry_run_reports_dry_without_rendering(tmp_path, monkeypatch):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 6, "5.1", tagged=True), OFF_TARGET,
+                         dry_run=True, cc=[0])
+    assert result == {"path": str(m["src"]), "status": "DRY", "cc_only": True}
+    m["measure"].assert_not_called()
+    m["render"].assert_not_called()
+    m["tag"].assert_not_called()
+
+
+def test_v1_tagged_file_without_captions_is_still_skipped(tmp_path, monkeypatch):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 6, "5.1", tagged=True), OFF_TARGET, cc=[])
+    assert result["status"] == "SKIP"
+    assert result["detail"] == "already v1"
+    m["render"].assert_not_called()
+
+
+def test_on_target_untagged_mkv_with_captions_is_not_tag_only(tmp_path, monkeypatch):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 6, "5.1", tagged=False), ON_TARGET, cc=[0])
+    assert result["status"] == "FIXED"
+    assert result["cc_only"] is True
+    assert result["in_i"] == -23.0                      # the measurement is still reported
+    m["measure"].assert_called_once()
+    m["render"].assert_called_once()
+    assert _render_audio_index_arg(m["render"]) is None
+    assert _render_measured_arg(m["render"]) is None    # audio copied, so no loudnorm
+    assert m["render"].call_args.kwargs["strip_cc"] == [0]
+    m["tag"].assert_called_once()
+
+
+def test_off_target_untagged_file_with_captions_gets_the_full_pass_and_the_strip(
+        tmp_path, monkeypatch):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 2, "stereo", tagged=False), OFF_TARGET, cc=[0])
+    assert result["status"] == "FIXED"
+    assert "cc_only" not in result
+    assert _render_audio_index_arg(m["render"]) == 0    # the primary is still re-encoded
+    assert _render_measured_arg(m["render"]) is OFF_TARGET
+    assert m["render"].call_args.kwargs["strip_cc"] == [0]
+
+
+def test_pce_layout_fast_path_also_strips_captions(tmp_path, monkeypatch):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 6, "unknown", tagged=True), OFF_TARGET, cc=[0])
+    assert result["status"] == "FIXED"
+    assert result["relayout_only"] is True
+    assert _render_audio_index_arg(m["render"]) == 0    # the layout fix still re-encodes
+    assert m["render"].call_args.kwargs["strip_cc"] == [0]
+
+
+def test_file_without_captions_passes_an_empty_strip_list(tmp_path, monkeypatch):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 2, "stereo", tagged=False), OFF_TARGET, cc=[])
+    assert result["status"] == "FIXED"
+    assert list(m["render"].call_args.kwargs["strip_cc"]) == []
+
+
+@pytest.mark.parametrize("tagged, measured", [(True, OFF_TARGET), (False, ON_TARGET)],
+                         ids=["caption-only-v1", "caption-only-on-target"])
+def test_captions_surviving_the_strip_fail_the_file_and_keep_the_original(
+        tmp_path, monkeypatch, tagged, measured):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 6, "5.1", tagged=tagged), measured,
+                         cc=[0], remux_cc=[0])
+    assert result["status"] == "FAIL"
+    assert "closed captions survived the strip" in result["detail"]
+    src = m["src"]
+    assert src.read_bytes() == b"ORIGINAL"              # never swapped
+    assert not src.with_suffix(".mkv.pre-norm.bak").exists()
+    assert not (tmp_path / ".normalize-tmp").exists()   # temps removed
+    m["tag"].assert_not_called()
+
+
+# --- keyframe guard: dropping every SEI also drops recovery-point SEI, so an open-GOP stream can
+# --- lose keyframes (seeking breaks) while packet count and duration still match ---
+
+def test_caption_strip_compares_keyframes_of_the_stripped_stream_before_and_after(
+        tmp_path, monkeypatch):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 6, "5.1", tagged=True), OFF_TARGET, cc=[0])
+    assert result["status"] == "FIXED"
+    (src_call, out_call) = m["kf"].call_args_list
+    assert (src_call.args[0], src_call.args[1]) == (m["src"], "0")     # absolute input index
+    assert out_call.args[0].name.endswith(".remux.mkv") and out_call.args[1] == "v:0"
+
+
+@pytest.mark.parametrize("keyframes, detail", [
+    ((100, 3), "caption strip lost keyframes: 100->3"),
+    ((100, None), "caption strip lost keyframes: 100->None"),
+    ((None, 100), "caption strip lost keyframes: None->100"),
+], ids=["lost", "output-unreadable", "source-unreadable"])
+def test_lost_or_uncountable_keyframes_fail_the_file_and_keep_the_original(
+        tmp_path, monkeypatch, keyframes, detail):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 6, "5.1", tagged=True), OFF_TARGET,
+                         cc=[0], keyframes=keyframes)
+    assert result["status"] == "FAIL"
+    assert detail in result["detail"]
+    src = m["src"]
+    assert src.read_bytes() == b"ORIGINAL"              # never swapped
+    assert not src.with_suffix(".mkv.pre-norm.bak").exists()
+    assert not (tmp_path / ".normalize-tmp").exists()   # temps removed
+    m["tag"].assert_not_called()
+
+
+def test_a_file_without_captions_never_counts_keyframes(tmp_path, monkeypatch):
+    result, m = _process(tmp_path, monkeypatch,
+                         _audio_info("aac", 2, "stereo", tagged=False), OFF_TARGET, cc=[])
+    assert result["status"] == "FIXED"
+    m["kf"].assert_not_called()

@@ -26,7 +26,8 @@ def _streams(*specs):
             for i, t, c, ap in specs]
 
 
-def _run_pass2(tmp_path, streams, audio_index=0, channels=6, layout="5.1", measured=MEASURED):
+def _run_pass2(tmp_path, streams, audio_index=0, channels=6, layout="5.1", measured=MEASURED,
+               **kwargs):
     """Invoke render_normalized with ffprobe + ffmpeg mocked; return argv."""
     src = tmp_path / "in.mkv"
     src.write_bytes(b"X" * 200_000)
@@ -41,7 +42,7 @@ def _run_pass2(tmp_path, streams, audio_index=0, channels=6, layout="5.1", measu
     with patch("media_stack.loudness.ffprobe_strict",
                return_value={"streams": streams}), \
          patch("media_stack.loudness.subprocess.run", side_effect=fake_run):
-        render_normalized(src, dst, audio_index, channels, measured, layout)
+        render_normalized(src, dst, audio_index, channels, measured, layout, **kwargs)
     return captured["cmd"]
 
 
@@ -292,3 +293,56 @@ def test_pass2_runs_under_the_shared_size_scaled_timeout(tmp_path):
          patch("media_stack.loudness.subprocess.run", side_effect=fake_run):
         render_normalized(src, dst, 0, 2, MEASURED, "stereo")
     assert seen["timeout"] == pass2_timeout_s(30 * GB) == 7800
+
+
+# --- closed-caption strip: SEI NAL units (type 6) carry CEA-608/708 in H.264 ---
+
+CC_BSF = "filter_units=remove_types=6"
+
+
+def _bsf_args(cmd):
+    return {cmd[i]: cmd[i + 1] for i, a in enumerate(cmd) if a.startswith("-bsf")}
+
+
+def test_pass2_strips_captions_only_on_the_listed_video_stream(tmp_path):
+    cmd = _run_pass2(tmp_path, _streams(
+        (0, "video", "mjpeg", False),     # cover art: dropped, so it takes no output position
+        (1, "video", "hevc", False),
+        (2, "video", "h264", False),      # output video position 1
+        (3, "audio", "aac", False),
+    ), strip_cc=[2])
+    assert _video_maps(cmd) == ["0:1", "0:2"]
+    assert _bsf_args(cmd) == {"-bsf:v:1": CC_BSF}
+    assert _arg_after(cmd, "-c:v") == "copy"
+
+
+def test_pass2_without_strip_cc_adds_no_bitstream_filter(tmp_path):
+    cmd = _run_pass2(tmp_path, _streams(
+        (0, "video", "h264", False), (1, "audio", "aac", False)))
+    assert _bsf_args(cmd) == {}
+
+
+def test_pass2_strip_cc_ignores_indices_that_are_not_kept_video(tmp_path):
+    cmd = _run_pass2(tmp_path, _streams(
+        (0, "video", "h264", False), (1, "audio", "aac", False)), strip_cc=[1, 7])
+    assert _bsf_args(cmd) == {}
+
+
+def test_pass2_audio_index_none_copies_every_audio_track(tmp_path):
+    cmd = _run_pass2(tmp_path, _dual_audio_streams(), audio_index=None, measured=None,
+                     strip_cc=[0])
+    assert _audio_maps(cmd) == ["0:a:0", "0:a:1"]
+    assert _arg_after(cmd, "-c:a:0") == "copy"
+    assert _arg_after(cmd, "-c:a:1") == "copy"
+    assert _bsf_args(cmd) == {"-bsf:v:0": CC_BSF}
+    assert "aac" not in cmd
+    for bad in ("-filter:a", "-b:a", "-ar", "-ac", "-af"):
+        assert not any(a.startswith(bad) for a in cmd), f"{bad} in a caption-only pass"
+    assert not any("loudnorm" in a or "aformat" in a for a in cmd)
+
+
+def test_pass2_copies_default_flags_as_they_are(tmp_path):
+    cmd = _run_pass2(tmp_path, _streams((0, "video", "h264", False), (1, "audio", "aac", False)))
+    i = cmd.index("-default_mode")
+    assert cmd[i + 1] == "passthrough"
+    assert i < cmd.index("-f")
